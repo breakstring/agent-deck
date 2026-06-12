@@ -47,6 +47,7 @@
 技术栈建议：
 
 - Python 3.11+。
+- `uv` 管理 Python 项目、虚拟环境、依赖锁文件和本地命令。
 - StreamDock Python SDK。
 - Pillow。
 - FastAPI 或 aiohttp。
@@ -527,6 +528,7 @@ enabled = false
 
 ## 第一版交付物
 
+- `uv` 项目配置和锁文件。
 - Python package skeleton。
 - `agent-deckd` 常驻服务。
 - `agent-deckctl doctor/install/status/simulate`。

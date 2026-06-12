@@ -1,0 +1,13 @@
+[project]
+name = "agent-deck"
+version = "0.1.0"
+description = "Local hardware console bridge for AI agent status and actions."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = []
+
+[tool.uv]
+package = false

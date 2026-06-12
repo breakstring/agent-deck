@@ -1,0 +1,22 @@
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local runtime state
+.env
+.env.*
+!.env.example
+logs/
+tmp/
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Local worktrees
+.worktrees/

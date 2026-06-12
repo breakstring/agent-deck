@@ -48,6 +48,8 @@ gantt
 - `2026-06-12-agent-deck-analysis.md`
 - `2026-06-12-agent-deck-mvp-design.md`
 - `2026-06-12-agent-deck-roadmap.md`
+- Gemini 粘贴报告归档到 `docs/references/`
+- `uv` 项目配置
 - Python package skeleton。
 - 基础测试命令。
 
@@ -81,7 +83,7 @@ gantt
 可拆任务：
 
 1. 项目初始化  
-   建立 Python 包、测试框架、lint、typing、基础 CLI。
+   使用 `uv` 建立 Python 包、虚拟环境、测试框架、lint、typing、基础 CLI。
 
 2. 配置与路径  
    定义用户配置、cache、日志、runtime state 路径。
@@ -312,7 +314,7 @@ P1 验收清单：
 
 建议第一个实现节点：
 
-- 初始化 Python 项目。
+- 用 `uv` 初始化 Python 项目。
 - 建立 core event/state/decision 的纯内存模型。
 - 建立 fake hardware。
 - 用模拟 Codex 事件跑通状态到 fake surface 的测试。

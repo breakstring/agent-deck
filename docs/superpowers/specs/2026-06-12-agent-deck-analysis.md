@@ -234,6 +234,7 @@ Agent Deck 的动作分为四级：
 第一版采用 **macOS + N4 Pro + Codex 最快闭环**：
 
 - Python 常驻服务。
+- 使用 `uv` 管理 Python 项目、虚拟环境、锁文件和命令运行。
 - StreamDock Python SDK HID 直连。
 - Codex OTel 作为细粒度状态源。
 - Codex command hooks 作为可选审批/工具事件入口。
