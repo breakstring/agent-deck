@@ -114,6 +114,83 @@ def test_drain_inputs_returns_fifo_events_and_clears_queue() -> None:
     assert surface.drain_inputs() == []
 
 
+def test_input_value_is_immutable_snapshot_after_raw_payload_mutation() -> None:
+    """Verify input value snapshots are not polluted by caller mutations.
+
+    入参：无；测试内用嵌套 dict/list 构造 `HardwareInput` 并入队。
+    返回：无返回值；断言通过代表原始 payload 的顶层和嵌套修改不会影响 queued event。
+    错误处理：payload 被外部修改污染时由 pytest 报告。
+    副作用：仅修改测试内 raw payload 和 fake surface 的内存队列。
+    """
+
+    surface = FakeHardwareSurface()
+    raw_payload = {
+        "position": {"x": 1, "y": 2},
+        "gestures": ["tap", {"direction": "left"}],
+    }
+    event = HardwareInput(
+        kind="touch",
+        index=4,
+        value=raw_payload,
+        occurred_at=BASE_TIME,
+    )
+    surface.emit_input(event)
+
+    raw_payload["position"]["x"] = 99
+    raw_payload["gestures"].append("swipe")
+    raw_payload["gestures"][1]["direction"] = "right"
+    raw_payload["extra"] = "pollution"
+
+    drained = surface.drain_inputs()
+
+    assert len(drained) == 1
+    assert drained[0].value == {
+        "position": {"x": 1, "y": 2},
+        "gestures": ("tap", {"direction": "left"}),
+    }
+
+
+def test_input_value_rejects_top_level_and_nested_mutation() -> None:
+    """Verify frozen input values reject direct top-level and nested mutation.
+
+    入参：无；测试内构造包含 dict/list 嵌套结构的 `HardwareInput`。
+    返回：无返回值；断言通过代表顶层 mapping、嵌套 mapping 和 tuple 都不可原地修改。
+    错误处理：任一层可被修改时由 pytest 报告。
+    副作用：仅触发本地不可变容器的异常路径。
+    """
+
+    event = HardwareInput(
+        kind="swipe",
+        index=5,
+        value={"nested": {"count": 1}, "items": ["a", {"b": 2}]},
+        occurred_at=BASE_TIME,
+    )
+
+    with pytest.raises(TypeError):
+        event.value["new"] = "blocked"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        event.value["nested"]["count"] = 2  # type: ignore[index]
+    with pytest.raises(TypeError):
+        event.value["items"][1]["b"] = 3  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        event.value["items"].append("blocked")  # type: ignore[attr-defined,index]
+
+
+def test_hardware_input_top_level_fields_are_frozen() -> None:
+    """Verify `HardwareInput` rejects direct reassignment of top-level fields.
+
+    入参：无；测试内构造一个合法 `HardwareInput`。
+    返回：无返回值；断言通过代表 Pydantic frozen model 禁止 `index` 字段赋值。
+    错误处理：字段可被重新赋值时由 pytest 报告。
+    副作用：仅触发本地模型冻结校验。
+    """
+
+    event = _input(index=1)
+
+    with pytest.raises(ValidationError):
+        event.index = 2
+
+
 def test_invalid_input_kind_is_rejected() -> None:
     """Verify unsupported hardware input kind fails Pydantic validation.
 
