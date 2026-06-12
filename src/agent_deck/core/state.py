@@ -9,7 +9,6 @@ already-normalized events and persisting snapshots if they need durability.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
@@ -100,7 +99,7 @@ class AgentStateStore:
 
         self._idle_ttl = idle_ttl
         self._states: dict[str, AgentState] = {}
-        self._active_tools: dict[str, tuple[str, ...]] = {}
+        self._active_tools: dict[str, dict[str, int]] = {}
 
     def apply(self, event: NormalizedEvent) -> AgentState:
         """Apply one normalized event and return the updated agent state.
@@ -113,7 +112,7 @@ class AgentStateStore:
 
         current = self._states.get(event.agent_key)
         state = current or self._new_state(event)
-        active_tools = self._active_tools.get(event.agent_key, ())
+        active_tools = dict(self._active_tools.get(event.agent_key, {}))
         status = state.status
         active_tool = state.active_tool
         pending_count = state.pending_decision_count
@@ -122,37 +121,39 @@ class AgentStateStore:
         match event.normalized_type:
             case EventType.SESSION_STARTED:
                 status = AgentStatus.IDLE
-                active_tools = ()
+                active_tools = {}
                 active_tool = None
                 pending_count = 0
             case EventType.SESSION_ENDED:
                 status = AgentStatus.OFFLINE
-                active_tools = ()
+                active_tools = {}
                 active_tool = None
                 pending_count = 0
                 force_status_since = True
             case EventType.TURN_STARTED:
                 status = AgentStatus.THINKING
             case EventType.TURN_COMPLETED:
-                status = (
-                    AgentStatus.APPROVAL_NEEDED
-                    if pending_count > 0
-                    else AgentStatus.COMPLETED_RECENTLY
+                status, active_tool = _derive_non_terminal_state(
+                    pending_count,
+                    active_tools,
+                    fallback_status=AgentStatus.COMPLETED_RECENTLY,
                 )
             case EventType.TOOL_STARTED:
                 tool_name = _tool_name(event)
                 active_tools = _add_tool(active_tools, tool_name)
-                active_tool = tool_name
-                status = AgentStatus.RUNNING_TOOL
+                status, active_tool = _derive_non_terminal_state(
+                    pending_count,
+                    active_tools,
+                    fallback_status=AgentStatus.RUNNING_TOOL,
+                    preferred_tool=tool_name,
+                )
             case EventType.TOOL_COMPLETED:
                 active_tools = _remove_tool(active_tools, _tool_name(event) or active_tool)
-                active_tool = _first_tool(active_tools)
-                if pending_count > 0:
-                    status = AgentStatus.APPROVAL_NEEDED
-                elif active_tool is not None:
-                    status = AgentStatus.RUNNING_TOOL
-                else:
-                    status = AgentStatus.THINKING
+                status, active_tool = _derive_non_terminal_state(
+                    pending_count,
+                    active_tools,
+                    fallback_status=AgentStatus.THINKING,
+                )
             case EventType.TOOL_FAILED:
                 active_tools = _remove_tool(active_tools, _tool_name(event) or active_tool)
                 active_tool = _first_tool(active_tools)
@@ -161,7 +162,6 @@ class AgentStateStore:
                 tool_name = _tool_name(event)
                 pending_count += 1
                 active_tool = tool_name or active_tool
-                active_tools = _add_tool(active_tools, tool_name)
                 status = AgentStatus.APPROVAL_NEEDED
             case EventType.INPUT_REQUESTED:
                 status = AgentStatus.WAITING_USER
@@ -203,15 +203,23 @@ class AgentStateStore:
         _ensure_timezone_aware_datetime(resolved_time)
         pending_count = max(0, state.pending_decision_count - 1)
         status = state.status
+        active_tool = state.active_tool
         status_since = state.status_since
         if state.status == AgentStatus.APPROVAL_NEEDED and pending_count == 0:
-            status = AgentStatus.THINKING
+            active_tools = self._active_tools.get(agent_key, {})
+            status, active_tool = _derive_non_terminal_state(
+                pending_count,
+                active_tools,
+                fallback_status=AgentStatus.THINKING,
+                preferred_tool=active_tool,
+            )
             status_since = resolved_time
 
         updated = state.model_copy(
             update={
                 "status": status,
                 "status_since": status_since,
+                "active_tool": active_tool,
                 "pending_decision_count": pending_count,
             }
         )
@@ -366,47 +374,96 @@ def _tool_name(event: NormalizedEvent) -> str | None:
     return event.tool_name
 
 
-def _add_tool(active_tools: Iterable[str], tool_name: str | None) -> tuple[str, ...]:
-    """Add a tool name to the active tool tuple while preserving order.
+def _derive_non_terminal_state(
+    pending_count: int,
+    active_tools: dict[str, int],
+    *,
+    fallback_status: AgentStatus,
+    preferred_tool: str | None = None,
+) -> tuple[AgentStatus, str | None]:
+    """Derive status and active tool from pending and active tool state.
 
-    入参：`active_tools` 是当前活跃工具集合的有序快照；`tool_name` 可为空。
-    返回：加入工具后的 tuple；空工具名或重复工具名会返回原有集合。
-    错误处理：迭代输入失败时按 Python 异常传播。
-    副作用：无；只创建新的内存 tuple，不访问外部 I/O。
+    入参：`pending_count` 是待处理 decision 数；`active_tools` 是按工具名计数的活跃
+    工具映射；`fallback_status` 是没有 pending 和 active tool 时使用的状态；
+    `preferred_tool` 是调用方希望优先展示的工具名。
+    返回：`(status, active_tool)`；优先级固定为 pending approval、active tools、
+    fallback status。
+    错误处理：本函数不主动抛业务异常；负 pending 或非法状态应由调用方模型校验约束。
+    副作用：无；只读取内存映射，不访问外部 I/O。
     """
 
-    tools = tuple(active_tools)
-    if tool_name is None or tool_name in tools:
+    if pending_count > 0:
+        return AgentStatus.APPROVAL_NEEDED, preferred_tool or _first_tool(active_tools)
+    active_tool = _select_tool(active_tools, preferred_tool=preferred_tool)
+    if active_tool is not None:
+        return AgentStatus.RUNNING_TOOL, active_tool
+    return fallback_status, None
+
+
+def _add_tool(active_tools: dict[str, int], tool_name: str | None) -> dict[str, int]:
+    """Increment an active tool count by name.
+
+    入参：`active_tools` 是当前活跃工具名称到数量的映射；`tool_name` 可为空。
+    返回：更新后的新 dict；空工具名不会改变集合。
+    错误处理：输入 mapping 不支持复制或计数不可加时按 Python 异常传播。
+    副作用：不修改输入 mapping，只创建新的内存 dict，不访问外部 I/O。
+    """
+
+    tools = dict(active_tools)
+    if tool_name is None:
         return tools
-    return (*tools, tool_name)
+    tools[tool_name] = tools.get(tool_name, 0) + 1
+    return tools
 
 
 def _remove_tool(
-    active_tools: Iterable[str], tool_name: str | None
-) -> tuple[str, ...]:
-    """Remove a tool name from the active tool tuple.
+    active_tools: dict[str, int], tool_name: str | None
+) -> dict[str, int]:
+    """Decrement an active tool count by name.
 
-    入参：`active_tools` 是当前活跃工具集合的有序快照；`tool_name` 可为空。
-    返回：移除匹配工具后的 tuple；空工具名不会改变集合。
-    错误处理：迭代输入失败时按 Python 异常传播。
-    副作用：无；只创建新的内存 tuple，不访问外部 I/O。
+    入参：`active_tools` 是当前活跃工具名称到数量的映射；`tool_name` 可为空。
+    返回：更新后的新 dict；对应计数降为 0 时移除工具名，空工具名不会改变集合。
+    错误处理：输入 mapping 不支持复制或计数不可减时按 Python 异常传播。
+    副作用：不修改输入 mapping，只创建新的内存 dict，不访问外部 I/O。
     """
 
-    tools = tuple(active_tools)
-    if tool_name is None:
+    tools = dict(active_tools)
+    if tool_name is None or tool_name not in tools:
         return tools
-    return tuple(tool for tool in tools if tool != tool_name)
+    next_count = tools[tool_name] - 1
+    if next_count > 0:
+        tools[tool_name] = next_count
+    else:
+        del tools[tool_name]
+    return tools
 
 
-def _first_tool(active_tools: Iterable[str]) -> str | None:
+def _select_tool(
+    active_tools: dict[str, int], *, preferred_tool: str | None = None
+) -> str | None:
+    """Return a preferred active tool name when it is still counted.
+
+    入参：`active_tools` 是当前活跃工具名称到数量的映射；`preferred_tool` 可为空。
+    返回：若 preferred tool 仍活跃则返回它，否则返回第一个活跃工具名；无活跃工具返回 None。
+    错误处理：输入 mapping 迭代失败时按 Python 异常传播。
+    副作用：无；只读取内存 mapping，不访问外部 I/O。
+    """
+
+    if preferred_tool is not None and active_tools.get(preferred_tool, 0) > 0:
+        return preferred_tool
+    return _first_tool(active_tools)
+
+
+def _first_tool(active_tools: dict[str, int]) -> str | None:
     """Return the first active tool name, if any.
 
-    入参：`active_tools` 是当前活跃工具集合的有序快照。
+    入参：`active_tools` 是当前活跃工具名称到数量的映射。
     返回：第一个工具名；集合为空时返回 None。
-    错误处理：迭代输入失败时按 Python 异常传播。
-    副作用：无；只读取内存 iterable，不访问外部 I/O。
+    错误处理：mapping 迭代失败时按 Python 异常传播。
+    副作用：无；只读取内存 mapping，不访问外部 I/O。
     """
 
-    for tool in active_tools:
-        return tool
+    for tool, count in active_tools.items():
+        if count > 0:
+            return tool
     return None

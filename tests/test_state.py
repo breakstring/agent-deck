@@ -177,6 +177,39 @@ def test_tool_completed_with_pending_keeps_approval_needed() -> None:
     assert state.active_tool is None
 
 
+def test_turn_completed_keeps_running_tool_when_tools_are_still_active() -> None:
+    """Verify turn completion does not hide active tool work.
+
+    入参：无；测试内启动 shell 和 python 两个工具后应用 `TURN_COMPLETED`。
+    返回：无返回值；断言通过代表 active tool 优先级高于 completed_recently。
+    错误处理：状态被误置为 completed 或 active tool 丢失会由 pytest 报告。
+    副作用：仅修改测试内的 `AgentStateStore` 内存状态。
+    """
+
+    store = AgentStateStore()
+    store.apply(
+        _event(
+            EventType.TOOL_STARTED,
+            datetime(2026, 6, 12, 8, 2, tzinfo=UTC),
+            tool_name="shell",
+        )
+    )
+    store.apply(
+        _event(
+            EventType.TOOL_STARTED,
+            datetime(2026, 6, 12, 8, 3, tzinfo=UTC),
+            tool_name="python",
+        )
+    )
+
+    state = store.apply(
+        _event(EventType.TURN_COMPLETED, datetime(2026, 6, 12, 8, 4, tzinfo=UTC))
+    )
+
+    assert state.status == AgentStatus.RUNNING_TOOL
+    assert state.active_tool in {"shell", "python"}
+
+
 def test_mark_decision_resolved_returns_to_thinking_when_pending_clears() -> None:
     """Verify resolving the final pending decision returns to thinking.
 
@@ -202,6 +235,87 @@ def test_mark_decision_resolved_returns_to_thinking_when_pending_clears() -> Non
     assert state.pending_decision_count == 0
     assert state.status == AgentStatus.THINKING
     assert state.status_since == resolved_at
+
+
+def test_mark_decision_resolved_returns_to_running_tool_when_tool_still_active() -> None:
+    """Verify resolving approval preserves still-active tool state.
+
+    入参：无；测试内启动 shell、请求 approval，再按 agent key 标记 resolved。
+    返回：无返回值；断言通过代表 pending 清空后 active tool 驱动 running_tool 状态。
+    错误处理：状态误回 thinking、pending 未清空或 active tool 丢失会由 pytest 报告。
+    副作用：仅修改测试内的 `AgentStateStore` 内存状态。
+    """
+
+    store = AgentStateStore()
+    store.apply(
+        _event(
+            EventType.TOOL_STARTED,
+            datetime(2026, 6, 12, 8, 2, tzinfo=UTC),
+            tool_name="shell",
+        )
+    )
+    store.apply(
+        _event(
+            EventType.APPROVAL_REQUESTED,
+            datetime(2026, 6, 12, 8, 3, tzinfo=UTC),
+            tool_name="shell",
+        )
+    )
+
+    state = store.mark_decision_resolved(
+        "codex:session-1", resolved_at=datetime(2026, 6, 12, 8, 4, tzinfo=UTC)
+    )
+
+    assert state is not None
+    assert state.status == AgentStatus.RUNNING_TOOL
+    assert state.pending_decision_count == 0
+    assert state.active_tool == "shell"
+
+
+def test_duplicate_tool_names_are_counted_until_each_completion_arrives() -> None:
+    """Verify same-name concurrent tools require matching completion count.
+
+    入参：无；测试内启动两次 shell，并依次完成两次 shell。
+    返回：无返回值；断言通过代表 active tool 按名称计数而不是去重。
+    错误处理：第一次完成后过早清空工具或第二次完成后未回 thinking 会由 pytest 报告。
+    副作用：仅修改测试内的 `AgentStateStore` 内存状态。
+    """
+
+    store = AgentStateStore()
+    store.apply(
+        _event(
+            EventType.TOOL_STARTED,
+            datetime(2026, 6, 12, 8, 2, tzinfo=UTC),
+            tool_name="shell",
+        )
+    )
+    store.apply(
+        _event(
+            EventType.TOOL_STARTED,
+            datetime(2026, 6, 12, 8, 3, tzinfo=UTC),
+            tool_name="shell",
+        )
+    )
+
+    first_complete = store.apply(
+        _event(
+            EventType.TOOL_COMPLETED,
+            datetime(2026, 6, 12, 8, 4, tzinfo=UTC),
+            tool_name="shell",
+        )
+    )
+    second_complete = store.apply(
+        _event(
+            EventType.TOOL_COMPLETED,
+            datetime(2026, 6, 12, 8, 5, tzinfo=UTC),
+            tool_name="shell",
+        )
+    )
+
+    assert first_complete.status == AgentStatus.RUNNING_TOOL
+    assert first_complete.active_tool == "shell"
+    assert second_complete.status == AgentStatus.THINKING
+    assert second_complete.active_tool is None
 
 
 def test_snapshot_projects_stale_non_offline_agents_without_mutating_store() -> None:
