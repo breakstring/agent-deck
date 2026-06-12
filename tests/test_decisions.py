@@ -7,6 +7,7 @@ side effects are local asyncio scheduling and pytest assertion reporting.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -93,7 +94,7 @@ async def test_wait_timeout_returns_default_deny_and_removes_from_pending() -> N
     入参：无；测试内创建默认 deny 的 pending decision，并用很短 wait timeout 等待。
     返回：无返回值；断言通过代表超时会返回默认行为并从 pending 列表消失。
     错误处理：wait 未超时、结果不是 deny 或状态未改为 timed_out 会由 pytest 报告。
-    副作用：仅修改测试内 broker 的内存状态并取消/完成 asyncio future。
+    副作用：仅修改测试内 broker 的内存状态，避免取消共享 future 并写入 timeout 结果。
     """
 
     broker = DecisionBroker()
@@ -114,6 +115,44 @@ async def test_wait_timeout_returns_default_deny_and_removes_from_pending() -> N
     assert timed_out.status == DecisionStatus.TIMED_OUT
     assert timed_out.result == result
     assert broker.pending() == []
+
+
+async def test_cancelled_waiter_does_not_cancel_shared_decision_future() -> None:
+    """Verify cancelling one waiter keeps the decision pending and resolvable.
+
+    入参：无；测试内创建 decision，启动长时间 wait task，随后取消该 task。
+    返回：无返回值；断言通过代表取消外部 waiter 不会取消 broker 共享 future。
+    错误处理：若 task 未抛 CancelledError、decision 丢失 pending 或后续 wait 不能返回 allow，
+    会由 pytest 报告。
+    副作用：仅修改测试内 broker 的内存状态并取消一个测试创建的 asyncio task。
+    """
+
+    broker = DecisionBroker()
+    decision = broker.create(
+        agent_key="codex:session-1",
+        session_id="session-1",
+        tool_name="shell",
+        reason="needs approval",
+        created_at=BASE_TIME,
+        timeout=timedelta(seconds=30),
+    )
+    task = asyncio.create_task(broker.wait(decision.decision_id, timeout=10))
+    await asyncio.sleep(0)
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [pending.decision_id for pending in broker.pending()] == [
+        decision.decision_id
+    ]
+
+    broker.resolve(decision.decision_id, DecisionBehavior.ALLOW, "approved")
+    result = await broker.wait(decision.decision_id, timeout=0.1)
+
+    assert result.behavior == DecisionBehavior.ALLOW
+    assert result.message == "approved"
 
 
 async def test_unknown_resolve_and_wait_raise_key_error() -> None:
