@@ -33,13 +33,14 @@ class FakeDevice:
         firmware_version: str = "1.2.3",
         serial_number: str = "SN123",
         open_error: Exception | None = None,
+        open_result: bool = True,
         init_error: Exception | None = None,
         close_error: Exception | None = None,
     ) -> None:
         """初始化一个可控 fake device。
 
         入参：`device_type`、`path`、`firmware_version`、`serial_number` 是读取接口返回值；
-        `open_error`、`init_error`、`close_error` 分别控制对应阶段是否失败。
+        `open_error`、`open_result`、`init_error`、`close_error` 分别控制对应阶段结果。
         返回：无显式返回值；初始化后的实例可被 fake manager 枚举。
         错误处理：构造阶段不主动抛业务异常。
         副作用：仅保存内存字段，不访问外部 I/O。
@@ -50,9 +51,11 @@ class FakeDevice:
         self._firmware_version = firmware_version
         self._serial_number = serial_number
         self._open_error = open_error
+        self._open_result = open_result
         self._init_error = init_error
         self._close_error = close_error
         self.calls: list[str] = []
+        self.close_notify_values: list[bool | None] = []
 
     def getType(self) -> str:
         """返回 fake 设备类型。
@@ -78,11 +81,11 @@ class FakeDevice:
         self.calls.append("getPath")
         return self.path
 
-    def open(self) -> None:
+    def open(self) -> bool:
         """模拟打开 StreamDock 设备。
 
         入参：无。
-        返回：无返回值；成功时代表设备可继续初始化。
+        返回：构造时传入的 `open_result`；True 代表设备可继续读取诊断信息。
         错误处理：若构造时提供 `open_error`，原样抛出该异常。
         副作用：记录 `open` 调用到内存列表。
         """
@@ -90,6 +93,7 @@ class FakeDevice:
         self.calls.append("open")
         if self._open_error is not None:
             raise self._open_error
+        return self._open_result
 
     def init(self) -> None:
         """模拟探针允许的初始化握手。
@@ -128,16 +132,17 @@ class FakeDevice:
         self.calls.append("getSerialNumber")
         return self._serial_number
 
-    def close(self) -> None:
+    def close(self, notify: bool | None = None) -> None:
         """模拟关闭 StreamDock 设备。
 
-        入参：无。
+        入参：`notify` 模拟官方 SDK 的 `close(notify=False)` 参数。
         返回：无返回值。
         错误处理：若构造时提供 `close_error`，原样抛出该异常；探针应吞掉该异常。
-        副作用：记录 `close` 调用到内存列表。
+        副作用：记录 `close` 调用和 notify 值到内存列表。
         """
 
         self.calls.append("close")
+        self.close_notify_values.append(notify)
         if self._close_error is not None:
             raise self._close_error
 
@@ -220,12 +225,12 @@ class FakeManager:
         return list(self.devices)
 
 
-def test_probe_reports_openable_initialized_device() -> None:
-    """验证可打开设备会完成初始化并读取固件与序列号。
+def test_probe_reports_openable_device_without_initializing() -> None:
+    """验证可打开设备不调用 init 也能读取固件与序列号。
 
     入参：无；测试内构造一个成功 fake device。
-    返回：无返回值；断言通过代表 ProbeResult 字段和调用顺序符合只读诊断契约。
-    错误处理：字段错误、遗漏 close 或调用禁止接口时由 pytest 报告。
+    返回：无返回值；断言通过代表 ProbeResult 字段和调用顺序符合安全诊断契约。
+    错误处理：调用 init、字段错误、遗漏 close 或调用禁止接口时由 pytest 报告。
     副作用：仅修改 fake device/manager 的内存调用记录。
     """
 
@@ -239,7 +244,7 @@ def test_probe_reports_openable_initialized_device() -> None:
             device_type="N4 Pro",
             path="fake-path",
             can_open=True,
-            can_init=True,
+            can_init=False,
             firmware_version="1.2.3",
             serial_number="SN123",
             error=None,
@@ -250,11 +255,11 @@ def test_probe_reports_openable_initialized_device() -> None:
         "getType",
         "getPath",
         "open",
-        "init",
         "getFirmwareVersion",
         "getSerialNumber",
         "close",
     ]
+    assert device.close_notify_values == [False]
 
 
 def test_probe_reports_open_failure_without_init_or_diagnostic_reads() -> None:
@@ -281,19 +286,20 @@ def test_probe_reports_open_failure_without_init_or_diagnostic_reads() -> None:
             error="open failed: RuntimeError: device busy",
         )
     ]
-    assert device.calls == ["getType", "getPath", "open"]
+    assert device.calls == ["getType", "getPath", "open", "close"]
+    assert device.close_notify_values == [False]
 
 
-def test_probe_reports_init_failure_and_still_closes_device() -> None:
-    """验证初始化失败会记录错误且仍尽力关闭已打开设备。
+def test_probe_reports_false_open_result_without_init_or_diagnostic_reads() -> None:
+    """验证官方 SDK 返回 False 的 open 失败路径不会继续 init 或读取。
 
-    入参：无；测试内构造一个 init 抛错的 fake device。
-    返回：无返回值；断言通过代表 can_open 为 True、can_init 为 False 且 close 被调用。
-    错误处理：错误字段不对或未 close 时由 pytest 报告。
+    入参：无；测试内构造一个 `open()` 返回 False 的 fake device。
+    返回：无返回值；断言通过代表 false result 会被视为打开失败。
+    错误处理：若误判 can_open 或继续读取元数据，会由 pytest 报告。
     副作用：仅修改 fake device/manager 的内存调用记录。
     """
 
-    device = FakeDevice(init_error=RuntimeError("init rejected"))
+    device = FakeDevice(open_result=False)
 
     results = probe_streamdock_devices(FakeManager([device]))
 
@@ -301,14 +307,64 @@ def test_probe_reports_init_failure_and_still_closes_device() -> None:
         ProbeResult(
             device_type="N4 Pro",
             path="fake-path",
-            can_open=True,
+            can_open=False,
             can_init=False,
             firmware_version=None,
             serial_number=None,
-            error="init failed: RuntimeError: init rejected",
+            error="open failed: SDK returned false",
         )
     ]
-    assert device.calls == ["getType", "getPath", "open", "init", "close"]
+    assert device.calls == ["getType", "getPath", "open", "close"]
+    assert device.close_notify_values == [False]
+
+
+def test_probe_reports_metadata_read_failure_and_still_closes_device() -> None:
+    """验证元数据读取失败会记录错误且仍尽力关闭已打开设备。
+
+    入参：无；测试内构造一个固件读取抛错的 fake device。
+    返回：无返回值；断言通过代表 can_open 为 True、can_init 为 False 且 close 被调用。
+    错误处理：错误字段不对或未 close 时由 pytest 报告。
+    副作用：仅修改 fake device/manager 的内存调用记录。
+    """
+
+    class FirmwareFailingDevice(FakeDevice):
+        """读取固件版本时失败的 fake device。
+
+        入参：继承 `FakeDevice` 构造参数。
+        返回：实例在 `getFirmwareVersion()` 时抛出 RuntimeError。
+        错误处理：固定抛出 RuntimeError，由探针记录为 read 失败。
+        副作用：仅记录内存调用，不访问外部 I/O。
+        """
+
+        def getFirmwareVersion(self) -> str:
+            """模拟固件读取失败。
+
+            入参：无。
+            返回：正常情况下不返回；总是抛出 RuntimeError。
+            错误处理：固定抛出 RuntimeError。
+            副作用：记录 `getFirmwareVersion` 调用到内存列表。
+            """
+
+            self.calls.append("getFirmwareVersion")
+            raise RuntimeError("firmware rejected")
+
+    device = FirmwareFailingDevice()
+
+    results = probe_streamdock_devices(FakeManager([device]))
+
+    assert results == [
+        ProbeResult(
+            device_type="N4 Pro",
+                        path="fake-path",
+                        can_open=True,
+                        can_init=False,
+                        firmware_version=None,
+                        serial_number=None,
+                        error="read failed: RuntimeError: firmware rejected",
+                    )
+                ]
+    assert device.calls == ["getType", "getPath", "open", "getFirmwareVersion", "close"]
+    assert device.close_notify_values == [False]
 
 
 def test_probe_swallows_close_failure_without_overwriting_success() -> None:
@@ -329,7 +385,7 @@ def test_probe_swallows_close_failure_without_overwriting_success() -> None:
             device_type="N4 Pro",
             path="fake-path",
             can_open=True,
-            can_init=True,
+            can_init=False,
             firmware_version="1.2.3",
             serial_number="SN123",
             error=None,

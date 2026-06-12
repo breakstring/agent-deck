@@ -1,11 +1,12 @@
 """真实 StreamDock 设备的只读诊断探针。
 
-本模块只负责枚举官方 SDK 暴露的 StreamDock 设备，逐个执行 open/init，
-读取固件版本与序列号，并尽力 close。它不渲染图片、不修改 LED、不设置按键、
-不切换场景，也不持有长期硬件连接。
+本模块只负责枚举官方 SDK 暴露的 StreamDock 设备，逐个执行 open，
+读取固件版本与序列号，并用 `notify=False` 尽力 close。它不调用官方 SDK 的
+`init()`，因为该方法会清空图标、设置亮度并刷新屏幕；也不渲染图片、不修改 LED、
+不设置按键、不切换场景，不持有长期硬件连接。
 
 关键副作用：无注入 manager 时会懒加载官方 StreamDock SDK；探针运行期间会短暂
-打开、初始化并关闭 HID 设备。枚举错误保持传播，单设备 open/init/read 错误会写入
+打开并关闭 HID 设备。枚举错误保持传播，单设备 open/read 错误会写入
 `ProbeResult.error`，close 错误会被吞掉以保留首要诊断信息。
 """
 
@@ -37,7 +38,7 @@ class StreamDockDeviceLike(Protocol):
         """打开设备以便执行后续诊断。
 
         入参：无。
-        返回：无返回值；成功后调用方可继续执行 `init()`。
+        返回：无返回值或 truthy 值代表成功；False/None 代表官方 SDK 未能打开设备。
         错误处理：设备 busy、权限不足或传输层失败时允许抛出异常，由探针记录为 open 失败。
         副作用：可能短暂占用 HID 设备连接；不得修改屏幕、LED、按键或场景。
         """
@@ -48,7 +49,8 @@ class StreamDockDeviceLike(Protocol):
         入参：无；调用前必须已经成功 `open()`。
         返回：无返回值；成功后调用方可读取固件和序列号。
         错误处理：初始化失败时允许抛出异常，由探针记录为 init 失败。
-        副作用：仅执行 SDK 所需初始化握手；不得渲染图片、改 LED、改按键或改场景。
+        副作用：官方 SDK 的真实实现会清屏、改亮度和刷新屏幕；安全探针默认不会调用它，
+        此协议声明只保留给 fake 或后续显式接管设备流程。
         """
 
     def close(self) -> None:
@@ -93,8 +95,9 @@ class ProbeResult(BaseModel):
     """单个 StreamDock 设备的诊断结果。
 
     入参：`device_type` 是设备型号或类名；`path` 是可用于识别的设备路径；
-    `can_open` 表示 open 是否成功；`can_init` 表示 open 后 init 是否成功；
-    `firmware_version` 和 `serial_number` 是成功初始化后读取到的诊断元数据；
+        `can_open` 表示 open 是否成功；`can_init` 表示本次探针是否执行并通过 SDK init；
+        安全诊断模式不会调用 init，因此成功只读探针也会返回 `can_init=False`；
+        `firmware_version` 和 `serial_number` 是成功初始化后读取到的诊断元数据；
     `error` 是首个 open/init/read 失败的阶段化错误字符串。
     返回：frozen Pydantic model，可比较、可序列化，并防止调用方事后篡改诊断事实。
     错误处理：字段类型不匹配时由 Pydantic 抛出 ValidationError。
@@ -183,11 +186,12 @@ def probe_streamdock_devices(
 
     入参：`manager` 可注入 fake 或官方 SDK manager；为 None 时懒加载并实例化官方
     `DeviceManager`。该 manager 必须提供 `enumerate()`。
-    返回：每个枚举设备对应一个 `ProbeResult`；设备级 open/init/read 失败会以
-    `error` 字段呈现，不阻断后续设备诊断。
-    错误处理：manager 枚举错误会原样传播；open/init/read 错误被捕获到对应 result；
-    已成功 open 的设备会在 finally 中尽力 close，close 错误被吞掉且不覆盖原诊断。
-    副作用：可能短暂打开、初始化并关闭真实 HID 设备；绝不调用渲染、显示、LED、
+    返回：每个枚举设备对应一个 `ProbeResult`；设备级 open/read 失败会以 `error`
+    字段呈现，不阻断后续设备诊断。安全模式不会调用 SDK init，因此成功结果的
+    `can_init` 仍为 False。
+    错误处理：manager 枚举错误会原样传播；open/read 错误被捕获到对应 result；
+    每个设备都会在 finally 中尽力 close，close 错误被吞掉且不覆盖原诊断。
+    副作用：可能短暂打开并关闭真实 HID 设备；绝不调用渲染、显示、LED、
     按键映射或场景配置类方法。
     """
 
@@ -197,9 +201,10 @@ def probe_streamdock_devices(
     for device in active_manager.enumerate():
         device_type = _safe_device_type(device)
         path = _safe_path(device)
+        opened = False
 
         try:
-            device.open()
+            open_result = device.open()
         except Exception as exc:
             results.append(
                 ProbeResult(
@@ -210,55 +215,72 @@ def probe_streamdock_devices(
                     error=_format_error("open", exc),
                 )
             )
-            continue
-
-        try:
-            try:
-                device.init()
-            except Exception as exc:
+        else:
+            if open_result is False or open_result is None:
                 results.append(
                     ProbeResult(
                         device_type=device_type,
                         path=path,
-                        can_open=True,
+                        can_open=False,
                         can_init=False,
-                        error=_format_error("init", exc),
+                        error="open failed: SDK returned false",
                     )
                 )
-                continue
-
-            try:
-                firmware_version = _read_metadata(device, "firmware")
-                serial_number = _read_metadata(device, "serial")
-            except Exception as exc:
-                results.append(
-                    ProbeResult(
-                        device_type=device_type,
-                        path=path,
-                        can_open=True,
-                        can_init=True,
-                        error=_format_error("read", exc),
+            else:
+                opened = True
+                try:
+                    firmware_version = _read_metadata(device, "firmware")
+                    serial_number = _read_metadata(device, "serial")
+                except Exception as exc:
+                    results.append(
+                        ProbeResult(
+                            device_type=device_type,
+                            path=path,
+                            can_open=True,
+                            can_init=False,
+                            error=_format_error("read", exc),
+                        )
                     )
-                )
-                continue
-
-            results.append(
-                ProbeResult(
-                    device_type=device_type,
-                    path=path,
-                    can_open=True,
-                    can_init=True,
-                    firmware_version=firmware_version,
-                    serial_number=serial_number,
-                )
-            )
+                else:
+                    results.append(
+                        ProbeResult(
+                            device_type=device_type,
+                            path=path,
+                            can_open=True,
+                            can_init=False,
+                            firmware_version=firmware_version,
+                            serial_number=serial_number,
+                        )
+                    )
         finally:
             try:
-                device.close()
+                _close_device_quietly(device, opened=opened)
             except Exception:
                 pass
 
     return results
+
+
+def _close_device_quietly(device: StreamDockDeviceLike, *, opened: bool) -> None:
+    """尽力关闭设备，并避免官方 SDK 的断开通知副作用。
+
+    入参：`device` 是刚尝试 open 的 SDK 或 fake device；`opened` 表示 open 是否明确成功。
+    `opened` 目前仅作为调用者意图的显式记录；即使 open 失败也会尝试 close。
+    返回：无显式返回值。
+    错误处理：close 抛出的任何异常都由本函数吞掉，避免覆盖首要诊断错误。
+    副作用：可能释放 HID transport；若设备 close 支持 `notify=False`，会显式传入 False，
+    避免官方 SDK 默认发送 disconnect/clear 类设备命令。open 失败时也会尝试 close，
+    用于释放半打开资源。
+    """
+
+    try:
+        close = device.close
+        try:
+            close(notify=False)  # type: ignore[call-arg]
+        except TypeError:
+            close()
+    except Exception:
+        return
 
 
 def _safe_path(device: Any) -> str:
