@@ -9,12 +9,14 @@ is replaced with pytest monkeypatch fakes and Typer's in-process CliRunner.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from typer.testing import CliRunner
 
 from agent_deck import __version__
 from agent_deck import cli
+from agent_deck.rendering.asset_builder import CodexVisualAssetBuildResult
 
 
 runner = CliRunner()
@@ -321,6 +323,57 @@ def test_daemon_rejects_out_of_range_port_before_uvicorn(monkeypatch: Any) -> No
 
     assert result.exit_code == 2
     assert calls == []
+
+
+def test_generate_codex_assets_uses_default_sources(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Verify `generate-codex-assets` calls the local asset builder.
+
+    入参：`monkeypatch` 替换 CLI 内的 builder；`tmp_path` 提供输出目录。
+    返回：无返回值；断言通过代表默认源素材、尺寸和帧数参数传递正确。
+    错误处理：命令缺失、退出码非 0、参数传递错误或 JSON 输出错误由 pytest 报告。
+    副作用：只写入测试内存记录，不读取真实 assets、不生成真实图片。
+    """
+
+    output_dir = tmp_path / "codex-preview"
+    calls: list[dict[str, Any]] = []
+
+    def fake_build_codex_visual_assets(**kwargs: Any) -> CodexVisualAssetBuildResult:
+        """Capture CLI builder arguments and return deterministic metadata.
+
+        入参：`kwargs` 是 CLI 转发给 builder 的命名参数。
+        返回：固定 `CodexVisualAssetBuildResult`，用于 CLI JSON 输出断言。
+        错误处理：本 fake 不主动抛异常。
+        副作用：把调用参数追加到 `calls`。
+        """
+
+        calls.append(kwargs)
+        return CodexVisualAssetBuildResult(
+            output_dir=kwargs["output_dir"],
+            preview_path=kwargs["output_dir"] / "preview.png",
+            frame_size=kwargs["key_size"],
+            variant_frame_counts={"idle": 1, "offline": 1},
+        )
+
+    monkeypatch.setattr(cli, "build_codex_visual_assets", fake_build_codex_visual_assets)
+
+    result = runner.invoke(
+        cli.ctl_app,
+        ["generate-codex-assets", "--output-dir", str(output_dir)],
+    )
+
+    assert result.exit_code == 0
+    assert len(calls) == 1
+    assert calls[0]["source_gif"] == Path("assets/codex/codex.gif")
+    assert calls[0]["source_png"] == Path("assets/codex/codex.png")
+    assert calls[0]["output_dir"] == output_dir
+    assert calls[0]["key_size"] == (112, 112)
+    assert calls[0]["max_frames"] == 12
+    payload = json.loads(result.output)
+    assert payload["preview_path"] == str(output_dir / "preview.png")
+    assert payload["variant_frame_counts"] == {"idle": 1, "offline": 1}
 
 
 def _install_fake_client(monkeypatch: Any, fail: bool = False) -> None:

@@ -40,7 +40,9 @@ def test_user_intervention_statuses_share_needs_user_visual(
     spec = resolve_visual_icon_spec(status)
 
     assert spec.visual_state == VisualAgentState.NEEDS_USER
-    assert spec.asset_id == "codex-needs-user"
+    assert spec.base_asset_id == "assets/codex/codex.gif"
+    assert spec.asset_id == "generated/codex/needs_user"
+    assert spec.variant_id == "needs_user"
     assert spec.accent_color == "amber"
     assert spec.animation == VisualAnimation.PULSE
     assert spec.badge == VisualBadge.USER_ACTION
@@ -63,7 +65,9 @@ def test_active_work_statuses_share_working_visual(status: AgentStatus) -> None:
     spec = resolve_visual_icon_spec(status)
 
     assert spec.visual_state == VisualAgentState.WORKING
-    assert spec.asset_id == "codex-working"
+    assert spec.base_asset_id == "assets/codex/codex.gif"
+    assert spec.asset_id == "generated/codex/working"
+    assert spec.variant_id == "working"
     assert spec.accent_color == "cyan"
     assert spec.animation == VisualAnimation.SWEEP
     assert spec.badge is None
@@ -82,7 +86,9 @@ def test_idle_uses_existing_codex_gif() -> None:
     spec = resolve_visual_icon_spec(AgentStatus.IDLE)
 
     assert spec.visual_state == VisualAgentState.IDLE
+    assert spec.base_asset_id == "assets/codex/codex.gif"
     assert spec.asset_id == "assets/codex/codex.gif"
+    assert spec.variant_id == "idle"
     assert spec.animation == VisualAnimation.GIF_ASSET
     assert spec.accent_color == "green"
     assert spec.badge is None
@@ -101,7 +107,9 @@ def test_completed_recently_reuses_idle_with_success_badge() -> None:
     spec = resolve_visual_icon_spec(AgentStatus.COMPLETED_RECENTLY)
 
     assert spec.visual_state == VisualAgentState.IDLE
+    assert spec.base_asset_id == "assets/codex/codex.gif"
     assert spec.asset_id == "assets/codex/codex.gif"
+    assert spec.variant_id == "completed"
     assert spec.animation == VisualAnimation.FLASH
     assert spec.accent_color == "green"
     assert spec.badge == VisualBadge.SUCCESS
@@ -120,7 +128,9 @@ def test_offline_uses_static_codex_png_dimmed() -> None:
     spec = resolve_visual_icon_spec(AgentStatus.OFFLINE)
 
     assert spec.visual_state == VisualAgentState.OFFLINE
+    assert spec.base_asset_id == "assets/codex/codex.png"
     assert spec.asset_id == "assets/codex/codex.png"
+    assert spec.variant_id == "offline"
     assert spec.animation == VisualAnimation.NONE
     assert spec.accent_color == "gray"
     assert spec.dimmed is True
@@ -139,7 +149,9 @@ def test_error_has_dedicated_visual_state() -> None:
     spec = resolve_visual_icon_spec(AgentStatus.ERROR)
 
     assert spec.visual_state == VisualAgentState.ERROR
-    assert spec.asset_id == "codex-error"
+    assert spec.base_asset_id == "assets/codex/codex.gif"
+    assert spec.asset_id == "generated/codex/error"
+    assert spec.variant_id == "error"
     assert spec.animation == VisualAnimation.PULSE
     assert spec.accent_color == "red"
     assert spec.badge == VisualBadge.ERROR

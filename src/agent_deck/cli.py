@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import sys
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated, Any
 
 import httpx
@@ -21,6 +22,7 @@ import uvicorn
 from agent_deck import __version__
 from agent_deck.core.decisions import DecisionBehavior
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
+from agent_deck.rendering.asset_builder import build_codex_visual_assets
 from agent_deck.server.app import create_app
 
 DEFAULT_DAEMON_URL = "http://127.0.0.1:8765"
@@ -224,6 +226,87 @@ def resolve(
     except (httpx.HTTPError, ValueError) as exc:
         _fail_http_command("resolve", exc)
     _echo_json(payload)
+
+
+@ctl_app.command("generate-codex-assets")
+def generate_codex_assets(
+    output_dir: Annotated[
+        Path,
+        typer.Option(
+            "--output-dir",
+            help="Directory for generated Codex visual frames and preview.",
+        ),
+    ],
+    source_gif: Annotated[
+        Path,
+        typer.Option(
+            "--source-gif",
+            help="Source animated Codex GIF.",
+        ),
+    ] = Path("assets/codex/codex.gif"),
+    source_png: Annotated[
+        Path,
+        typer.Option(
+            "--source-png",
+            help="Source static Codex PNG for offline state.",
+        ),
+    ] = Path("assets/codex/codex.png"),
+    key_width: Annotated[
+        int,
+        typer.Option(
+            "--key-width",
+            help="Generated key frame width in pixels.",
+            min=1,
+        ),
+    ] = 112,
+    key_height: Annotated[
+        int,
+        typer.Option(
+            "--key-height",
+            help="Generated key frame height in pixels.",
+            min=1,
+        ),
+    ] = 112,
+    max_frames: Annotated[
+        int,
+        typer.Option(
+            "--max-frames",
+            help="Maximum GIF frames to prerender per animated variant.",
+            min=1,
+        ),
+    ] = 12,
+) -> None:
+    """Generate local Codex visual asset frames and a preview sheet.
+
+    入参：`output_dir` 是生成目录；`source_gif` 是非 offline 状态的源 GIF；
+    `source_png` 是 offline 状态的源 PNG；`key_width`/`key_height` 是输出帧尺寸；
+    `max_frames` 是每个动画变体最多预渲染的帧数。
+    返回：无显式返回值；成功时以 JSON 输出生成目录、预览图路径、帧尺寸和变体帧数。
+    错误处理：源资产缺失、图片解码失败、输出目录不可写或参数非法时写 stderr 并 exit 1；
+    Typer 负责命令行参数类型和范围错误。
+    副作用：读取源 GIF/PNG，写入输出目录下的 PNG 帧和 `preview.png`；不访问 daemon、
+    不连接硬件、不修改 Codex 配置。
+    """
+
+    try:
+        result = build_codex_visual_assets(
+            source_gif=source_gif,
+            source_png=source_png,
+            output_dir=output_dir,
+            key_size=(key_width, key_height),
+            max_frames=max_frames,
+        )
+    except Exception as exc:
+        typer.echo(f"agent-deckctl generate-codex-assets: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    _echo_json(
+        {
+            "output_dir": str(result.output_dir),
+            "preview_path": str(result.preview_path),
+            "frame_size": list(result.frame_size),
+            "variant_frame_counts": result.variant_frame_counts,
+        }
+    )
 
 
 @codex_hook_app.callback()

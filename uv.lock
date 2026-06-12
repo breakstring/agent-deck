@@ -9,6 +9,7 @@ source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "pillow" },
     { name = "pydantic" },
     { name = "streamdock" },
     { name = "typer" },
@@ -25,6 +26,7 @@ dev = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.28.0" },
+    { name = "pillow", specifier = ">=10.0.0" },
     { name = "pydantic", specifier = ">=2.7.0" },
     { name = "streamdock", specifier = ">=0.1.2,<0.2.0" },
     { name = "typer", specifier = ">=0.12.0" },

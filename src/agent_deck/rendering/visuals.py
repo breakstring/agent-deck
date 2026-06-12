@@ -1,6 +1,6 @@
 """Agent 状态到按钮视觉规格的渲染层映射。
 
-本模块只负责把内部 `AgentStatus` 压缩成硬件按钮可消费的主视觉态、资产 id、
+本模块只负责把内部 `AgentStatus` 压缩成硬件按钮可消费的主视觉态、源资产 id、
 强调色、动画语义和角标信息。它不生成图片、不读取 `assets/` 文件、不访问真实
 StreamDock 设备、不启动服务，也不修改状态机；后续具体 renderer 可以根据
 `VisualIconSpec` 决定如何加载 GIF、生成帧或绘制 overlay。
@@ -64,10 +64,11 @@ class VisualBadge(StrEnum):
 class VisualIconSpec(BaseModel):
     """描述一个 Agent 按钮槽位的视觉规格。
 
-    入参：`visual_state` 是压缩后的主视觉态；`asset_id` 可以是实际资产路径或逻辑
-    资产名称；`accent_color` 是 renderer 可映射到具体色值的语义颜色；
-    `animation` 是动画语义；`badge` 可为空；`dimmed` 表示低亮展示；
-    `priority` 表示视觉刷新/提醒优先级，数字越小越需要用户注意。
+    入参：`visual_state` 是压缩后的主视觉态；`base_asset_id` 是源素材路径或 id；
+    `asset_id` 是最终可播放资产路径或生成缓存 id；`variant_id` 是生成器使用的变体名；
+    `accent_color` 是 renderer 可映射到具体色值的语义颜色；`animation` 是动画语义；
+    `badge` 可为空；`dimmed` 表示低亮展示；`priority` 表示视觉刷新/提醒优先级，
+    数字越小越需要用户注意。
     返回：frozen Pydantic model，可被 layout、API 和 renderer 只读消费。
     错误处理：字段类型、枚举值或负优先级非法时由 Pydantic 报告。
     副作用：仅保存内存数据，不读取图片、不访问网络、硬件或文件系统。
@@ -76,7 +77,9 @@ class VisualIconSpec(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     visual_state: VisualAgentState
+    base_asset_id: str
     asset_id: str
+    variant_id: str
     accent_color: str
     animation: VisualAnimation
     badge: VisualBadge | None = None
@@ -88,9 +91,9 @@ def resolve_visual_icon_spec(status: AgentStatus) -> VisualIconSpec:
     """把内部 Agent 状态解析成按钮主视觉规格。
 
     入参：`status` 是状态归约层输出的 `AgentStatus`；本函数只接受已知枚举值。
-    返回：对应的 `VisualIconSpec`。当前映射保留 error 独立视觉态，将
-    approval/waiting 合并为 `needs_user`，running/thinking 合并为 `working`，
-    idle 复用 `assets/codex/codex.gif`，offline 复用 `assets/codex/codex.png`。
+    返回：对应的 `VisualIconSpec`。当前映射保留 error 独立视觉态；除 offline 外都以
+    `assets/codex/codex.gif` 为源素材，再映射到 generated/codex 下的变体缓存；
+    offline 以 `assets/codex/codex.png` 为源素材。
     错误处理：如果未来传入非 `AgentStatus` 值，匹配不到时抛出 ValueError，
     由调用方决定是否降级。
     副作用：无；只创建内存模型，不读取资产、不访问硬件、不修改状态机。
@@ -100,7 +103,9 @@ def resolve_visual_icon_spec(status: AgentStatus) -> VisualIconSpec:
         case AgentStatus.APPROVAL_NEEDED | AgentStatus.WAITING_USER:
             return VisualIconSpec(
                 visual_state=VisualAgentState.NEEDS_USER,
-                asset_id="codex-needs-user",
+                base_asset_id="assets/codex/codex.gif",
+                asset_id="generated/codex/needs_user",
+                variant_id="needs_user",
                 accent_color="amber",
                 animation=VisualAnimation.PULSE,
                 badge=VisualBadge.USER_ACTION,
@@ -109,7 +114,9 @@ def resolve_visual_icon_spec(status: AgentStatus) -> VisualIconSpec:
         case AgentStatus.ERROR:
             return VisualIconSpec(
                 visual_state=VisualAgentState.ERROR,
-                asset_id="codex-error",
+                base_asset_id="assets/codex/codex.gif",
+                asset_id="generated/codex/error",
+                variant_id="error",
                 accent_color="red",
                 animation=VisualAnimation.PULSE,
                 badge=VisualBadge.ERROR,
@@ -118,7 +125,9 @@ def resolve_visual_icon_spec(status: AgentStatus) -> VisualIconSpec:
         case AgentStatus.RUNNING_TOOL | AgentStatus.THINKING:
             return VisualIconSpec(
                 visual_state=VisualAgentState.WORKING,
-                asset_id="codex-working",
+                base_asset_id="assets/codex/codex.gif",
+                asset_id="generated/codex/working",
+                variant_id="working",
                 accent_color="cyan",
                 animation=VisualAnimation.SWEEP,
                 priority=2,
@@ -126,7 +135,9 @@ def resolve_visual_icon_spec(status: AgentStatus) -> VisualIconSpec:
         case AgentStatus.COMPLETED_RECENTLY:
             return VisualIconSpec(
                 visual_state=VisualAgentState.IDLE,
+                base_asset_id="assets/codex/codex.gif",
                 asset_id="assets/codex/codex.gif",
+                variant_id="completed",
                 accent_color="green",
                 animation=VisualAnimation.FLASH,
                 badge=VisualBadge.SUCCESS,
@@ -135,7 +146,9 @@ def resolve_visual_icon_spec(status: AgentStatus) -> VisualIconSpec:
         case AgentStatus.IDLE:
             return VisualIconSpec(
                 visual_state=VisualAgentState.IDLE,
+                base_asset_id="assets/codex/codex.gif",
                 asset_id="assets/codex/codex.gif",
+                variant_id="idle",
                 accent_color="green",
                 animation=VisualAnimation.GIF_ASSET,
                 priority=4,
@@ -143,7 +156,9 @@ def resolve_visual_icon_spec(status: AgentStatus) -> VisualIconSpec:
         case AgentStatus.OFFLINE:
             return VisualIconSpec(
                 visual_state=VisualAgentState.OFFLINE,
+                base_asset_id="assets/codex/codex.png",
                 asset_id="assets/codex/codex.png",
+                variant_id="offline",
                 accent_color="gray",
                 animation=VisualAnimation.NONE,
                 dimmed=True,
