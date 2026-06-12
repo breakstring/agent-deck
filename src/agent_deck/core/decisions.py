@@ -10,6 +10,8 @@ non-durable.
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from datetime import datetime, timedelta
 from enum import StrEnum
 from uuid import uuid4
@@ -102,13 +104,13 @@ class PendingDecision(BaseModel):
 
 
 class DecisionBroker:
-    """Coordinate in-process approval decisions with asyncio futures.
+    """Coordinate in-process approval decisions across threads and loops.
 
     入参：构造时不需要外部依赖；后续通过 `create` 注册 pending decision。
     返回：方法返回 frozen `PendingDecision` 或 `DecisionResult` 快照。
-    错误处理：未知 decision id 抛 KeyError；无运行中的 asyncio loop 创建有效 decision
-    时由 `asyncio.get_running_loop` 抛 RuntimeError；模型校验错误按 Pydantic 语义传播。
-    副作用：修改本实例内存 dict，并完成对应 asyncio future；不访问外部 I/O。
+    错误处理：未知 decision id 抛 KeyError；模型校验错误按 Pydantic 语义传播。
+    副作用：在 `threading.Condition` 保护下修改本实例内存 dict，并通知等待线程；
+    不绑定 asyncio event loop，也不访问外部 I/O。
     """
 
     def __init__(self) -> None:
@@ -117,11 +119,11 @@ class DecisionBroker:
         入参：无。
         返回：无显式返回值；初始化后的 broker 可注册和等待 decision。
         错误处理：本方法不主动抛业务异常。
-        副作用：仅初始化内存 dict，不访问网络、硬件或文件系统。
+        副作用：仅初始化内存 dict 和线程条件变量，不访问网络、硬件或文件系统。
         """
 
         self._decisions: dict[str, PendingDecision] = {}
-        self._futures: dict[str, asyncio.Future[DecisionResult]] = {}
+        self._condition = threading.Condition()
 
     def create(
         self,
@@ -134,15 +136,15 @@ class DecisionBroker:
         turn_id: str | None = None,
         default_behavior: DecisionBehavior = DecisionBehavior.DENY,
     ) -> PendingDecision:
-        """Register a pending decision and its asyncio future.
+        """Register a pending decision without binding it to an asyncio loop.
 
         入参：`agent_key` 是状态聚合 key；`session_id`、`turn_id` 和 `tool_name` 标记来源；
         `reason` 是展示给审批 UI 的原因；`created_at` 必须带 timezone；`timeout` 可为
         正数秒或正 `timedelta`；`default_behavior` 是 wait 超时时返回的行为。
         返回：status 为 pending 的 `PendingDecision` 快照，`expires_at = created_at + timeout`。
-        错误处理：非正 timeout 抛 ValueError；naive 时间由 Pydantic ValidationError 报告；
-        没有运行中的 asyncio loop 时抛 RuntimeError，避免 future 绑定到不明确 loop。
-        副作用：写入本 broker 的内存 decision/future 表；不访问外部 I/O。
+        错误处理：非正 timeout 抛 ValueError；naive 时间由 Pydantic ValidationError 报告。
+        副作用：在 condition 锁内写入本 broker 的内存 decision 表；不创建 asyncio future，
+        不访问外部 I/O。
         """
 
         timeout_delta = _coerce_positive_timeout(timeout)
@@ -157,9 +159,9 @@ class DecisionBroker:
             expires_at=created_at + timeout_delta,
             default_behavior=default_behavior,
         )
-        loop = asyncio.get_running_loop()
-        self._decisions[decision.decision_id] = decision
-        self._futures[decision.decision_id] = loop.create_future()
+        with self._condition:
+            self._decisions[decision.decision_id] = decision
+            self._condition.notify_all()
         return decision
 
     def resolve(
@@ -175,52 +177,34 @@ class DecisionBroker:
         返回：resolved `PendingDecision`；若该 decision 已 resolved 或 timed_out，则幂等返回
         已保存的终态快照，不改写原结果。
         错误处理：未知 decision id 抛 KeyError；非法 behavior 由 Pydantic 校验报告。
-        副作用：首次 resolve 会更新本 broker 内存状态并完成对应 asyncio future；不访问外部 I/O。
+        副作用：首次 resolve 会在 condition 锁内更新本 broker 内存状态并通知 waiters；
+        不访问外部 I/O。
         """
 
-        decision = self._require_decision(decision_id)
-        if decision.status != DecisionStatus.PENDING:
-            return decision
+        with self._condition:
+            decision = self._require_decision_locked(decision_id)
+            if decision.status != DecisionStatus.PENDING:
+                return decision
 
-        result = DecisionResult(behavior=behavior, message=message)
-        resolved = decision.model_copy(
-            update={"status": DecisionStatus.RESOLVED, "result": result}
-        )
-        self._decisions[decision_id] = resolved
-        self._complete_future(decision_id, result)
-        return resolved
+            result = DecisionResult(behavior=behavior, message=message)
+            resolved = decision.model_copy(
+                update={"status": DecisionStatus.RESOLVED, "result": result}
+            )
+            self._decisions[decision_id] = resolved
+            self._condition.notify_all()
+            return resolved
 
     async def wait(self, decision_id: str, timeout: float) -> DecisionResult:
-        """Wait for a decision result or mark it timed out.
+        """Wait for a decision result or mark it timed out without loop affinity.
 
-        入参：`decision_id` 是 `create` 返回的 id；`timeout` 是本次等待的最长秒数，交给
-        `asyncio.wait_for` 解释。
+        入参：`decision_id` 是 `create` 返回的 id；`timeout` 是本次等待的最长秒数。
         返回：resolved result；若等待超时，返回 default behavior 和固定 timeout message。
-        错误处理：未知 decision id 抛 KeyError；非法 wait timeout 由 asyncio 报告或立即超时。
-        副作用：超时时更新本 broker 内存状态为 timed_out 并完成 future；不访问外部 I/O。
+        错误处理：未知 decision id 抛 KeyError；非正 timeout 会按立即超时处理。
+        副作用：通过 `asyncio.to_thread` 在 condition 上等待；超时时在同一锁内仅一次更新
+        timed_out 状态并通知其他 waiters；取消当前 coroutine 不会取消共享 decision 状态。
         """
 
-        decision = self._require_decision(decision_id)
-        if decision.result is not None:
-            return decision.result
-
-        future = self._futures[decision_id]
-        try:
-            return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
-        except TimeoutError:
-            current = self._require_decision(decision_id)
-            if current.result is not None:
-                return current.result
-            result = DecisionResult(
-                behavior=current.default_behavior,
-                message=_DEFAULT_TIMEOUT_MESSAGE,
-            )
-            timed_out = current.model_copy(
-                update={"status": DecisionStatus.TIMED_OUT, "result": result}
-            )
-            self._decisions[decision_id] = timed_out
-            self._complete_future(decision_id, result)
-            return result
+        return await asyncio.to_thread(self._wait_blocking, decision_id, timeout)
 
     def pending(self) -> list[PendingDecision]:
         """Return pending decisions sorted by creation time.
@@ -228,17 +212,18 @@ class DecisionBroker:
         入参：无；读取当前 broker 内存状态。
         返回：仅包含 status 为 pending 的 `PendingDecision` 列表，按 `created_at` 升序。
         错误处理：不主动抛业务异常；内部数据若被外部破坏则按 Python 排序语义传播。
-        副作用：无；只读取内存并创建列表，不访问外部 I/O。
+        副作用：无；在 condition 锁内只读取内存并创建列表，不访问外部 I/O。
         """
 
-        return sorted(
-            (
-                decision
-                for decision in self._decisions.values()
-                if decision.status == DecisionStatus.PENDING
-            ),
-            key=lambda decision: decision.created_at,
-        )
+        with self._condition:
+            return sorted(
+                (
+                    decision
+                    for decision in self._decisions.values()
+                    if decision.status == DecisionStatus.PENDING
+                ),
+                key=lambda decision: decision.created_at,
+            )
 
     def get(self, decision_id: str) -> PendingDecision | None:
         """Return one decision snapshot without changing broker state.
@@ -246,15 +231,63 @@ class DecisionBroker:
         入参：`decision_id` 是 `create` 返回的 id。
         返回：已存储的 `PendingDecision`；未知 id 返回 None。
         错误处理：本方法不主动抛业务异常。
-        副作用：无；只读取内存状态，不访问外部 I/O。
+        副作用：无；在 condition 锁内只读取内存状态，不访问外部 I/O。
         """
 
-        return self._decisions.get(decision_id)
+        with self._condition:
+            return self._decisions.get(decision_id)
 
-    def _require_decision(self, decision_id: str) -> PendingDecision:
-        """Return a stored decision or raise KeyError.
+    def _wait_blocking(self, decision_id: str, timeout: float) -> DecisionResult:
+        """Block on the condition until a decision resolves or times out.
 
-        入参：`decision_id` 是调用方要读取的 decision id。
+        入参：`decision_id` 是调用方要等待的 decision id；`timeout` 是最长等待秒数。
+        返回：已保存的 terminal result；超时时返回并保存默认 result。
+        错误处理：未知 id 抛 KeyError；无法转为 float 的 timeout 按 Python 异常传播。
+        副作用：可能在 condition 锁内把 pending decision 标记为 timed_out 并通知 waiters。
+        """
+
+        deadline = time.monotonic() + float(timeout)
+        with self._condition:
+            decision = self._require_decision_locked(decision_id)
+            if decision.result is not None:
+                return decision.result
+
+            while decision.result is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return self._timeout_decision_locked(decision_id)
+                self._condition.wait(timeout=remaining)
+                decision = self._require_decision_locked(decision_id)
+
+            return decision.result
+
+    def _timeout_decision_locked(self, decision_id: str) -> DecisionResult:
+        """Mark a pending decision timed out while holding the condition lock.
+
+        入参：`decision_id` 是要 timeout 的 decision id；调用方必须已经持有 condition 锁。
+        返回：existing result 或新建的 default timeout result。
+        错误处理：未知 id 抛 KeyError。
+        副作用：首次 timeout 会更新 `_decisions` 并通知所有 condition waiters。
+        """
+
+        current = self._require_decision_locked(decision_id)
+        if current.result is not None:
+            return current.result
+        result = DecisionResult(
+            behavior=current.default_behavior,
+            message=_DEFAULT_TIMEOUT_MESSAGE,
+        )
+        timed_out = current.model_copy(
+            update={"status": DecisionStatus.TIMED_OUT, "result": result}
+        )
+        self._decisions[decision_id] = timed_out
+        self._condition.notify_all()
+        return result
+
+    def _require_decision_locked(self, decision_id: str) -> PendingDecision:
+        """Return a stored decision while the condition lock is held.
+
+        入参：`decision_id` 是调用方要读取的 decision id；调用方必须持有 condition 锁。
         返回：对应 `PendingDecision` 快照。
         错误处理：id 不存在时抛 KeyError，错误消息包含原 id 便于定位。
         副作用：无；只读取内存 dict。
@@ -264,19 +297,6 @@ class DecisionBroker:
             return self._decisions[decision_id]
         except KeyError as error:
             raise KeyError(f"unknown decision_id: {decision_id}") from error
-
-    def _complete_future(self, decision_id: str, result: DecisionResult) -> None:
-        """Complete the stored future when it has not already completed.
-
-        入参：`decision_id` 是 future 表 key；`result` 是要交付给 waiters 的终态结果。
-        返回：无显式返回值。
-        错误处理：未知 future 会按 dict 访问抛 KeyError；已完成 future 会被忽略。
-        副作用：可能完成一个 asyncio future，唤醒等待中的 coroutine；不访问外部 I/O。
-        """
-
-        future = self._futures[decision_id]
-        if not future.done():
-            future.set_result(result)
 
 
 def _coerce_positive_timeout(timeout: timedelta | float | int) -> timedelta:

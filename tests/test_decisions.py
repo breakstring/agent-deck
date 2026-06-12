@@ -22,13 +22,40 @@ from agent_deck.core.decisions import (
 BASE_TIME = datetime(2026, 6, 12, 8, 0, tzinfo=UTC)
 
 
+def test_create_without_running_loop_succeeds() -> None:
+    """Verify create can be called from a synchronous no-loop context.
+
+    入参：无；测试内在普通同步 pytest test 中调用 `DecisionBroker.create`。
+    返回：无返回值；断言通过代表 broker 不把 creation 绑定到当前 asyncio loop。
+    错误处理：若 create 依赖 `asyncio.get_running_loop` 并抛 RuntimeError，会由 pytest 报告。
+    副作用：仅修改测试内 broker 的内存状态，不创建 asyncio future 或外部资源。
+    """
+
+    broker = DecisionBroker()
+
+    decision = broker.create(
+        agent_key="codex:session-1",
+        session_id="session-1",
+        tool_name="shell",
+        reason="needs approval",
+        created_at=BASE_TIME,
+        timeout=timedelta(seconds=30),
+    )
+
+    assert decision.agent_key == "codex:session-1"
+    assert decision.status == DecisionStatus.PENDING
+    assert [pending.decision_id for pending in broker.pending()] == [
+        decision.decision_id
+    ]
+
+
 async def test_create_accepts_first_six_arguments_positionally() -> None:
     """Verify create supports the positional API shape from the task spec.
 
     入参：无；测试内按 spec 位置参数顺序调用 `DecisionBroker.create`。
     返回：无返回值；断言通过代表前六个业务参数可位置传入且字段正确保存。
     错误处理：签名不兼容、模型校验失败或字段不匹配会由 pytest 报告。
-    副作用：仅修改测试内 broker 的内存状态并注册 asyncio future。
+    副作用：仅修改测试内 broker 的内存状态，不绑定 asyncio event loop。
     """
 
     broker = DecisionBroker()
@@ -58,7 +85,7 @@ async def test_create_resolve_allow_and_wait_returns_allow() -> None:
     入参：无；测试内创建 `DecisionBroker` 并注册 shell 工具决策。
     返回：无返回值；断言通过代表 create/resolve/wait 的基本成功路径成立。
     错误处理：未知 id、模型校验失败或 wait 未收到 allow 会由 pytest 报告。
-    副作用：仅修改测试内 broker 的内存状态并调度 asyncio future。
+    副作用：仅修改测试内 broker 的内存状态并通过 async wait 读取 result。
     """
 
     broker = DecisionBroker()
@@ -94,7 +121,7 @@ async def test_wait_timeout_returns_default_deny_and_removes_from_pending() -> N
     入参：无；测试内创建默认 deny 的 pending decision，并用很短 wait timeout 等待。
     返回：无返回值；断言通过代表超时会返回默认行为并从 pending 列表消失。
     错误处理：wait 未超时、结果不是 deny 或状态未改为 timed_out 会由 pytest 报告。
-    副作用：仅修改测试内 broker 的内存状态，避免取消共享 future 并写入 timeout 结果。
+    副作用：仅修改测试内 broker 的内存状态，并写入 timeout 结果。
     """
 
     broker = DecisionBroker()
@@ -117,11 +144,11 @@ async def test_wait_timeout_returns_default_deny_and_removes_from_pending() -> N
     assert broker.pending() == []
 
 
-async def test_cancelled_waiter_does_not_cancel_shared_decision_future() -> None:
+async def test_cancelled_waiter_does_not_cancel_shared_decision() -> None:
     """Verify cancelling one waiter keeps the decision pending and resolvable.
 
     入参：无；测试内创建 decision，启动长时间 wait task，随后取消该 task。
-    返回：无返回值；断言通过代表取消外部 waiter 不会取消 broker 共享 future。
+    返回：无返回值；断言通过代表取消外部 waiter 不会取消 broker 共享 decision。
     错误处理：若 task 未抛 CancelledError、decision 丢失 pending 或后续 wait 不能返回 allow，
     会由 pytest 报告。
     副作用：仅修改测试内 broker 的内存状态并取消一个测试创建的 asyncio task。
@@ -179,7 +206,7 @@ async def test_pending_sorts_by_created_at_and_filters_resolved_and_timed_out() 
     入参：无；测试内创建三个不同创建时间的 decision，并分别 resolve/timeout 两个。
     返回：无返回值；断言通过代表 `pending()` 只返回仍 pending 的决策且按创建时间升序。
     错误处理：排序错误、终态未过滤或 wait 超时失败会由 pytest 报告。
-    副作用：仅修改测试内 broker 的内存状态并调度 asyncio future。
+    副作用：仅修改测试内 broker 的内存状态并通过 async wait 写入 timeout 结果。
     """
 
     broker = DecisionBroker()
@@ -222,7 +249,7 @@ async def test_resolve_after_timeout_does_not_replace_timed_out_result() -> None
     入参：无；测试内让 decision 先通过 wait 超时，再调用 resolve allow。
     返回：无返回值；断言通过代表 timeout 后 resolve 幂等返回既有 timed_out snapshot。
     错误处理：若后续 resolve 改写状态、行为或 message，会由 pytest 报告。
-    副作用：仅修改测试内 broker 的内存状态并调度 asyncio future。
+    副作用：仅修改测试内 broker 的内存状态并通过 async wait 写入 timeout 结果。
     """
 
     broker = DecisionBroker()
@@ -272,7 +299,7 @@ def test_create_rejects_non_positive_timeout() -> None:
     """Verify decision creation requires a positive timeout.
 
     入参：无；测试内传入零秒 timeout。
-    返回：无返回值；断言通过代表无效 timeout 会在注册 future 前被拒绝。
+    返回：无返回值；断言通过代表无效 timeout 会在写入 broker 状态前被拒绝。
     错误处理：若创建成功或抛出非 ValueError，会由 pytest 报告。
     副作用：仅尝试创建内存模型，不访问网络、硬件或文件系统。
     """
@@ -296,7 +323,7 @@ async def test_duplicate_resolve_returns_existing_resolved_snapshot() -> None:
     入参：无；测试内先 resolve allow，再尝试 resolve deny。
     返回：无返回值；断言通过代表重复 resolve 返回首次 resolved snapshot。
     错误处理：若第二次 resolve 改写结果或抛出异常，会由 pytest 报告。
-    副作用：仅修改测试内 broker 的内存状态并完成 asyncio future。
+    副作用：仅修改测试内 broker 的内存状态并通知 condition waiters。
     """
 
     broker = DecisionBroker()

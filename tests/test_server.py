@@ -197,6 +197,26 @@ def test_wait_returns_existing_resolved_decision_result() -> None:
     assert response.json() == {"behavior": "allow", "message": "approved"}
 
 
+def test_testclient_pending_wait_timeout_returns_deny_not_500() -> None:
+    """Verify pending wait works across TestClient request loops.
+
+    入参：无；测试内使用 `raise_server_exceptions=False` 的 TestClient 创建 pending decision
+    后等待短 timeout。
+    返回：无返回值；断言通过代表 API 不暴露 cross-loop future 500，并返回默认 deny。
+    错误处理：若 wait await 到其他 loop 的 future，HTTP 500 会由断言报告。
+    副作用：仅修改测试 app 内存 runtime，并让 broker timeout 一个 pending decision。
+    """
+
+    client = TestClient(create_app(), raise_server_exceptions=False)
+    client.post("/events", json=_event("session-1").model_dump(mode="json"))
+    decision_id = _request_decision(client)
+
+    response = client.get(f"/decisions/{decision_id}/wait?timeout_seconds=0.001")
+
+    assert response.status_code == 200
+    assert response.json()["behavior"] == "deny"
+
+
 def test_request_before_event_reconciles_pending_decisions_when_agent_arrives() -> None:
     """Verify pending broker decisions are reflected when agent state appears.
 
