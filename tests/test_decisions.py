@@ -1,0 +1,248 @@
+"""Tests for the Agent Deck in-memory decision broker.
+
+These tests define the Task 4 approval decision contract only. They do not
+start servers, touch hardware, read user files, or persist state; their only
+side effects are local asyncio scheduling and pytest assertion reporting.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from pydantic import ValidationError
+
+from agent_deck.core.decisions import (
+    DecisionBehavior,
+    DecisionBroker,
+    DecisionStatus,
+)
+
+
+async def test_create_resolve_allow_and_wait_returns_allow() -> None:
+    """Verify a pending decision can be resolved to allow and awaited.
+
+    入参：无；测试内创建 `DecisionBroker` 并注册 shell 工具决策。
+    返回：无返回值；断言通过代表 create/resolve/wait 的基本成功路径成立。
+    错误处理：未知 id、模型校验失败或 wait 未收到 allow 会由 pytest 报告。
+    副作用：仅修改测试内 broker 的内存状态并调度 asyncio future。
+    """
+
+    broker = DecisionBroker()
+    created_at = datetime(2026, 6, 12, 8, 0, tzinfo=UTC)
+    decision = broker.create(
+        agent_key="codex:session-1",
+        session_id="session-1",
+        turn_id="turn-1",
+        tool_name="shell",
+        reason="needs approval",
+        created_at=created_at,
+        timeout=timedelta(seconds=30),
+    )
+
+    resolved = broker.resolve(
+        decision.decision_id,
+        DecisionBehavior.ALLOW,
+        message="approved",
+    )
+    result = await broker.wait(decision.decision_id, timeout=0.01)
+
+    assert decision.status == DecisionStatus.PENDING
+    assert decision.expires_at == created_at + timedelta(seconds=30)
+    assert resolved.status == DecisionStatus.RESOLVED
+    assert resolved.result is not None
+    assert result.behavior == DecisionBehavior.ALLOW
+    assert result.message == "approved"
+
+
+async def test_wait_timeout_returns_default_deny_and_removes_from_pending() -> None:
+    """Verify wait timeout records a timed-out deny result.
+
+    入参：无；测试内创建默认 deny 的 pending decision，并用很短 wait timeout 等待。
+    返回：无返回值；断言通过代表超时会返回默认行为并从 pending 列表消失。
+    错误处理：wait 未超时、结果不是 deny 或状态未改为 timed_out 会由 pytest 报告。
+    副作用：仅修改测试内 broker 的内存状态并取消/完成 asyncio future。
+    """
+
+    broker = DecisionBroker()
+    decision = broker.create(
+        agent_key="codex:session-1",
+        session_id="session-1",
+        tool_name="shell",
+        reason="needs approval",
+        created_at=datetime(2026, 6, 12, 8, 0, tzinfo=UTC),
+        timeout=timedelta(seconds=30),
+    )
+
+    result = await broker.wait(decision.decision_id, timeout=0.01)
+    stored = broker.get(decision.decision_id)
+
+    assert result.behavior == DecisionBehavior.DENY
+    assert result.message == "Timed out waiting for Agent Deck decision."
+    assert stored is not None
+    assert stored.status == DecisionStatus.TIMED_OUT
+    assert stored.result == result
+    assert broker.pending() == []
+
+
+async def test_unknown_resolve_and_wait_raise_key_error() -> None:
+    """Verify unknown decision ids are rejected consistently.
+
+    入参：无；测试内对空 broker 调用 resolve 和 wait。
+    返回：无返回值；断言通过代表未知 decision id 不会被静默创建或默认拒绝。
+    错误处理：若未抛 KeyError 或抛出其他异常，会由 pytest 报告。
+    副作用：仅读取测试内空 broker，不访问外部 I/O。
+    """
+
+    broker = DecisionBroker()
+
+    with pytest.raises(KeyError):
+        broker.resolve("missing", DecisionBehavior.ALLOW)
+
+    with pytest.raises(KeyError):
+        await broker.wait("missing", timeout=0.01)
+
+
+async def test_pending_sorts_by_created_at_and_filters_resolved_and_timed_out() -> None:
+    """Verify pending snapshots are ordered and exclude terminal decisions.
+
+    入参：无；测试内创建三个不同创建时间的 decision，并分别 resolve/timeout 两个。
+    返回：无返回值；断言通过代表 `pending()` 只返回仍 pending 的决策且按创建时间升序。
+    错误处理：排序错误、终态未过滤或 wait 超时失败会由 pytest 报告。
+    副作用：仅修改测试内 broker 的内存状态并调度 asyncio future。
+    """
+
+    broker = DecisionBroker()
+    latest = broker.create(
+        agent_key="codex:session-1",
+        session_id="session-1",
+        tool_name="shell",
+        reason="latest",
+        created_at=datetime(2026, 6, 12, 8, 2, tzinfo=UTC),
+        timeout=timedelta(seconds=30),
+    )
+    earliest = broker.create(
+        agent_key="codex:session-1",
+        session_id="session-1",
+        tool_name="python",
+        reason="earliest",
+        created_at=datetime(2026, 6, 12, 8, 0, tzinfo=UTC),
+        timeout=timedelta(seconds=30),
+    )
+    middle = broker.create(
+        agent_key="codex:session-1",
+        session_id="session-1",
+        tool_name="git",
+        reason="middle",
+        created_at=datetime(2026, 6, 12, 8, 1, tzinfo=UTC),
+        timeout=timedelta(seconds=30),
+    )
+
+    broker.resolve(earliest.decision_id, DecisionBehavior.ALLOW)
+    await broker.wait(middle.decision_id, timeout=0.01)
+
+    assert [decision.decision_id for decision in broker.pending()] == [
+        latest.decision_id
+    ]
+
+
+async def test_resolve_after_timeout_does_not_replace_timed_out_result() -> None:
+    """Verify terminal timed-out decisions cannot later become allowed.
+
+    入参：无；测试内让 decision 先通过 wait 超时，再调用 resolve allow。
+    返回：无返回值；断言通过代表 timeout 后 resolve 幂等返回既有 timed_out snapshot。
+    错误处理：若后续 resolve 改写状态、行为或 message，会由 pytest 报告。
+    副作用：仅修改测试内 broker 的内存状态并调度 asyncio future。
+    """
+
+    broker = DecisionBroker()
+    decision = broker.create(
+        agent_key="codex:session-1",
+        session_id="session-1",
+        tool_name="shell",
+        reason="needs approval",
+        created_at=datetime(2026, 6, 12, 8, 0, tzinfo=UTC),
+        timeout=timedelta(seconds=30),
+    )
+    timed_out = await broker.wait(decision.decision_id, timeout=0.01)
+
+    resolved = broker.resolve(decision.decision_id, DecisionBehavior.ALLOW, "late allow")
+
+    assert timed_out.behavior == DecisionBehavior.DENY
+    assert resolved.status == DecisionStatus.TIMED_OUT
+    assert resolved.result == timed_out
+    assert resolved.result is not None
+    assert resolved.result.behavior == DecisionBehavior.DENY
+    assert resolved.result.message == "Timed out waiting for Agent Deck decision."
+
+
+def test_create_rejects_naive_created_at() -> None:
+    """Verify decision creation rejects naive timestamps.
+
+    入参：无；测试内传入没有 timezone 的 `created_at`。
+    返回：无返回值；断言通过代表 broker 不会猜测本地时区。
+    错误处理：若创建成功或抛出非 Pydantic ValidationError，会由 pytest 报告。
+    副作用：仅尝试创建内存模型，不访问网络、硬件或文件系统。
+    """
+
+    broker = DecisionBroker()
+
+    with pytest.raises(ValidationError):
+        broker.create(
+            agent_key="codex:session-1",
+            session_id="session-1",
+            tool_name="shell",
+            reason="needs approval",
+            created_at=datetime(2026, 6, 12, 8, 0),
+            timeout=timedelta(seconds=30),
+        )
+
+
+def test_create_rejects_non_positive_timeout() -> None:
+    """Verify decision creation requires a positive timeout.
+
+    入参：无；测试内传入零秒 timeout。
+    返回：无返回值；断言通过代表无效 timeout 会在注册 future 前被拒绝。
+    错误处理：若创建成功或抛出非 ValueError，会由 pytest 报告。
+    副作用：仅尝试创建内存模型，不访问网络、硬件或文件系统。
+    """
+
+    broker = DecisionBroker()
+
+    with pytest.raises(ValueError):
+        broker.create(
+            agent_key="codex:session-1",
+            session_id="session-1",
+            tool_name="shell",
+            reason="needs approval",
+            created_at=datetime(2026, 6, 12, 8, 0, tzinfo=UTC),
+            timeout=timedelta(seconds=0),
+        )
+
+
+async def test_duplicate_resolve_returns_existing_resolved_snapshot() -> None:
+    """Verify resolving an already resolved decision is idempotent.
+
+    入参：无；测试内先 resolve allow，再尝试 resolve deny。
+    返回：无返回值；断言通过代表重复 resolve 返回首次 resolved snapshot。
+    错误处理：若第二次 resolve 改写结果或抛出异常，会由 pytest 报告。
+    副作用：仅修改测试内 broker 的内存状态并完成 asyncio future。
+    """
+
+    broker = DecisionBroker()
+    decision = broker.create(
+        agent_key="codex:session-1",
+        session_id="session-1",
+        tool_name="shell",
+        reason="needs approval",
+        created_at=datetime(2026, 6, 12, 8, 0, tzinfo=UTC),
+        timeout=timedelta(seconds=30),
+    )
+
+    first = broker.resolve(decision.decision_id, DecisionBehavior.ALLOW, "approved")
+    second = broker.resolve(decision.decision_id, DecisionBehavior.DENY, "late deny")
+
+    assert second == first
+    assert second.result is not None
+    assert second.result.behavior == DecisionBehavior.ALLOW
+    assert second.result.message == "approved"
