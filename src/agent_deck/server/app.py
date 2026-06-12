@@ -69,7 +69,8 @@ class _DaemonRuntime:
     """Hold all process-local daemon state used by the HTTP handlers.
 
     入参：`store` 是 normalized event reducer；`broker` 管理 pending approval；
-    `surface` 记录 fake render 帧；`selection` 保存当前 deck 选择。
+    `surface` 记录 fake render 帧；`selection` 保存当前 deck 选择；两个 id 集合分别
+    记录已反映到 store 的 pending decision 和已同步终态的 decision。
     返回：dataclass 实例，供 app.state 持有并在路由间共享。
     错误处理：本类不主动校验依赖类型；handler 调用时底层异常按原语义传播。
     副作用：后续方法会修改这些内存对象；不会访问真实硬件、文件或网络。
@@ -79,6 +80,8 @@ class _DaemonRuntime:
     broker: DecisionBroker
     surface: FakeHardwareSurface
     selection: DeckSelection
+    reflected_pending_decision_ids: set[str]
+    terminal_synced_decision_ids: set[str]
 
     def apply_event(self, event: NormalizedEvent) -> dict[str, Any]:
         """Apply an event, render the latest layout, and return response data.
@@ -90,6 +93,8 @@ class _DaemonRuntime:
         """
 
         state = self.store.apply(event)
+        self._reflect_pending_decisions_for_agent(state.agent_key)
+        state = self.store.get(state.agent_key) or state
         layout = self.render_current()
         return {
             "state": _dump_model(state),
@@ -117,7 +122,7 @@ class _DaemonRuntime:
             created_at=created_at,
             timeout=body.timeout_seconds,
         )
-        self._apply_synthetic_approval_if_agent_exists(body, decision, created_at)
+        self._reflect_pending_decision_if_agent_exists(decision, created_at)
         self.selection = self.selection.model_copy(
             update={
                 "selected_agent_key": body.agent_key,
@@ -143,7 +148,7 @@ class _DaemonRuntime:
         if self.broker.get(decision_id) is None:
             return None
         resolved = self.broker.resolve(decision_id, body.behavior, body.message)
-        self.store.mark_decision_resolved(resolved.agent_key)
+        self._sync_terminal_decision_once(resolved)
         if self.selection.selected_decision_id == decision_id:
             self.selection = self.selection.model_copy(
                 update={"selected_decision_id": None}
@@ -172,7 +177,7 @@ class _DaemonRuntime:
         result = await self.broker.wait(decision_id, timeout=timeout_seconds)
         after = self.broker.get(decision_id)
         if was_pending and after is not None and after.result is not None:
-            self.store.mark_decision_resolved(after.agent_key)
+            self._sync_terminal_decision_once(after)
             if self.selection.selected_decision_id == decision_id:
                 self.selection = self.selection.model_copy(
                     update={"selected_decision_id": None}
@@ -206,6 +211,7 @@ class _DaemonRuntime:
         副作用：可能在首次出现 agent 时更新 selection，并递增 fake surface render count。
         """
 
+        self._reflect_pending_decisions_for_known_agents()
         states = self.store.snapshot()
         self._ensure_first_agent_selected(states)
         decisions = self.broker.pending()
@@ -227,40 +233,90 @@ class _DaemonRuntime:
                 update={"selected_agent_key": states[0].agent_key}
             )
 
-    def _apply_synthetic_approval_if_agent_exists(
+    def _reflect_pending_decisions_for_known_agents(self) -> None:
+        """Reflect all pending broker decisions whose agents already exist.
+
+        入参：无；读取 broker 的 pending decisions 和当前 store 中的 agent keys。
+        返回：无显式返回值。
+        错误处理：synthetic event 构造或 store apply 失败会向调用方传播。
+        副作用：可能为尚未 reflected 的 decision 修改对应 agent pending count。
+        """
+
+        for decision in self.broker.pending():
+            self._reflect_pending_decision_if_agent_exists(decision, decision.created_at)
+
+    def _reflect_pending_decisions_for_agent(self, agent_key: str) -> None:
+        """Reflect pending broker decisions for one known agent.
+
+        入参：`agent_key` 是刚创建或更新的 store agent key。
+        返回：无显式返回值。
+        错误处理：synthetic event 构造或 store apply 失败会向调用方传播。
+        副作用：可能为该 agent 尚未 reflected 的 decision 增加 pending count。
+        """
+
+        for decision in self.broker.pending():
+            if decision.agent_key == agent_key:
+                self._reflect_pending_decision_if_agent_exists(
+                    decision,
+                    decision.created_at,
+                )
+
+    def _reflect_pending_decision_if_agent_exists(
         self,
-        body: DecisionRequestBody,
         decision: PendingDecision,
         created_at: datetime,
     ) -> None:
-        """Apply an approval.requested event for already known agents.
+        """Apply an approval.requested event once for an existing agent.
 
-        入参：`body` 提供 request 上下文；`decision` 提供 broker 生成的稳定 id；
-        `created_at` 是 timezone-aware 创建时间。
+        入参：`decision` 是 broker 中的 pending decision；`created_at` 是 synthetic event
+        使用的 timezone-aware 时间。
         返回：无显式返回值。
         错误处理：若 synthetic event 构造或 store apply 失败，异常向调用方传播。
-        副作用：仅当 `body.agent_key` 已存在于 store 时修改该 agent 的 pending count。
+        副作用：仅当 agent 已存在且 decision id 未 reflected 时修改 store pending count。
         """
 
-        state = self.store.get(body.agent_key)
+        if decision.decision_id in self.reflected_pending_decision_ids:
+            return
+        state = self.store.get(decision.agent_key)
         if state is None:
             return
-        session_id = _session_id_from_agent_key(body.agent_key)
         self.store.apply(
             NormalizedEvent.build(
                 source=state.source,
                 source_event_type="decision.requested",
                 normalized_type=EventType.APPROVAL_REQUESTED,
-                session_id=session_id,
-                turn_id=body.turn_id,
+                session_id=decision.session_id,
+                turn_id=decision.turn_id,
                 title=state.display_name,
-                tool_name=body.tool_name,
-                summary=body.reason,
-                payload={"decision_id": decision.decision_id, "reason": body.reason},
+                tool_name=decision.tool_name,
+                summary=decision.reason,
+                payload={
+                    "decision_id": decision.decision_id,
+                    "reason": decision.reason,
+                },
                 occurred_at=created_at,
                 received_at=created_at,
             )
         )
+        self.reflected_pending_decision_ids.add(decision.decision_id)
+
+    def _sync_terminal_decision_once(self, decision: PendingDecision) -> None:
+        """Reflect one terminal decision back to the store at most once.
+
+        入参：`decision` 是 broker 返回的 resolved 或 timed-out snapshot。
+        返回：无显式返回值。
+        错误处理：store 更新失败会向调用方传播；非 terminal decision 会被忽略。
+        副作用：若该 decision 曾 reflected 且尚未 terminal-synced，则递减 agent pending count。
+        """
+
+        if decision.result is None:
+            return
+        if decision.decision_id in self.terminal_synced_decision_ids:
+            return
+        self.terminal_synced_decision_ids.add(decision.decision_id)
+        if decision.decision_id not in self.reflected_pending_decision_ids:
+            return
+        self.store.mark_decision_resolved(decision.agent_key)
 
 
 def create_app() -> FastAPI:
@@ -277,6 +333,8 @@ def create_app() -> FastAPI:
         broker=DecisionBroker(),
         surface=FakeHardwareSurface(),
         selection=DeckSelection(),
+        reflected_pending_decision_ids=set(),
+        terminal_synced_decision_ids=set(),
     )
     app = FastAPI(title="Agent Deck Daemon API")
     app.state.runtime = runtime
@@ -366,16 +424,3 @@ def _dump_model(model: BaseModel) -> dict[str, Any]:
     """
 
     return model.model_dump(mode="json")
-
-
-def _session_id_from_agent_key(agent_key: str) -> str:
-    """Extract the session id suffix from an Agent Deck agent key.
-
-    入参：`agent_key` 是形如 `{source}:{session_id}` 的状态聚合 key。
-    返回：冒号后的 session id；没有冒号时返回原字符串作为兼容降级。
-    错误处理：本函数不主动抛业务异常。
-    副作用：无；只做字符串拆分，不访问外部 I/O。
-    """
-
-    _, separator, session_id = agent_key.partition(":")
-    return session_id if separator else agent_key
