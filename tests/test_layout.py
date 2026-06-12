@@ -56,23 +56,26 @@ def _decision(
     *,
     tool_name: str = "shell",
     reason: str = "needs local approval",
+    created_offset: int = 0,
 ) -> PendingDecision:
     """Build a pending decision for layout tests.
 
-    入参：`decision_id` 和 `agent_key` 绑定审批对象；`tool_name` 与 `reason` 覆盖触屏文案。
+    入参：`decision_id` 和 `agent_key` 绑定审批对象；`tool_name` 与 `reason` 覆盖触屏文案；
+    `created_offset` 以秒为单位偏移基础创建时间，用于排序断言。
     返回：status 为 pending 的 `PendingDecision`。
     错误处理：字段非法或时间无时区时由 `PendingDecision` 校验报告。
     副作用：仅创建内存模型，不访问网络、硬件或文件系统。
     """
 
+    created_at = BASE_TIME + timedelta(seconds=created_offset)
     return PendingDecision(
         decision_id=decision_id,
         agent_key=agent_key,
         session_id="session-1",
         tool_name=tool_name,
         reason=reason,
-        created_at=BASE_TIME,
-        expires_at=BASE_TIME + timedelta(seconds=30),
+        created_at=created_at,
+        expires_at=created_at + timedelta(seconds=30),
         status=DecisionStatus.PENDING,
     )
 
@@ -183,6 +186,148 @@ def test_pending_decision_overrides_mode_and_binds_approval_keys() -> None:
     assert plan.touchscreen.selected_decision_id == decision.decision_id
     assert "shell" in plan.touchscreen.lines
     assert "run deploy command" in plan.touchscreen.lines
+
+
+def test_decision_mode_focuses_slots_on_decision_agent_over_previous_selection() -> None:
+    """Verify decision mode uses the current decision agent as slot focus.
+
+    入参：无；测试内让 selection 指向 agent A，但当前 pending decision 属于 agent B。
+    返回：无返回值；断言通过代表 decision mode 的触屏和首个 slot 都聚焦 decision agent。
+    错误处理：若旧 selection 继续支配 slot 排序或触屏绑定，会由 pytest 报告。
+    副作用：仅创建内存模型和布局计划。
+    """
+
+    selected_agent = _state(
+        "codex:agent-a",
+        "Agent A",
+        AgentStatus.IDLE,
+        last_event_offset=40,
+    )
+    decision_agent = _state(
+        "codex:agent-b",
+        "Agent B",
+        AgentStatus.THINKING,
+        last_event_offset=10,
+    )
+    decision = _decision("decision-b", decision_agent.agent_key)
+
+    plan = build_layout_plan(
+        [selected_agent, decision_agent],
+        [decision],
+        DeckSelection(
+            mode=DeckMode.OVERVIEW,
+            selected_agent_key=selected_agent.agent_key,
+        ),
+    )
+
+    assert plan.mode == DeckMode.DECISION
+    assert plan.touchscreen.selected_agent_key == decision_agent.agent_key
+    assert plan.keys[0].agent_key == decision_agent.agent_key
+
+
+def test_selected_decision_id_binds_actions_and_touchscreen_when_multiple_pending() -> None:
+    """Verify selected decision id wins among multiple pending decisions.
+
+    入参：无；测试内构造两个 pending decisions，并让 selection 指向较晚的那个。
+    返回：无返回值；断言通过代表 action keys 和触屏都绑定 selected decision。
+    错误处理：若 fallback 覆盖 selected decision 或绑定错 id，会由 pytest 报告。
+    副作用：仅创建内存模型和布局计划。
+    """
+
+    agent_a = _state("codex:agent-a", "Agent A", AgentStatus.APPROVAL_NEEDED)
+    agent_b = _state("codex:agent-b", "Agent B", AgentStatus.APPROVAL_NEEDED)
+    earliest = _decision(
+        "decision-a",
+        agent_a.agent_key,
+        tool_name="shell",
+        reason="earliest reason",
+        created_offset=0,
+    )
+    selected = _decision(
+        "decision-b",
+        agent_b.agent_key,
+        tool_name="python",
+        reason="selected reason",
+        created_offset=10,
+    )
+
+    plan = build_layout_plan(
+        [agent_a, agent_b],
+        [earliest, selected],
+        DeckSelection(
+            mode=DeckMode.OVERVIEW,
+            selected_decision_id=selected.decision_id,
+        ),
+    )
+
+    assert plan.keys[10].decision_id == selected.decision_id
+    assert plan.keys[11].decision_id == selected.decision_id
+    assert plan.touchscreen.selected_decision_id == selected.decision_id
+    assert plan.touchscreen.selected_agent_key == agent_b.agent_key
+    assert plan.touchscreen.lines == ("python", "selected reason")
+
+
+def test_missing_selected_decision_falls_back_to_earliest_pending_decision() -> None:
+    """Verify missing selected decision id falls back by earliest created time.
+
+    入参：无；测试内构造两个 pending decisions，并让 selection 指向不存在的 id。
+    返回：无返回值；断言通过代表 fallback 稳定选择创建时间最早的 pending decision。
+    错误处理：若选择不存在 id 或较晚 pending decision，会由 pytest 报告。
+    副作用：仅创建内存模型和布局计划。
+    """
+
+    agent_a = _state("codex:agent-a", "Agent A", AgentStatus.APPROVAL_NEEDED)
+    agent_b = _state("codex:agent-b", "Agent B", AgentStatus.APPROVAL_NEEDED)
+    earliest = _decision(
+        "decision-a",
+        agent_a.agent_key,
+        reason="earliest reason",
+        created_offset=0,
+    )
+    later = _decision(
+        "decision-b",
+        agent_b.agent_key,
+        reason="later reason",
+        created_offset=10,
+    )
+
+    plan = build_layout_plan(
+        [agent_b, agent_a],
+        [later, earliest],
+        DeckSelection(
+            mode=DeckMode.OVERVIEW,
+            selected_decision_id="missing",
+        ),
+    )
+
+    assert plan.keys[10].decision_id == earliest.decision_id
+    assert plan.touchscreen.selected_decision_id == earliest.decision_id
+    assert plan.touchscreen.selected_agent_key == agent_a.agent_key
+
+
+def test_pending_decision_fallback_tie_breaks_by_decision_id() -> None:
+    """Verify same-time pending fallback uses decision id as deterministic tie-breaker.
+
+    入参：无；测试内构造两个 created_at 相同但 id 不同的 pending decisions。
+    返回：无返回值；断言通过代表 fallback 选择较小 decision id，避免输入顺序影响布局。
+    错误处理：若 fallback 仍依赖输入顺序，会由 pytest 报告。
+    副作用：仅创建内存模型和布局计划。
+    """
+
+    agent_a = _state("codex:agent-a", "Agent A", AgentStatus.APPROVAL_NEEDED)
+    agent_b = _state("codex:agent-b", "Agent B", AgentStatus.APPROVAL_NEEDED)
+    larger_id = _decision("decision-z", agent_b.agent_key)
+    smaller_id = _decision("decision-a", agent_a.agent_key)
+
+    plan = build_layout_plan(
+        [agent_b, agent_a],
+        [larger_id, smaller_id],
+        DeckSelection(mode=DeckMode.OVERVIEW),
+    )
+
+    assert plan.keys[10].decision_id == smaller_id.decision_id
+    assert plan.touchscreen.selected_decision_id == smaller_id.decision_id
+    assert plan.touchscreen.selected_agent_key == agent_a.agent_key
 
 
 def test_led_priority_across_agent_statuses() -> None:
@@ -300,4 +445,45 @@ def test_slot_sorting_prefers_selected_then_active_status_then_recency() -> None
         thinking_new.agent_key,
         idle_new.agent_key,
         idle_old.agent_key,
+    ]
+
+
+def test_slot_sorting_places_error_before_running_and_thinking() -> None:
+    """Verify error status is a higher slot priority than active execution.
+
+    入参：无；测试内构造 error、running 和 thinking agent，且不设置 selected agent。
+    返回：无返回值；断言通过代表 error 会排在 running/thinking 前面。
+    错误处理：若 slot 排序与 LED 高优先级语义不一致，会由 pytest 报告。
+    副作用：仅创建内存模型和布局计划。
+    """
+
+    running = _state(
+        "codex:running",
+        "Running",
+        AgentStatus.RUNNING_TOOL,
+        last_event_offset=30,
+    )
+    thinking = _state(
+        "codex:thinking",
+        "Thinking",
+        AgentStatus.THINKING,
+        last_event_offset=40,
+    )
+    error = _state(
+        "codex:error",
+        "Error",
+        AgentStatus.ERROR,
+        last_event_offset=10,
+    )
+
+    plan = build_layout_plan(
+        [running, thinking, error],
+        [],
+        DeckSelection(mode=DeckMode.OVERVIEW),
+    )
+
+    assert [key.agent_key for key in plan.keys[:3]] == [
+        error.agent_key,
+        running.agent_key,
+        thinking.agent_key,
     ]

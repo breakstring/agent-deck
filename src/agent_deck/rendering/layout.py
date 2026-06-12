@@ -20,9 +20,9 @@ _AGENT_SLOT_COUNT = 10
 _STATUS_SORT_PRIORITY = {
     AgentStatus.APPROVAL_NEEDED: 0,
     AgentStatus.WAITING_USER: 1,
-    AgentStatus.RUNNING_TOOL: 2,
-    AgentStatus.THINKING: 3,
-    AgentStatus.ERROR: 4,
+    AgentStatus.ERROR: 2,
+    AgentStatus.RUNNING_TOOL: 3,
+    AgentStatus.THINKING: 4,
     AgentStatus.COMPLETED_RECENTLY: 5,
     AgentStatus.IDLE: 6,
     AgentStatus.OFFLINE: 7,
@@ -102,8 +102,13 @@ def build_layout_plan(
 
     pending_decision = _select_pending_decision(decisions, selection)
     effective_mode = DeckMode.DECISION if pending_decision is not None else selection.mode
-    sorted_states = _sort_states_for_slots(states, selection.selected_agent_key)
-    selected_agent = _select_agent(sorted_states, selection.selected_agent_key)
+    effective_selected_agent_key = (
+        pending_decision.agent_key
+        if pending_decision is not None
+        else selection.selected_agent_key
+    )
+    sorted_states = _sort_states_for_slots(states, effective_selected_agent_key)
+    selected_agent = _select_agent(sorted_states, effective_selected_agent_key)
     keys = _build_base_keys(sorted_states)
 
     if effective_mode == DeckMode.DECISION and pending_decision is not None:
@@ -187,7 +192,10 @@ def _select_pending_decision(
         for decision in pending:
             if decision.decision_id == selection.selected_decision_id:
                 return decision
-    return sorted(pending, key=lambda decision: decision.created_at)[0]
+    return sorted(
+        pending,
+        key=lambda decision: (decision.created_at, decision.decision_id),
+    )[0]
 
 
 def _build_base_keys(sorted_states: list[AgentState]) -> list[KeyPlan]:
