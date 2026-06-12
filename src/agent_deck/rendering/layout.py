@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict
 from agent_deck.core.decisions import DecisionStatus, PendingDecision
 from agent_deck.core.modes import DeckMode, DeckSelection
 from agent_deck.core.state import AgentState, AgentStatus
+from agent_deck.rendering.visuals import VisualIconSpec, resolve_visual_icon_spec
 
 _KEY_COUNT = 15
 _AGENT_SLOT_COUNT = 10
@@ -33,7 +34,8 @@ class KeyPlan(BaseModel):
     """Describe one physical key without renderer-specific image data.
 
     入参：`index` 是 0-14 的物理键位；`label` 是短文本标签；`status` 是绑定 agent
-    的展示状态，可空；`agent_key`、`intent` 和 `decision_id` 描述按键行为上下文。
+    的展示状态，可空；`visual` 是 renderer 可消费的按钮视觉规格，可空；
+    `agent_key`、`intent` 和 `decision_id` 描述按键行为上下文。
     返回：frozen Pydantic model，后续 renderer 可只读消费。
     错误处理：字段类型非法由 Pydantic 校验异常报告；键位范围由调用方生成保证。
     副作用：仅保存内存数据；实例化不访问网络、硬件或文件系统。
@@ -44,6 +46,7 @@ class KeyPlan(BaseModel):
     index: int
     label: str = ""
     status: AgentStatus | None = None
+    visual: VisualIconSpec | None = None
     agent_key: str | None = None
     intent: str | None = None
     decision_id: str | None = None
@@ -213,6 +216,7 @@ def _build_base_keys(sorted_states: list[AgentState]) -> list[KeyPlan]:
             index=index,
             label=state.display_name,
             status=state.status,
+            visual=resolve_visual_icon_spec(state.status),
             agent_key=state.agent_key,
             intent="select_agent",
         )

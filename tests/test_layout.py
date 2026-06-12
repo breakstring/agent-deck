@@ -15,6 +15,7 @@ from agent_deck.core.events import AgentSource
 from agent_deck.core.modes import DeckMode, DeckSelection
 from agent_deck.core.state import AgentState, AgentStatus
 from agent_deck.rendering.layout import build_layout_plan
+from agent_deck.rendering.visuals import VisualAgentState
 
 BASE_TIME = datetime(2026, 6, 12, 8, 0, tzinfo=UTC)
 
@@ -115,6 +116,9 @@ def test_overview_layout_prioritizes_selected_running_agent_and_touchscreen() ->
     assert [key.index for key in plan.keys] == list(range(15))
     assert plan.keys[0].agent_key == selected.agent_key
     assert plan.keys[0].intent == "select_agent"
+    assert plan.keys[0].visual is not None
+    assert plan.keys[0].visual.visual_state == VisualAgentState.WORKING
+    assert plan.keys[10].visual is None
     assert plan.keys[10].label == "FOCUS"
     assert plan.keys[10].agent_key == selected.agent_key
     assert plan.touchscreen.title == selected.display_name
