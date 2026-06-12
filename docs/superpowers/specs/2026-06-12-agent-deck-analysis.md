@@ -39,6 +39,20 @@ N4 Pro 的能力明显高于普通按键设备。当前 SDK 源码显示它支�
 
 因此核心抽象不能是“按钮脚本”，而应该是“硬件表面”。按键、触屏、旋钮、LED 都只是硬件表面的不同区域和输入类型。
 
+### 官方场景配置
+
+妙联宝官方软件有“场景配置”概念。官方文档将其定义为面向特定应用程序、任务、工具或软件的一套专门按键布局，适合直播、剪辑、沟通软件、浏览器、编程快捷操作等稳定任务。
+
+该能力对 Agent Deck 有价值，但不应成为第一版动态控制底座。原因：
+
+- 官方场景配置更适合定义明确的静态操作。
+- 官方文档明确提到场景配置缺乏基于实时数据和复杂逻辑动态调整内容或动作的能力。
+- 不同 Stream Dock 型号按键数量不同，场景跨设备使用会出现功能缺口或布局问题。
+- Python SDK 暴露的是设备、按键、旋钮、触屏、LED 等底层能力，目前没有看到官方场景切换 API。
+- Plugin SDK 支持 `willAppear`、`willDisappear`、`applicationDidLaunch`、`applicationDidTerminate` 等事件，说明官方生态有应用跟随和配置切换语义；但可发送事件里目前只看到 `setTitle`、`setImage`、`setState` 等操作实例级更新，没有看到 `switchScene` 或 `switchProfile`。
+
+因此，第一版应把官方场景当作用户入口和外部配置层：建议用户在 Stream Dock 软件里创建一个 `Agent Deck` 场景，放置启动 daemon、打开管理页、查看日志等静态入口。Agent 的实时状态、临时审批、触屏详情和旋钮选择仍由 Agent Deck 内部运行场景控制。
+
 ### Codex 能力面
 
 Codex 不能只按“普通 CLI 输出解析”理解。当前官方文档和手册显示 Codex 有以下集成面：
@@ -94,7 +108,8 @@ flowchart LR
   Generic["Generic CLI / PTY fallback"] --> Ingress
   Ingress --> Normalize["Event Normalizer"]
   Normalize --> Store["State Store / Reducer"]
-  Store --> Layout["Surface Layout Engine"]
+  Store --> Mode["DeckMode / Selection"]
+  Mode --> Layout["Surface Layout Engine"]
   Layout --> Render["Renderer Queue"]
   Render --> Hardware["Hardware Driver"]
   Hardware --> Input["Hardware Input Events"]
@@ -109,6 +124,7 @@ flowchart LR
 
 - Agent 来源变化：Codex、Claude Code、Gemini CLI、Cursor、OpenCode 等。
 - 硬件能力变化：只有按键、按键加旋钮、按键加旋钮加触屏、是否有 LED、是否支持刷新时并发输入。
+- 场景/模式变化：官方 Stream Dock 场景作为入口，Agent Deck 内部 DeckMode 作为实时布局状态。
 - 操作能力变化：只读状态、聚焦窗口、发送快捷 prompt、选择选项、批准/拒绝敏感操作。
 
 ## 核心概念
@@ -178,6 +194,24 @@ flowchart LR
 ### SurfaceRegion
 
 硬件上的可渲染区域，例如 N4 Pro 的逻辑 key 1-15、触摸屏、LED 组、旋钮。
+
+### DeckMode
+
+Agent Deck 内部运行场景，不等同于妙联宝官方软件的场景配置。DeckMode 描述当前硬件表面应该呈现哪类任务界面。
+
+第一版建议包含：
+
+- `overview`：总览所有 Agent。
+- `agent_detail`：当前选中 Agent 的详细状态。
+- `decision`：审批、选择、等待输入的临时模式。
+- `quick_prompt`：快捷 prompt 模板模式。
+- `settings`：亮度、静音、显示模式等。
+
+官方 Stream Dock 场景配置用于“进入 Agent Deck”，DeckMode 用于“Agent Deck 接管设备后的动态运行界面”。
+
+### LayoutPlan
+
+`AgentState + PendingDecision + SelectedAgent + DeckMode + HardwareSurface` 生成的渲染计划。它不直接等同于 N4 Pro 布局，而是一个可投影到不同硬件的中间表示。
 
 ### InteractionIntent
 
@@ -253,6 +287,10 @@ Agent Deck 的动作分为四级：
 - Codex 高级配置：https://developers.openai.com/codex/config-advanced
 - Codex hooks：https://developers.openai.com/codex/hooks
 - Claude Code hooks：https://code.claude.com/docs/en/hooks
+- Stream Dock 场景配置：https://creator.key123.vip/stream-dock/scene/scene.html
+- Space Plugin SDK 接收事件：https://sdk.key123.vip/guide/events-received.html
+- Space Plugin SDK 发送事件：https://sdk.key123.vip/guide/events-sent.html
 - Vibe Cat：https://github.com/gogoswift/vibe-cat
 - PeonPing：https://github.com/PeonPing/peon-ping
 - Gemini 粘贴报告：`/Users/kenn/.codex/attachments/81854f12-4adb-4ad8-bd62-97f3aa76c77b/pasted-text.txt`
+- Stream Dock 场景研究摘记：`docs/references/stream-dock-scenes-research-2026-06-12.md`

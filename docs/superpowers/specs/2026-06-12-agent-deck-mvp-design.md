@@ -74,7 +74,8 @@ flowchart TB
   OTelReceiver --> Normalizer
   Normalizer --> Reducer["State Reducer"]
   Reducer --> StateStore["Agent State Store"]
-  StateStore --> Layout["N4 Pro Layout Engine"]
+  StateStore --> Mode["DeckMode + SelectedAgent"]
+  Mode --> Layout["N4 Pro Layout Engine"]
   Layout --> RenderQueue["Debounced Render Queue"]
   RenderQueue --> Driver["StreamDock Driver"]
   Driver --> N4Pro["N4 Pro"]
@@ -265,17 +266,109 @@ result
 - 每个 pending decision 有自己的 async future/event，不使用全局阻塞锁。
 - 到期后必须 cleanup UI 和 action binding。
 
+## 官方场景与内部 DeckMode
+
+妙联宝官方软件的“场景配置”适合作为用户入口，但第一版不依赖它作为动态状态展示底座。
+
+第一版建议用户手动创建一个官方 `Agent Deck` 场景，用于放置静态入口：
+
+- 启动或停止 `agent-deckd`。
+- 打开 Agent Deck 本地管理页。
+- 打开日志目录。
+- 打开配置目录。
+- 回到用户自己的默认 Stream Dock 场景。
+
+真正的动态展示和交互由 Agent Deck 内部 DeckMode 控制。DeckMode 是 daemon 内的运行模式，不等同于官方场景配置。
+
+第一版 DeckMode：
+
+- `overview`：总览所有 Agent/session slots。
+- `agent_detail`：当前选中 Agent 的详情和最近事件。
+- `decision`：当前 pending decision 的审批或选择界面。
+- `quick_prompt`：快捷 prompt 模板选择界面，默认功能关闭。
+- `settings`：亮度、显示模式、静音等本地控制。
+
+渲染链路：
+
+```text
+AgentState + PendingDecision + SelectedAgent + DeckMode
+  -> LayoutPlan
+  -> N4ProRenderer
+```
+
+而不是由 `AgentState` 直接生成 N4 Pro 画面。这样后续接入其他硬件、官方插件模式或宠物机制时，不需要改状态归约层。
+
+如果官方 Stream Dock 软件和 Python HID 直连不能同时控制设备，第一版采用 **Agent Deck 独占控制模式**：启动 `agent-deckd` 后由 Agent Deck 接管设备，退出后释放设备，让用户回到官方软件场景。
+
 ## N4 Pro 布局
 
-第一版使用逻辑区域，不依赖硬件物理编号含义。
+第一版使用逻辑区域，不依赖硬件物理编号含义。下面是各 DeckMode 的初始投影方式。
 
-### 按键区
+### overview
 
-建议布局：
+默认模式。展示所有 Agent/session slots 和少量全局动作。
+
+按键区：
 
 - `keys 1-10`：Agent/session slots。
 - `keys 11-14`：上下文动作区。
 - `key 15`：全局模式/返回/当前详情。
+
+触屏：
+
+- 显示当前选中 Agent 的概要。
+- 显示所有 pending decision 的数量。
+- 显示 daemon/硬件连接状态。
+
+旋钮：
+
+- 旋钮 1：切换选中 Agent。
+- 旋钮 2：滚动当前 Agent 最近事件。
+- 旋钮 3：选择快捷 prompt 模板。
+- 旋钮 4：亮度或显示模式。
+
+### agent_detail
+
+当前选中 Agent 的详情模式。
+
+触屏显示：
+
+- Agent 名称。
+- 当前 cwd 简写。
+- 当前状态。
+- 最近事件摘要。
+- 当前工具名。
+- pending decision 内容摘要。
+
+按键区：
+
+- 保留 Agent slots，方便快速切换。
+- 上下文动作区显示 focus、mute、quick prompt、back。
+
+### decision
+
+有 pending decision 时进入或临时覆盖。该模式优先级高于 `overview` 和 `agent_detail`。
+
+按键区：
+
+- 上下文动作区显示 allow、deny、details、back。
+- slot 上显示 pending 数量角标。
+
+触屏：
+
+- 显示当前 decision 摘要。
+- 显示工具名、来源 Agent、超时倒计时。
+- 不显示 raw tool input，除非用户开启 debug。
+
+### quick_prompt
+
+快捷 prompt 模板模式。第一版默认关闭自动输入，只允许复制到剪贴板并聚焦目标。
+
+### settings
+
+本地设置模式。第一版只覆盖亮度、显示模式、清屏/恢复。
+
+### 共用按键表现
 
 slot 键显示：
 
@@ -289,31 +382,10 @@ slot 键显示：
 - 当前没有 pending decision 时：快捷动作，例如 focus、mute、next、quick prompt。
 - 有 pending decision 时：临时覆盖为 allow、deny、details、timeout countdown。
 
-### 触摸屏
-
-触摸屏显示当前选中的 Agent 详情：
-
-- Agent 名称。
-- 当前 cwd 简写。
-- 当前状态。
-- 最近事件摘要。
-- 当前工具名。
-- pending decision 内容摘要。
-- 超时倒计时。
-
 触摸屏输入第一版只做：
 
 - 点击区域切换 tab 或 details。
 - 不做复杂表单输入。
-
-### 旋钮
-
-建议映射：
-
-- 旋钮 1：切换选中 Agent。
-- 旋钮 2：滚动当前 Agent 的最近事件。
-- 旋钮 3：选择快捷 prompt 模板。
-- 旋钮 4：亮度或显示模式。
 
 旋钮按压：
 
@@ -497,6 +569,12 @@ enabled = false
 - 不覆盖用户已有 `notify` 或 `[otel]`，而是检测、提示合并策略。
 - 如果无法安全合并，`agent-deckctl install codex --dry-run` 输出手动 patch。
 
+### 官方软件和 HID 直连冲突
+
+- 如果 Stream Dock 官方软件占用设备导致 Python SDK 打不开设备，`doctor` 应提示用户退出官方软件或切换到 Agent Deck 独占控制模式。
+- 第一版不自动创建或切换官方场景。
+- 第一版文档可以指导用户手动创建 `Agent Deck` 官方场景作为启动入口。
+
 ### 敏感信息
 
 - 日志默认不记录完整 prompt、完整 shell command、环境变量。
@@ -547,5 +625,7 @@ enabled = false
 3. 你的 Codex 主要运行形态是 Codex Desktop App、CLI、IDE extension，还是混合？
 4. 聚焦动作优先支持 Terminal、iTerm2、Warp、Codex App 中的哪一个？
 5. 快捷 prompt 第一版是否开启，还是只做复制到剪贴板？
+6. 官方 Stream Dock 软件和 Python HID 直连是否能在你的 N4 Pro 上同时运行，需要实测。
+7. 是否把官方 `Agent Deck` 场景的创建步骤写成手动教程，还是后续研究自动导入场景配置。
 
 这些问题不阻塞基础架构设计，但会影响第一版实现的默认行为。

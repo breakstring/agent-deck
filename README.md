@@ -6,6 +6,7 @@ Agent Deck 是一个面向本机 AI Agents 的硬件控制台项目。目标是�
 
 - `docs/superpowers/specs/2026-06-12-agent-deck-analysis.md`
 - `docs/superpowers/specs/2026-06-12-agent-deck-mvp-design.md`
-- `docs/superpowers/specs/2026-06-12-agent-deck-roadmap.md`
+- `docs/references/agent-deck-roadmap.md`
+- `docs/references/stream-dock-scenes-research-2026-06-12.md`
 
 Python 项目使用 `uv` 管理。

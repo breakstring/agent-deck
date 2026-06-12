@@ -1,7 +1,6 @@
 # Agent Deck Roadmap
 
-状态：草案  
-日期：2026-06-12  
+状态：长期参考，随项目推进动态更新
 用途：后续工作拆分、模块依赖、阶段目标
 
 ## 路线原则
@@ -15,24 +14,17 @@
 ## 阶段总览
 
 ```mermaid
-gantt
-  title Agent Deck Roadmap
-  dateFormat  YYYY-MM-DD
-  section P0
-  文档与项目骨架           :p0, 2026-06-12, 2d
-  section P1
-  macOS N4 Pro Codex MVP   :p1, after p0, 10d
-  section P2
-  Claude Code Adapter      :p2, after p1, 5d
-  section P3
-  通用 CLI / PTY Fallback  :p3, after p2, 7d
-  section P4
-  硬件传输扩展             :p4, after p1, 7d
-  section P5
-  管理 UI 与打包           :p5, after p1, 10d
+flowchart LR
+  P0["P0 文档与项目骨架"] --> P1["P1 macOS + N4 Pro + Codex MVP"]
+  P1 --> P2["P2 Claude Code Adapter"]
+  P2 --> P3["P3 通用 CLI / PTY Fallback"]
+  P1 --> P4["P4 硬件传输扩展"]
+  P4 --> P45["P4.5 官方场景配置集成研究"]
+  P1 --> P5["P5 管理 UI 与 macOS 打包"]
+  P5 --> P6["P6 宠物/环境反馈扩展"]
 ```
 
-日期只是初始估算，实际以每次迭代计划为准。
+阶段顺序表示建议依赖，不代表固定时间表。每次迭代可以按当前需求重新调整。
 
 ## P0：文档与项目骨架
 
@@ -47,8 +39,9 @@ gantt
 
 - `2026-06-12-agent-deck-analysis.md`
 - `2026-06-12-agent-deck-mvp-design.md`
-- `2026-06-12-agent-deck-roadmap.md`
+- `docs/references/agent-deck-roadmap.md`
 - Gemini 粘贴报告归档到 `docs/references/`
+- Stream Dock 场景配置研究摘记归档到 `docs/references/`
 - `uv` 项目配置
 - Python package skeleton。
 - 基础测试命令。
@@ -79,52 +72,57 @@ gantt
 - `agent_deck.actions.macos`
 - `agent_deck.cli`
 - `agent_deck.config`
+- `agent_deck.core.modes`
 
 可拆任务：
 
-1. 项目初始化  
+1. 项目初始化
    使用 `uv` 建立 Python 包、虚拟环境、测试框架、lint、typing、基础 CLI。
 
-2. 配置与路径  
+2. 配置与路径
    定义用户配置、cache、日志、runtime state 路径。
 
-3. fake hardware  
+3. fake hardware
    先实现可测试硬件接口，模拟 key/knob/touch/led。
 
-4. Codex OTel receiver  
+4. Codex OTel receiver
    接收 OTLP HTTP，解析 Codex 日志为内部事件。
 
-5. Codex hook helper  
+5. Codex hook helper
    command hook 从 stdin 读 JSON，发送到 `agent-deckd`，必要时等待决策。
 
-6. Codex notify helper  
+6. Codex notify helper
    作为 fallback 接收 `agent-turn-complete`。
 
-7. state reducer  
+7. state reducer
    把事件归约为 AgentState。
 
-8. decision broker  
+8. DeckMode 和 layout plan
+   建立 `overview`、`agent_detail`、`decision`、`quick_prompt`、`settings` 内部运行场景，并输出硬件无关的 layout plan。
+
+9. decision broker
    支持 pending decision、timeout、allow、deny、cleanup。
 
-9. N4 Pro driver  
+10. N4 Pro driver
    枚举设备、初始化、按键图标、触屏背景、LED、输入回调、断线恢复。
 
-10. N4 Pro renderer  
-    生成 slot icons、详情屏、决策界面、LED 聚合状态。
+11. N4 Pro renderer
+    根据 DeckMode 生成 slot icons、详情屏、决策界面、LED 聚合状态。
 
-11. action executor  
+12. action executor
     实现 focus target、tmux、AppleScript 激活、递归熔断。
 
-12. installer / doctor  
-    检查 Codex 配置、SDK、设备权限、端口占用，提供 dry-run patch。
+13. installer / doctor
+    检查 Codex 配置、SDK、设备权限、端口占用、官方软件设备占用，提供 dry-run patch。
 
-13. 手动验收脚本  
+14. 手动验收脚本
     提供模拟事件和真实 Codex 验证步骤。
 
 P1 验收清单：
 
 - 无硬件时 fake hardware 测试通过。
 - 有 N4 Pro 时 `doctor` 能识别设备。
+- `doctor` 能识别或提示官方 Stream Dock 软件占用设备的情况。
 - Codex turn 状态能显示到 slot。
 - PermissionRequest 能在硬件上显示并返回 allow/deny。
 - 超时默认策略按配置执行。
@@ -149,7 +147,7 @@ P1 验收清单：
 6. 与 Codex 并行运行的 slot 分配策略。
 7. Claude adapter 测试和安装器。
 
-关键设计点：
+P4.5 关键设计点：
 
 - Claude HTTP hook 超时不是 fail-closed，服务必须主动返回 deny。
 - Elicitation 适合映射到 N4 Pro 触屏/上下文按键。
@@ -196,7 +194,30 @@ P1 验收清单：
 6. 多设备选择和 fallback。
 7. 硬件 capability simulator。
 
-关键设计点：
+## P4.5：官方场景配置集成研究
+
+目标：
+
+- 明确 Agent Deck 与 Stream Dock 官方场景配置的边界。
+- 判断是否能自动导入、创建或切换官方 `Agent Deck` 场景。
+- 给出官方软件共存或独占控制策略。
+
+可拆任务：
+
+1. 实测 N4 Pro 上官方软件运行时 Python HID 是否能打开设备。
+2. 实测退出 `agent-deckd` 后官方软件场景是否自动恢复。
+3. 研究官方场景导出文件格式，判断是否可生成可导入的 `Agent Deck` 场景。
+4. 研究官方软件的“应用智能跟随”是否可绑定 Codex、Terminal、iTerm2、Warp 或 Agent Deck daemon。
+5. 研究 Plugin SDK 是否存在未文档化或新版的场景切换 API。
+6. 如可行，制作 `Agent Deck` 官方场景模板；如不可行，写手动配置教程。
+
+P4.5 关键设计点：
+
+- 官方场景是入口和用户熟悉的配置层，不是 Agent Deck 动态状态机。
+- Agent Deck 内部 DeckMode 仍是动态展示和审批交互的主路径。
+- 不能假设所有设备或所有平台都有相同场景能力。
+
+P4 关键设计点：
 
 - 旧 293/293s 刷新图像时不能同时响应按键，renderer 必须降低刷新频率。
 - 不同设备的 key image size、rotation、touchscreen 支持不同，必须由 profile 提供。
@@ -246,6 +267,7 @@ P1 验收清单：
 - `state_store`
 - `state_reducer`
 - `decision_broker`
+- `deck_mode`
 - `intent_router`
 - `config`
 - `audit_log`
@@ -272,6 +294,7 @@ P1 验收清单：
 
 - `icon_renderer`
 - `touchscreen_renderer`
+- `layout_plan`
 - `layout_engine`
 - `asset_cache`
 - `render_queue`
@@ -304,6 +327,9 @@ P1 验收清单：
 6. N4 Pro 触摸屏是否需要中文字体，还是第一版全英文短标签？
 7. 是否需要 SQLite 保存状态，还是 P1 只用内存加 JSONL audit？
 8. 是否需要菜单栏 App，还是 P1 仅 CLI + daemon？
+9. 第一版是否采用 Agent Deck 独占控制模式，还是要求与官方 Stream Dock 软件共存？
+10. 是否为官方 `Agent Deck` 场景提供手动配置教程或可导入模板？
+11. 官方“应用智能跟随”是否绑定 Codex/Terminal/Codex App，还是绑定 Agent Deck 管理页？
 
 ## 下一次工作建议
 
@@ -317,6 +343,7 @@ P1 验收清单：
 - 用 `uv` 初始化 Python 项目。
 - 建立 core event/state/decision 的纯内存模型。
 - 建立 fake hardware。
+- 建立 DeckMode 和 layout plan。
 - 用模拟 Codex 事件跑通状态到 fake surface 的测试。
 
 这个节点不依赖真实 N4 Pro，也不修改 Codex 配置，风险最低。
