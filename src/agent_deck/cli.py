@@ -64,16 +64,19 @@ def daemon_callback(
         typer.Option(
             "--port",
             help="TCP port for the local daemon listener.",
+            min=1,
+            max=65535,
         ),
     ] = 8765,
 ) -> None:
     """Start the local daemon when no daemon subcommand is selected.
 
     入参：`ctx` 是 Typer/Click 当前命令上下文，用于判断是否已有子命令；`host`
-    是 uvicorn 监听地址，默认 `127.0.0.1`；`port` 是监听 TCP 端口，默认 `8765`。
+    是 uvicorn 监听地址，默认 `127.0.0.1`；`port` 是监听 TCP 端口，范围 1-65535，
+    默认 `8765`。
     返回：无显式返回值；`uvicorn.run` 负责阻塞运行 ASGI app。
-    错误处理：Typer 处理 CLI 参数错误；`create_app` 或 `uvicorn.run` 抛出的异常会向上
-    传播并使命令失败。
+    错误处理：Typer 处理 CLI 参数错误，包括非法端口范围；`create_app` 或
+    `uvicorn.run` 抛出的异常会向上传播并使命令失败。
     副作用：当没有子命令时创建 FastAPI app 并启动 uvicorn 监听指定本地地址；不探测硬件、
     不读写用户配置、不安装 Codex hooks。
     """

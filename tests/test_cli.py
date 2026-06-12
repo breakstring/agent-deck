@@ -301,6 +301,28 @@ def test_daemon_callback_calls_uvicorn_run(monkeypatch: Any) -> None:
     assert calls == [{"app": fake_app, "host": "127.0.0.1", "port": 8765}]
 
 
+def test_daemon_rejects_out_of_range_port_before_uvicorn(monkeypatch: Any) -> None:
+    """Verify invalid daemon ports fail at CLI parsing instead of uvicorn bind.
+
+    入参：`monkeypatch` 替换 `uvicorn.run`，用于确认解析失败时不会启动 server。
+    返回：无返回值；断言通过代表端口范围错误以 exit 2 收敛。
+    错误处理：若命令进入 uvicorn 或退出码不是 2，会由 pytest 报告。
+    副作用：只运行 Typer in-process 解析，不打开真实 socket。
+    """
+
+    calls: list[object] = []
+    monkeypatch.setattr(
+        cli.uvicorn,
+        "run",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    result = runner.invoke(cli.daemon_app, ["--port", "88765"])
+
+    assert result.exit_code == 2
+    assert calls == []
+
+
 def _install_fake_client(monkeypatch: Any, fail: bool = False) -> None:
     """Install `_FakeClient` as the CLI's httpx.Client replacement.
 
