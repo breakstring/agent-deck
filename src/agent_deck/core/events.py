@@ -9,16 +9,107 @@ or perform network I/O; importing it is intentionally side-effect free.
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 _SENSITIVE_KEY_MARKERS = frozenset(
     {"token", "secret", "authorization", "api_key", "apikey", "password"}
 )
 _REDACTED_VALUE = "[REDACTED]"
+
+
+class FrozenDict(Mapping[str, Any]):
+    """Read-only mapping used to protect normalized event payloads.
+
+    入参：`items` 是已经完成脱敏和递归冻结的键值映射；本类不主动重新脱敏。
+    返回：实现 `Mapping[str, Any]` 的不可变视图，可用于普通只读索引和比较。
+    错误处理：访问不存在的 key 会按 dict 语义抛出 KeyError；写入操作不存在并会
+    由 Python 抛出 TypeError。
+    副作用：构造时复制传入 mapping，之后不修改输入对象，也不访问外部 I/O。
+    """
+
+    def __init__(self, items: Mapping[str, Any] | None = None) -> None:
+        """Create an immutable mapping snapshot from already-safe items.
+
+        入参：`items` 可为空；非空时会被复制到内部 dict 中，调用方后续修改不影响本实例。
+        返回：无显式返回值；初始化后的实例可作为只读 mapping 使用。
+        错误处理：若 `items` 不符合 mapping 协议，底层 `dict(...)` 会抛出异常。
+        副作用：仅复制内存数据，不访问网络、硬件或文件系统。
+        """
+
+        self._items = dict(items or {})
+
+    def __getitem__(self, key: str) -> Any:
+        """Return a payload value by key.
+
+        入参：`key` 是 payload 顶层字符串键。
+        返回：对应的已冻结 payload 值，嵌套 dict 为 `FrozenDict`，list 为 tuple。
+        错误处理：key 不存在时抛出 KeyError。
+        副作用：无；只读取内部内存快照。
+        """
+
+        return self._items[key]
+
+    def __iter__(self) -> Iterator[str]:
+        """Iterate over payload keys in insertion order.
+
+        入参：无；读取当前冻结 mapping 的键集合。
+        返回：字符串 key 的迭代器，顺序与构造时复制的 dict 一致。
+        错误处理：不主动抛出业务异常；迭代器错误按 Python 运行时语义传播。
+        副作用：无；不修改 mapping 或外部状态。
+        """
+
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        """Return the number of top-level payload keys.
+
+        入参：无。
+        返回：内部 mapping 的键数量。
+        错误处理：不主动抛出业务异常。
+        副作用：无；只读取内存长度。
+        """
+
+        return len(self._items)
+
+    def __repr__(self) -> str:
+        """Return a developer-readable representation.
+
+        入参：无。
+        返回：形如 `FrozenDict({...})` 的字符串，便于测试失败时定位内容。
+        错误处理：若内部值的 repr 抛错则按 Python 语义传播。
+        副作用：无；只格式化内存数据。
+        """
+
+        return f"{type(self).__name__}({self._items!r})"
+
+    def __eq__(self, other: object) -> bool:
+        """Compare this frozen mapping with another mapping.
+
+        入参：`other` 可以是普通 dict、`FrozenDict` 或任意 Mapping。
+        返回：内容相等时为 True；非 Mapping 类型返回 False。
+        错误处理：对方 mapping 迭代失败时按 Python 语义传播。
+        副作用：无；不修改任一参与比较的对象。
+        """
+
+        if not isinstance(other, Mapping):
+            return False
+        return _thaw_payload(self) == _thaw_payload(other)
+
+    def __hash__(self) -> int:
+        """Return a hash for use inside frozen Pydantic models.
+
+        入参：无。
+        返回：基于已冻结键值对的 hash；嵌套结构必须已由 `_freeze_payload` 转为可哈希形态。
+        错误处理：若某个标量值本身不可哈希，Python 会抛出 TypeError。
+        副作用：无；只读取内部键值对。
+        """
+
+        return hash(tuple(self._items.items()))
 
 
 class AgentSource(StrEnum):
@@ -70,6 +161,8 @@ class NormalizedEvent(BaseModel):
     副作用：仅保存内存数据；模型实例化不访问网络、硬件或文件系统。
     """
 
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
     event_id: str
     source: AgentSource
     source_event_type: str
@@ -83,9 +176,54 @@ class NormalizedEvent(BaseModel):
     tool_name: str | None = None
     severity: str | None = None
     summary: str | None = None
-    payload: dict[str, Any] = Field(default_factory=dict)
+    payload: FrozenDict = Field(default_factory=FrozenDict)
     occurred_at: datetime
     received_at: datetime
+
+    @field_serializer("payload")
+    def _serialize_payload(self, value: FrozenDict) -> dict[str, Any]:
+        """Convert frozen payload containers back to plain serializable objects.
+
+        入参：`value` 是当前事件内部的只读 `FrozenDict` payload。
+        返回：普通 dict/list 结构，供 `model_dump` 与 JSON 序列化使用。
+        错误处理：若内部值不可序列化，后续 Pydantic/JSON 序列化会报告异常。
+        副作用：只复制内存结构，不修改事件或原始 payload，不访问外部 I/O。
+        """
+
+        return _thaw_payload(value)
+
+    @field_validator("occurred_at", "received_at")
+    @classmethod
+    def _ensure_timezone_aware(cls, value: datetime) -> datetime:
+        """Reject naive datetimes so event ordering never guesses local time.
+
+        入参：`value` 是 Pydantic 已解析出的 `occurred_at` 或 `received_at`。
+        返回：原始 timezone-aware datetime，不做时区转换。
+        错误处理：当 datetime 没有 tzinfo 或 utcoffset 为 None 时抛出 ValueError，
+        由 Pydantic 包装为 ValidationError。
+        副作用：无；只检查内存中的 datetime 字段。
+        """
+
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("datetime fields must be timezone-aware")
+        return value
+
+    @field_validator("payload", mode="before")
+    @classmethod
+    def _redact_and_freeze_payload(cls, value: Any) -> Mapping[str, Any]:
+        """Normalize payload values into an immutable, redacted mapping.
+
+        入参：`value` 是调用方传入的 payload；None 等价于空 mapping。
+        返回：`FrozenDict` 顶层 mapping，内部 dict/list 递归冻结且敏感 key 已脱敏。
+        错误处理：非 mapping 顶层 payload 由 ValueError 拒绝，并由 Pydantic 包装。
+        副作用：不修改原始 payload，不访问网络、硬件或文件系统。
+        """
+
+        if value is None:
+            return FrozenDict()
+        if not isinstance(value, Mapping):
+            raise ValueError("payload must be a mapping")
+        return _freeze_payload(redact_payload(value))
 
     @property
     def agent_key(self) -> str:
@@ -148,7 +286,7 @@ class NormalizedEvent(BaseModel):
             tool_name=tool_name,
             severity=severity,
             summary=summary,
-            payload=redact_payload(payload or {}),
+            payload=payload or {},
             occurred_at=occurred_at,
             received_at=received_at or datetime.now(UTC),
         )
@@ -175,6 +313,44 @@ def redact_payload(value: Any) -> Any:
 
     if isinstance(value, list):
         return [redact_payload(item) for item in value]
+
+    return value
+
+
+def _freeze_payload(value: Any) -> Any:
+    """Recursively convert JSON-like payload containers to immutable containers.
+
+    入参：任意已脱敏 Python 值；dict 会转为 `FrozenDict`，list 会转为 tuple，
+    其他标量保持原值。
+    返回：递归冻结后的值，可安全挂载到 frozen `NormalizedEvent`。
+    错误处理：若 dict key 无法作为字符串 key 使用或内部迭代失败，按 Python 异常传播。
+    副作用：不修改输入容器，不访问网络、硬件或文件系统。
+    """
+
+    if isinstance(value, Mapping):
+        return FrozenDict({key: _freeze_payload(item) for key, item in value.items()})
+
+    if isinstance(value, list):
+        return tuple(_freeze_payload(item) for item in value)
+
+    return value
+
+
+def _thaw_payload(value: Any) -> Any:
+    """Recursively convert frozen payload containers to plain containers.
+
+    入参：任意 payload 值；`FrozenDict` 会转为 dict，tuple 会转为 list，
+    其他标量保持原值。
+    返回：适合比较、`model_dump` 和 JSON 序列化的普通 Python 容器。
+    错误处理：内部 mapping 或 tuple 迭代失败时按 Python 异常传播。
+    副作用：不修改输入容器，不访问网络、硬件或文件系统。
+    """
+
+    if isinstance(value, Mapping):
+        return {key: _thaw_payload(item) for key, item in value.items()}
+
+    if isinstance(value, tuple):
+        return [_thaw_payload(item) for item in value]
 
     return value
 
