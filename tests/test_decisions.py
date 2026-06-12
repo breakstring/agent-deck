@@ -18,6 +18,38 @@ from agent_deck.core.decisions import (
     DecisionStatus,
 )
 
+BASE_TIME = datetime(2026, 6, 12, 8, 0, tzinfo=UTC)
+
+
+async def test_create_accepts_first_six_arguments_positionally() -> None:
+    """Verify create supports the positional API shape from the task spec.
+
+    入参：无；测试内按 spec 位置参数顺序调用 `DecisionBroker.create`。
+    返回：无返回值；断言通过代表前六个业务参数可位置传入且字段正确保存。
+    错误处理：签名不兼容、模型校验失败或字段不匹配会由 pytest 报告。
+    副作用：仅修改测试内 broker 的内存状态并注册 asyncio future。
+    """
+
+    broker = DecisionBroker()
+
+    decision = broker.create(
+        "codex:session-1",
+        "session-1",
+        "shell",
+        "reason",
+        BASE_TIME,
+        timedelta(seconds=30),
+    )
+
+    assert decision.agent_key == "codex:session-1"
+    assert decision.session_id == "session-1"
+    assert decision.tool_name == "shell"
+    assert decision.reason == "reason"
+    assert decision.created_at == BASE_TIME
+    assert decision.expires_at == BASE_TIME + timedelta(seconds=30)
+    assert decision.default_behavior == DecisionBehavior.DENY
+    assert decision.status == DecisionStatus.PENDING
+
 
 async def test_create_resolve_allow_and_wait_returns_allow() -> None:
     """Verify a pending decision can be resolved to allow and awaited.
@@ -75,13 +107,12 @@ async def test_wait_timeout_returns_default_deny_and_removes_from_pending() -> N
     )
 
     result = await broker.wait(decision.decision_id, timeout=0.01)
-    stored = broker.get(decision.decision_id)
+    timed_out = broker.resolve(decision.decision_id, DecisionBehavior.ALLOW)
 
     assert result.behavior == DecisionBehavior.DENY
     assert result.message == "Timed out waiting for Agent Deck decision."
-    assert stored is not None
-    assert stored.status == DecisionStatus.TIMED_OUT
-    assert stored.result == result
+    assert timed_out.status == DecisionStatus.TIMED_OUT
+    assert timed_out.result == result
     assert broker.pending() == []
 
 

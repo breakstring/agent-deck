@@ -125,7 +125,6 @@ class DecisionBroker:
 
     def create(
         self,
-        *,
         agent_key: str,
         session_id: str,
         tool_name: str,
