@@ -1,10 +1,9 @@
-"""Command-line entry points for Agent Deck daemon, control, and Codex hooks.
+"""Agent Deck daemon、控制命令和 Codex hook 的命令行入口。
 
-This module owns only CLI parsing, JSON/stdin handling, local daemon HTTP calls,
-and uvicorn hosting for the packaged console scripts. It does not probe
-hardware, install or edit Codex configuration, persist daemon state, implement
-broker logic, or mutate user files. Network side effects are limited to explicit
-HTTP calls to the configured local daemon URL with bounded httpx timeouts.
+本模块只负责 CLI 参数解析、JSON/stdin 处理、本地 daemon HTTP 调用，以及打包后的
+console scripts 启动 uvicorn。它不探测硬件、不安装或编辑 Codex 配置、不持久化
+daemon 状态、不实现 broker 业务逻辑，也不修改用户文件。网络副作用仅限用户显式
+执行命令时访问配置的本地 daemon URL，并使用有界 httpx timeout。
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ import typer
 import uvicorn
 
 from agent_deck import __version__
+from agent_deck.adapters.codex_quota import read_codex_quota
 from agent_deck.core.decisions import DecisionBehavior
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
 from agent_deck.rendering.asset_builder import build_codex_visual_assets
@@ -267,25 +267,42 @@ def generate_codex_assets(
             min=1,
         ),
     ] = 112,
-    max_frames: Annotated[
+    target_fps: Annotated[
         int,
         typer.Option(
-            "--max-frames",
-            help="Maximum GIF frames to prerender per animated variant.",
+            "--target-fps",
+            help="Target animation FPS for resampling source GIFs.",
             min=1,
         ),
-    ] = 12,
+    ] = 10,
+    max_duration_ms: Annotated[
+        int,
+        typer.Option(
+            "--max-duration-ms",
+            help="Maximum source GIF duration to sample in milliseconds.",
+            min=1,
+        ),
+    ] = 5000,
+    max_frames: Annotated[
+        int | None,
+        typer.Option(
+            "--max-frames",
+            help="Optional hard cap for generated frames per animated variant.",
+            min=1,
+        ),
+    ] = None,
 ) -> None:
-    """Generate local Codex visual asset frames and a preview sheet.
+    """Generate local Codex visual asset frames and previews.
 
     入参：`output_dir` 是生成目录；`source_gif` 是非 offline 状态的源 GIF；
     `source_png` 是 offline 状态的源 PNG；`key_width`/`key_height` 是输出帧尺寸；
-    `max_frames` 是每个动画变体最多预渲染的帧数。
-    返回：无显式返回值；成功时以 JSON 输出生成目录、预览图路径、帧尺寸和变体帧数。
+    `target_fps` 是按时间轴重采样的目标帧率；`max_duration_ms` 是参与采样的最长源动画时长；
+    `max_frames` 是可选的每个动画变体帧数硬上限。
+    返回：无显式返回值；成功时以 JSON 输出生成目录、预览图路径、manifest、帧尺寸和变体帧数。
     错误处理：源资产缺失、图片解码失败、输出目录不可写或参数非法时写 stderr 并 exit 1；
     Typer 负责命令行参数类型和范围错误。
-    副作用：读取源 GIF/PNG，写入输出目录下的 PNG 帧和 `preview.png`；不访问 daemon、
-    不连接硬件、不修改 Codex 配置。
+    副作用：读取源 GIF/PNG，写入输出目录下的 PNG 帧、每状态 `preview.gif`、`preview.png`
+    和 `manifest.json`；不访问 daemon、不连接硬件、不修改 Codex 配置。
     """
 
     try:
@@ -294,6 +311,8 @@ def generate_codex_assets(
             source_png=source_png,
             output_dir=output_dir,
             key_size=(key_width, key_height),
+            target_fps=target_fps,
+            max_duration_ms=max_duration_ms,
             max_frames=max_frames,
         )
     except Exception as exc:
@@ -303,10 +322,43 @@ def generate_codex_assets(
         {
             "output_dir": str(result.output_dir),
             "preview_path": str(result.preview_path),
+            "manifest_path": str(result.manifest_path),
+            "preview_gif_paths": {
+                variant: str(path) for variant, path in result.preview_gif_paths.items()
+            },
             "frame_size": list(result.frame_size),
             "variant_frame_counts": result.variant_frame_counts,
         }
     )
+
+
+@ctl_app.command("codex-quota")
+def codex_quota(
+    timeout_seconds: Annotated[
+        float,
+        typer.Option(
+            "--timeout-seconds",
+            help="Seconds to wait for Codex app-server quota responses.",
+            min=1,
+        ),
+    ] = 10.0,
+) -> None:
+    """Read Codex app-server quota information and print JSON.
+
+    入参：`timeout_seconds` 是等待 Codex app-server 初始化和 quota 响应的超时时间。
+    返回：无显式返回值；成功时将 `CodexQuotaSnapshot` 以 JSON 输出。
+    错误处理：Codex CLI 不存在、app-server 超时、JSON-RPC 错误或解析失败时写 stderr
+    并以 exit 1 退出。
+    副作用：启动短生命周期 `codex -s read-only -a untrusted app-server` 子进程；
+    不访问 StreamDock 硬件、不修改 Codex 配置、不连接 daemon。
+    """
+
+    try:
+        snapshot = read_codex_quota(timeout_seconds=timeout_seconds)
+    except Exception as exc:
+        typer.echo(f"agent-deckctl codex-quota: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    _echo_json(snapshot.model_dump(mode="json"))
 
 
 @codex_hook_app.callback()

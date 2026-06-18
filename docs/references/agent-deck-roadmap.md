@@ -109,13 +109,19 @@ flowchart LR
 11. N4 Pro renderer
     根据 DeckMode 生成 slot icons、详情屏、决策界面、LED 聚合状态。
 
-12. action executor
+12. Codex 视觉资产生成器
+    将 `assets/codex/codex.gif` 按目标设备 profile 预渲染成状态帧序列、每状态
+    `preview.gif` 和 `manifest.json`。动态图标遵循官方图标包建议：10-20fps、
+    理想情况下 5 秒以内；第一版 N4 Pro key profile 默认 10fps，并保留完整动画周期的
+    时间轴重采样，而不是截取源 GIF 前几帧。
+
+13. action executor
     实现 focus target、tmux、AppleScript 激活、递归熔断。
 
-13. installer / doctor
+14. installer / doctor
     检查 Codex 配置、SDK、设备权限、端口占用、官方软件设备占用，提供 dry-run patch。
 
-14. 手动验收脚本
+15. 手动验收脚本
     提供模拟事件和真实 Codex 验证步骤。
 
 P1 验收清单：
@@ -221,6 +227,9 @@ P4 关键设计点：
 
 - 旧 293/293s 刷新图像时不能同时响应按键，renderer 必须降低刷新频率。
 - 不同设备的 key image size、rotation、touchscreen 支持不同，必须由 profile 提供。
+- 官方图标包规格支持 128x128 GIF/WEBP 动态图标，并建议 10-20fps、5 秒以内；
+  Python SDK 直连路径仍按设备 profile 主动下发静态帧，所以 renderer 需要把官方建议转换为
+  每个设备的实际刷新策略。
 
 ## P5：管理 UI 与 macOS 打包
 
@@ -294,6 +303,8 @@ P4 关键设计点：
 
 - `icon_renderer`
 - `touchscreen_renderer`
+- `virtual_panel`
+- `n4pro_background_composer`
 - `layout_plan`
 - `layout_engine`
 - `asset_cache`

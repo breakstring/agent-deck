@@ -28,7 +28,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "pydantic", specifier = ">=2.7.0" },
-    { name = "streamdock", specifier = ">=0.1.2,<0.2.0" },
+    { name = "streamdock", directory = "vendor/streamdock-python-sdk" },
     { name = "typer", specifier = ">=0.12.0" },
     { name = "uvicorn", specifier = ">=0.30.0" },
 ]
@@ -498,16 +498,23 @@ wheels = [
 
 [[package]]
 name = "streamdock"
-version = "0.1.2"
-source = { registry = "https://pypi.org/simple" }
+version = "0.1.1"
+source = { directory = "vendor/streamdock-python-sdk" }
 dependencies = [
     { name = "pillow" },
     { name = "pyudev" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ef/c4/dd521227c259dfa04c8370656e04c4b4d6adc28c570842cccf2dd3a73d42/streamdock-0.1.2.tar.gz", hash = "sha256:996988976630d4a28b44f055ca562dc72bb5fafbd50bf87d1fda9bd4bcb9191c", size = 50492, upload-time = "2024-09-22T11:36:14.048Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/31/c1/c2e1d15d3572e1042f53f000b9f9a2ba272f92fe2bfaede1b552095bde96/streamdock-0.1.2-py3-none-any.whl", hash = "sha256:bba82da90ff59693c79c18a9e127de190fa35f2965563d83281667411906b52b", size = 52063, upload-time = "2024-09-22T11:36:11.69Z" },
+
+[package.metadata]
+requires-dist = [
+    { name = "opencv-python", marker = "extra == 'video'" },
+    { name = "pillow" },
+    { name = "pyudev" },
+    { name = "pyudev", marker = "extra == 'linux'" },
+    { name = "pywin32", marker = "extra == 'windows'" },
+    { name = "wmi", marker = "extra == 'windows'" },
 ]
+provides-extras = ["linux", "windows", "video"]
 
 [[package]]
 name = "typer"

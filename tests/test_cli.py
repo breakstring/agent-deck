@@ -332,7 +332,7 @@ def test_generate_codex_assets_uses_default_sources(
     """Verify `generate-codex-assets` calls the local asset builder.
 
     入参：`monkeypatch` 替换 CLI 内的 builder；`tmp_path` 提供输出目录。
-    返回：无返回值；断言通过代表默认源素材、尺寸和帧数参数传递正确。
+    返回：无返回值；断言通过代表默认源素材、尺寸和动画采样参数传递正确。
     错误处理：命令缺失、退出码非 0、参数传递错误或 JSON 输出错误由 pytest 报告。
     副作用：只写入测试内存记录，不读取真实 assets、不生成真实图片。
     """
@@ -353,6 +353,8 @@ def test_generate_codex_assets_uses_default_sources(
         return CodexVisualAssetBuildResult(
             output_dir=kwargs["output_dir"],
             preview_path=kwargs["output_dir"] / "preview.png",
+            manifest_path=kwargs["output_dir"] / "manifest.json",
+            preview_gif_paths={"idle": kwargs["output_dir"] / "idle" / "preview.gif"},
             frame_size=kwargs["key_size"],
             variant_frame_counts={"idle": 1, "offline": 1},
         )
@@ -370,10 +372,78 @@ def test_generate_codex_assets_uses_default_sources(
     assert calls[0]["source_png"] == Path("assets/codex/codex.png")
     assert calls[0]["output_dir"] == output_dir
     assert calls[0]["key_size"] == (112, 112)
-    assert calls[0]["max_frames"] == 12
+    assert calls[0]["target_fps"] == 10
+    assert calls[0]["max_duration_ms"] == 5000
+    assert calls[0]["max_frames"] is None
     payload = json.loads(result.output)
     assert payload["preview_path"] == str(output_dir / "preview.png")
+    assert payload["manifest_path"] == str(output_dir / "manifest.json")
+    assert payload["preview_gif_paths"] == {
+        "idle": str(output_dir / "idle" / "preview.gif")
+    }
     assert payload["variant_frame_counts"] == {"idle": 1, "offline": 1}
+
+
+def test_codex_quota_command_prints_snapshot(monkeypatch: Any) -> None:
+    """Verify `codex-quota` prints the adapter snapshot as JSON.
+
+    入参：`monkeypatch` 替换 CLI 内 quota reader。
+    返回：无返回值；断言通过表示 CLI 调用 adapter 并输出 plan 与窗口字段。
+    错误处理：命令退出码、JSON 结构或 adapter 调用错误由 pytest 报告。
+    副作用：只运行 Typer in-process，不启动真实 Codex app-server。
+    """
+
+    calls: list[dict[str, Any]] = []
+
+    class FakeSnapshot:
+        """测试用 quota snapshot。
+
+        入参：无。
+        返回：fake 对象，提供 CLI 需要的 `model_dump`。
+        错误处理：无。
+        副作用：无。
+        """
+
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            """返回固定 JSON payload。
+
+            入参：`mode` 是 Pydantic 兼容参数，测试要求为 `json`。
+            返回：固定 quota JSON object。
+            错误处理：mode 非 json 时断言失败。
+            副作用：无。
+            """
+
+            assert mode == "json"
+            return {
+                "plan_type": "prolite",
+                "plan_short_label": "ProLite",
+                "plan_display_name": "ProLite",
+                "primary": {"used_percent": 28},
+                "secondary": {"used_percent": 8},
+            }
+
+    def fake_read_codex_quota(**kwargs: Any) -> FakeSnapshot:
+        """捕获 CLI 传给 quota reader 的参数。
+
+        入参：`kwargs` 是 CLI 转发的选项。
+        返回：`FakeSnapshot`。
+        错误处理：无。
+        副作用：把调用参数追加到 `calls`。
+        """
+
+        calls.append(kwargs)
+        return FakeSnapshot()
+
+    monkeypatch.setattr(cli, "read_codex_quota", fake_read_codex_quota)
+
+    result = runner.invoke(cli.ctl_app, ["codex-quota"])
+
+    assert result.exit_code == 0
+    assert calls == [{"timeout_seconds": 10.0}]
+    payload = json.loads(result.output)
+    assert payload["plan_short_label"] == "ProLite"
+    assert payload["plan_display_name"] == "ProLite"
+    assert payload["primary"]["used_percent"] == 28
 
 
 def _install_fake_client(monkeypatch: Any, fail: bool = False) -> None:
