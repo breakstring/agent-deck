@@ -251,6 +251,35 @@ def test_notify_daemon_failure_exits_zero(monkeypatch: Any) -> None:
     assert "daemon unavailable" in result.stderr
 
 
+def test_notify_accepts_codex_json_argument(monkeypatch: Any) -> None:
+    """Verify Codex notify JSON argv is forwarded as a normalized event.
+
+    入参：`monkeypatch` 安装 fake HTTP client。
+    返回：无返回值；断言通过代表 notify 兼容 Codex 官方单 JSON 参数调用形态。
+    错误处理：命令退出码、POST body 或 URL 不符合契约时由 pytest 报告。
+    副作用：只运行 Typer in-process，不访问真实 daemon 或 Codex。
+    """
+
+    _install_fake_client(monkeypatch)
+    payload = {
+        "type": "agent-turn-complete",
+        "thread-id": "thread-1",
+        "turn-id": "turn-1",
+        "cwd": "/tmp/project",
+    }
+
+    result = runner.invoke(cli.codex_hook_app, ["notify", json.dumps(payload)])
+
+    assert result.exit_code == 0
+    request = _FakeClient.requests[0]
+    body = request["kwargs"]["json"]
+    assert request["url"] == f"{cli.DEFAULT_DAEMON_URL}/events"
+    assert body["normalized_type"] == "turn.completed"
+    assert body["session_id"] == "thread-1"
+    assert body["turn_id"] == "turn-1"
+    assert body["cwd"] == "/tmp/project"
+
+
 def test_permission_request_fail_closed_json(monkeypatch: Any) -> None:
     """Verify permission-request emits deny JSON when daemon I/O fails.
 
@@ -278,21 +307,35 @@ def test_permission_request_fail_closed_json(monkeypatch: Any) -> None:
 
 
 def test_daemon_callback_calls_uvicorn_run(monkeypatch: Any) -> None:
-    """Verify bare `agent-deckd` starts uvicorn with create_app and defaults.
+    """Verify bare `agent-deckd` starts uvicorn with Codex poller defaults.
 
     入参：`monkeypatch` 替换 `uvicorn.run` 与 `create_app`。
-    返回：无返回值；断言通过代表 callback 使用默认 host/port 并传入 app。
-    错误处理：命令失败或 uvicorn 参数不匹配时由 pytest 报告。
+    返回：无返回值；断言通过代表 callback 使用默认 host/port，并启用状态与 quota poller。
+    错误处理：命令失败、uvicorn 参数或 poller 配置不匹配时由 pytest 报告。
     副作用：只写入测试内存记录，不打开真实 socket。
     """
 
-    calls: list[dict[str, Any]] = []
+    uvicorn_calls: list[dict[str, Any]] = []
+    create_app_calls: list[dict[str, Any]] = []
     fake_app = object()
-    monkeypatch.setattr(cli, "create_app", lambda: fake_app)
+
+    def fake_create_app(**kwargs: Any) -> object:
+        """捕获 daemon callback 传给 app factory 的配置。
+
+        入参：`kwargs` 是 `create_app` 关键字参数。
+        返回：固定 fake ASGI app。
+        错误处理：无。
+        副作用：把调用参数追加到测试内存列表。
+        """
+
+        create_app_calls.append(kwargs)
+        return fake_app
+
+    monkeypatch.setattr(cli, "create_app", fake_create_app)
     monkeypatch.setattr(
         cli.uvicorn,
         "run",
-        lambda app, host, port: calls.append(
+        lambda app, host, port: uvicorn_calls.append(
             {"app": app, "host": host, "port": port}
         ),
     )
@@ -300,7 +343,49 @@ def test_daemon_callback_calls_uvicorn_run(monkeypatch: Any) -> None:
     result = runner.invoke(cli.daemon_app, [])
 
     assert result.exit_code == 0
-    assert calls == [{"app": fake_app, "host": "127.0.0.1", "port": 8765}]
+    assert uvicorn_calls == [{"app": fake_app, "host": "127.0.0.1", "port": 8765}]
+    poller_config = create_app_calls[0]["poller_config"]
+    assert poller_config.codex_app_state_enabled is True
+    assert poller_config.codex_app_state_interval_seconds == 5.0
+    assert poller_config.codex_quota_enabled is True
+    assert poller_config.codex_quota_interval_seconds == 300.0
+    assert poller_config.codex_quota_timeout_seconds == 10.0
+    assert poller_config.streamdock_quota_touchscreen_enabled is True
+    assert poller_config.streamdock_quota_device == "n4pro"
+
+
+def test_daemon_callback_can_disable_codex_pollers(monkeypatch: Any) -> None:
+    """Verify daemon CLI can disable Codex polling when needed.
+
+    入参：`monkeypatch` 替换 `uvicorn.run` 与 `create_app`。
+    返回：无返回值；断言通过代表两个 disable 选项会传入关闭状态。
+    错误处理：命令失败或 poller 配置仍启用时由 pytest 报告。
+    副作用：只运行 Typer in-process，不启动真实 daemon。
+    """
+
+    create_app_calls: list[dict[str, Any]] = []
+    fake_app = object()
+    monkeypatch.setattr(
+        cli,
+        "create_app",
+        lambda **kwargs: create_app_calls.append(kwargs) or fake_app,
+    )
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
+
+    result = runner.invoke(
+        cli.daemon_app,
+        [
+            "--disable-codex-app-state-poller",
+            "--disable-codex-quota-poller",
+            "--disable-streamdock-quota-touchscreen",
+        ],
+    )
+
+    assert result.exit_code == 0
+    poller_config = create_app_calls[0]["poller_config"]
+    assert poller_config.codex_app_state_enabled is False
+    assert poller_config.codex_quota_enabled is False
+    assert poller_config.streamdock_quota_touchscreen_enabled is False
 
 
 def test_daemon_rejects_out_of_range_port_before_uvicorn(monkeypatch: Any) -> None:
@@ -444,6 +529,590 @@ def test_codex_quota_command_prints_snapshot(monkeypatch: Any) -> None:
     assert payload["plan_short_label"] == "ProLite"
     assert payload["plan_display_name"] == "ProLite"
     assert payload["primary"]["used_percent"] == 28
+
+
+def test_codex_app_state_command_prints_scan_report(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Verify `codex-app-state` prints the local Codex App scan report.
+
+    入参：`monkeypatch` 替换 CLI 内的 Codex App scanner；`tmp_path` 提供 fake Codex home。
+    返回：无返回值；断言通过代表 CLI 转发路径和 limit，并输出 report JSON。
+    错误处理：命令退出码、参数转发或 JSON 输出不符合契约时由 pytest 报告。
+    副作用：只运行 Typer in-process，不读取真实 `~/.codex`。
+    """
+
+    calls: list[dict[str, Any]] = []
+    codex_home = tmp_path / ".codex"
+
+    class FakeReport:
+        """测试用 Codex App scan report。
+
+        入参：无。
+        返回：fake 对象，提供 CLI 需要的 `model_dump`。
+        错误处理：无。
+        副作用：无。
+        """
+
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            """返回固定 scan JSON。
+
+            入参：`mode` 是 Pydantic 兼容参数，测试要求为 `json`。
+            返回：固定 Codex App scan report JSON object。
+            错误处理：mode 非 json 时断言失败。
+            副作用：无。
+            """
+
+            assert mode == "json"
+            return {
+                "codex_home": str(codex_home),
+                "state_db_path": str(codex_home / "state_5.sqlite"),
+                "threads": [{"thread_id": "thread-1", "status": "waiting_user"}],
+            }
+
+    def fake_scan_codex_app_state(**kwargs: Any) -> FakeReport:
+        """捕获 CLI 传给 Codex App scanner 的参数。
+
+        入参：`kwargs` 是 CLI 转发的选项。
+        返回：`FakeReport`。
+        错误处理：无。
+        副作用：把调用参数追加到 `calls`。
+        """
+
+        calls.append(kwargs)
+        return FakeReport()
+
+    monkeypatch.setattr(cli, "scan_codex_app_state", fake_scan_codex_app_state)
+
+    result = runner.invoke(
+        cli.ctl_app,
+        ["codex-app-state", "--codex-home", str(codex_home), "--limit", "3"],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [{"codex_home": codex_home, "state_db_path": None, "limit": 3}]
+    payload = json.loads(result.output)
+    assert payload["threads"][0]["status"] == "waiting_user"
+
+
+def test_codex_app_state_sync_posts_pending_events(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Verify `codex-app-state --sync` posts generated events to the daemon.
+
+    入参：`monkeypatch` 替换 scanner、event builder 和 HTTP client；`tmp_path` 提供 fake DB。
+    返回：无返回值；断言通过代表 sync 只发送 adapter 生成的 normalized event。
+    错误处理：命令退出码、POST URL/body 或 JSON 输出不符合契约时由 pytest 报告。
+    副作用：只写入 fake HTTP request 记录，不访问真实 daemon 或 Codex。
+    """
+
+    _install_fake_client(monkeypatch)
+    state_db_path = tmp_path / "state_5.sqlite"
+    build_calls: list[object] = []
+
+    class FakeReport:
+        """测试用 Codex App scan report。
+
+        入参：无。
+        返回：fake 对象，提供 CLI 需要的 `model_dump`。
+        错误处理：无。
+        副作用：无。
+        """
+
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            """返回固定 scan JSON。
+
+            入参：`mode` 是 Pydantic 兼容参数，测试要求为 `json`。
+            返回：固定 Codex App scan report JSON object。
+            错误处理：mode 非 json 时断言失败。
+            副作用：无。
+            """
+
+            assert mode == "json"
+            return {"threads": [{"thread_id": "thread-1", "status": "waiting_user"}]}
+
+    class FakeEvent:
+        """测试用 normalized event。
+
+        入参：无。
+        返回：fake 对象，提供 CLI 需要的 `model_dump`。
+        错误处理：无。
+        副作用：无。
+        """
+
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            """返回固定 event JSON。
+
+            入参：`mode` 是 Pydantic 兼容参数，测试要求为 `json`。
+            返回：固定 `input.requested` event JSON object。
+            错误处理：mode 非 json 时断言失败。
+            副作用：无。
+            """
+
+            assert mode == "json"
+            return {
+                "source": "codex",
+                "session_id": "thread-1",
+                "normalized_type": "input.requested",
+            }
+
+    report = FakeReport()
+    monkeypatch.setattr(cli, "scan_codex_app_state", lambda **_: report)
+
+    def fake_build_codex_app_state_events_from_report(report_arg: object) -> tuple[FakeEvent]:
+        """捕获 CLI 传给 event builder 的 report。
+
+        入参：`report_arg` 是 scanner 返回对象。
+        返回：包含一个 fake event 的 tuple。
+        错误处理：无。
+        副作用：把 report 参数追加到 `build_calls`。
+        """
+
+        build_calls.append(report_arg)
+        return (FakeEvent(),)
+
+    monkeypatch.setattr(
+        cli,
+        "build_codex_app_state_events_from_report",
+        fake_build_codex_app_state_events_from_report,
+    )
+
+    result = runner.invoke(
+        cli.ctl_app,
+        [
+            "codex-app-state",
+            "--state-db-path",
+            str(state_db_path),
+            "--sync",
+            "--daemon-url",
+            "http://127.0.0.1:9999",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert build_calls == [report]
+    request = _FakeClient.requests[0]
+    assert request["url"] == "http://127.0.0.1:9999/events"
+    assert request["kwargs"]["json"]["normalized_type"] == "input.requested"
+    payload = json.loads(result.output)
+    assert payload["synced_events"] == 1
+
+
+def test_codex_detect_enable_integration_prints_report(monkeypatch: Any) -> None:
+    """Verify `codex-detect --enable-integration` prints the adapter report.
+
+    入参：`monkeypatch` 替换 CLI 内的 Codex detection report builder。
+    返回：无返回值；断言通过代表 CLI 转发 integration 选项并输出 JSON。
+    错误处理：命令退出码、参数转发或 JSON 输出不符合契约时由 pytest 报告。
+    副作用：只运行 Typer in-process，不读取真实 Codex 配置、不写文件、不启动子进程。
+    """
+
+    calls: list[dict[str, Any]] = []
+
+    class FakeReport:
+        """测试用 Codex detection report。
+
+        入参：无。
+        返回：fake 对象，提供 CLI 需要的 `model_dump`。
+        错误处理：无。
+        副作用：无。
+        """
+
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            """返回固定 JSON report。
+
+            入参：`mode` 是 Pydantic 兼容参数，测试要求为 `json`。
+            返回：固定 detection report JSON object。
+            错误处理：mode 非 json 时断言失败。
+            副作用：无。
+            """
+
+            assert mode == "json"
+            return {
+                "product": "codex",
+                "integration": {
+                    "writes_files": False,
+                    "notify_toml": 'notify = ["agent-deck-codex-hook", "notify"]',
+                },
+            }
+
+    def fake_build_codex_detection_report(**kwargs: Any) -> FakeReport:
+        """捕获 CLI 传给 detection builder 的参数。
+
+        入参：`kwargs` 是 CLI 转发的选项。
+        返回：`FakeReport`。
+        错误处理：无。
+        副作用：把调用参数追加到 `calls`。
+        """
+
+        calls.append(kwargs)
+        return FakeReport()
+
+    monkeypatch.setattr(
+        cli,
+        "build_codex_detection_report",
+        fake_build_codex_detection_report,
+    )
+
+    result = runner.invoke(
+        cli.ctl_app,
+        [
+            "codex-detect",
+            "--enable-integration",
+            "--daemon-url",
+            "http://127.0.0.1:9999",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        {
+            "enable_integration": True,
+            "daemon_url": "http://127.0.0.1:9999",
+            "codex_home": None,
+            "app_path": None,
+        }
+    ]
+    payload = json.loads(result.output)
+    assert payload["product"] == "codex"
+    assert payload["integration"]["writes_files"] is False
+
+
+def test_codex_install_defaults_to_dry_run(monkeypatch: Any) -> None:
+    """Verify `codex-install` defaults to a non-writing dry-run.
+
+    入参：`monkeypatch` 替换 CLI 内的 Codex installer。
+    返回：无返回值；断言通过代表 CLI 默认传入 apply=False 并输出 JSON。
+    错误处理：命令退出码、参数转发或 JSON 输出不符合契约时由 pytest 报告。
+    副作用：只运行 Typer in-process，不读取或写入真实 Codex 配置。
+    """
+
+    calls: list[dict[str, Any]] = []
+
+    class FakeInstallResult:
+        """测试用 Codex install result。
+
+        入参：无。
+        返回：fake 对象，提供 CLI 需要的 `model_dump`。
+        错误处理：无。
+        副作用：无。
+        """
+
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            """返回固定 dry-run JSON。
+
+            入参：`mode` 是 Pydantic 兼容参数，测试要求为 `json`。
+            返回：固定 install result JSON object。
+            错误处理：mode 非 json 时断言失败。
+            副作用：无。
+            """
+
+            assert mode == "json"
+            return {"applied": False, "writes_files": False, "written_paths": []}
+
+    def fake_install_codex_integration(**kwargs: Any) -> FakeInstallResult:
+        """捕获 CLI 传给 installer 的参数。
+
+        入参：`kwargs` 是 CLI 转发的选项。
+        返回：`FakeInstallResult`。
+        错误处理：无。
+        副作用：把调用参数追加到 `calls`。
+        """
+
+        calls.append(kwargs)
+        return FakeInstallResult()
+
+    monkeypatch.setattr(
+        cli,
+        "install_codex_integration",
+        fake_install_codex_integration,
+    )
+
+    result = runner.invoke(cli.ctl_app, ["codex-install"])
+
+    assert result.exit_code == 0
+    assert calls == [
+        {
+            "apply": False,
+            "daemon_url": cli.DEFAULT_DAEMON_URL,
+            "codex_home": None,
+            "app_path": None,
+            "mode": "user",
+            "system_requirements_path": None,
+            "managed_hooks_dir": None,
+        }
+    ]
+    assert json.loads(result.output)["writes_files"] is False
+
+
+def test_codex_install_apply_forwards_apply_flag(monkeypatch: Any) -> None:
+    """Verify `codex-install --apply` enables writing in the installer.
+
+    入参：`monkeypatch` 替换 CLI 内的 Codex installer。
+    返回：无返回值；断言通过代表 CLI 只在显式 `--apply` 时传入 apply=True。
+    错误处理：命令退出码、参数转发或 JSON 输出不符合契约时由 pytest 报告。
+    副作用：只运行 Typer in-process，不读取或写入真实 Codex 配置。
+    """
+
+    calls: list[dict[str, Any]] = []
+
+    class FakeInstallResult:
+        """测试用 Codex apply result。
+
+        入参：无。
+        返回：fake 对象，提供 CLI 需要的 `model_dump`。
+        错误处理：无。
+        副作用：无。
+        """
+
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            """返回固定 apply JSON。
+
+            入参：`mode` 是 Pydantic 兼容参数，测试要求为 `json`。
+            返回：固定 install result JSON object。
+            错误处理：mode 非 json 时断言失败。
+            副作用：无。
+            """
+
+            assert mode == "json"
+            return {"applied": True, "writes_files": True, "written_paths": ["x"]}
+
+    def fake_install_codex_integration(**kwargs: Any) -> FakeInstallResult:
+        """捕获 CLI 传给 installer 的参数。
+
+        入参：`kwargs` 是 CLI 转发的选项。
+        返回：`FakeInstallResult`。
+        错误处理：无。
+        副作用：把调用参数追加到 `calls`。
+        """
+
+        calls.append(kwargs)
+        return FakeInstallResult()
+
+    monkeypatch.setattr(
+        cli,
+        "install_codex_integration",
+        fake_install_codex_integration,
+    )
+
+    result = runner.invoke(
+        cli.ctl_app,
+        ["codex-install", "--apply", "--daemon-url", "http://127.0.0.1:9999"],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0]["apply"] is True
+    assert calls[0]["daemon_url"] == "http://127.0.0.1:9999"
+    assert json.loads(result.output)["applied"] is True
+
+
+def test_codex_install_managed_system_forwards_system_paths(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Verify `codex-install --managed-system` forwards system install options.
+
+    入参：`monkeypatch` 替换 CLI 内的 Codex installer；`tmp_path` 提供 fake 系统路径。
+    返回：无返回值；断言通过代表 CLI 能把 managed-system 选项转发到 installer。
+    错误处理：命令退出码、参数转发或 JSON 输出不符合契约时由 pytest 报告。
+    副作用：只运行 Typer in-process，不读取或写入真实系统配置。
+    """
+
+    calls: list[dict[str, Any]] = []
+
+    class FakeInstallResult:
+        """测试用 managed-system install result。
+
+        入参：无。
+        返回：fake 对象，提供 CLI 需要的 `model_dump`。
+        错误处理：无。
+        副作用：无。
+        """
+
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            """返回固定 managed-system JSON。
+
+            入参：`mode` 是 Pydantic 兼容参数，测试要求为 `json`。
+            返回：固定 install result JSON object。
+            错误处理：mode 非 json 时断言失败。
+            副作用：无。
+            """
+
+            assert mode == "json"
+            return {"mode": "managed-system", "applied": True}
+
+    def fake_install_codex_integration(**kwargs: Any) -> FakeInstallResult:
+        """捕获 CLI 传给 installer 的参数。
+
+        入参：`kwargs` 是 CLI 转发的选项。
+        返回：`FakeInstallResult`。
+        错误处理：无。
+        副作用：把调用参数追加到 `calls`。
+        """
+
+        calls.append(kwargs)
+        return FakeInstallResult()
+
+    monkeypatch.setattr(
+        cli,
+        "install_codex_integration",
+        fake_install_codex_integration,
+    )
+    requirements_path = tmp_path / "requirements.toml"
+    hooks_dir = tmp_path / "hooks"
+
+    result = runner.invoke(
+        cli.ctl_app,
+        [
+            "codex-install",
+            "--managed-system",
+            "--apply",
+            "--system-requirements-path",
+            str(requirements_path),
+            "--managed-hooks-dir",
+            str(hooks_dir),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0]["apply"] is True
+    assert calls[0]["mode"] == "managed-system"
+    assert calls[0]["system_requirements_path"] == requirements_path
+    assert calls[0]["managed_hooks_dir"] == hooks_dir
+    assert json.loads(result.output)["mode"] == "managed-system"
+
+
+def test_codex_install_managed_system_validate_only_uses_validator(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Verify `codex-install --managed-system --validate-only` runs read-only validation.
+
+    入参：`monkeypatch` 替换 CLI 内的 validator；`tmp_path` 提供 fake 系统路径。
+    返回：无返回值；断言通过代表 CLI 不调用 installer，且完整转发 validate 参数。
+    错误处理：命令退出码、参数转发或 JSON 输出不符合契约时由 pytest 报告。
+    副作用：只运行 Typer in-process，不读取或写入真实 Codex/系统配置。
+    """
+
+    calls: list[dict[str, Any]] = []
+
+    class FakeValidationResult:
+        """测试用 managed-system validation result。
+
+        入参：无。
+        返回：fake 对象，提供 CLI 需要的 `model_dump`。
+        错误处理：无。
+        副作用：无。
+        """
+
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            """返回固定 validation JSON。
+
+            入参：`mode` 是 Pydantic 兼容参数，测试要求为 `json`。
+            返回：固定 validation result JSON object。
+            错误处理：mode 非 json 时断言失败。
+            副作用：无。
+            """
+
+            assert mode == "json"
+            return {"mode": "managed-system", "ok": True, "checks": []}
+
+    def fake_validate_codex_managed_system_integration(
+        **kwargs: Any,
+    ) -> FakeValidationResult:
+        """捕获 CLI 传给 managed-system validator 的参数。
+
+        入参：`kwargs` 是 CLI 转发的选项。
+        返回：`FakeValidationResult`。
+        错误处理：无。
+        副作用：把调用参数追加到 `calls`。
+        """
+
+        calls.append(kwargs)
+        return FakeValidationResult()
+
+    def fail_install_codex_integration(**_: Any) -> None:
+        """确保 validate-only 不会落入 installer 写入路径。
+
+        入参：忽略所有参数。
+        返回：无；若被调用则直接断言失败。
+        错误处理：被调用时抛 AssertionError。
+        副作用：无。
+        """
+
+        raise AssertionError("validate-only must not call installer")
+
+    monkeypatch.setattr(
+        cli,
+        "validate_codex_managed_system_integration",
+        fake_validate_codex_managed_system_integration,
+    )
+    monkeypatch.setattr(cli, "install_codex_integration", fail_install_codex_integration)
+    requirements_path = tmp_path / "requirements.toml"
+    hooks_dir = tmp_path / "hooks"
+
+    result = runner.invoke(
+        cli.ctl_app,
+        [
+            "codex-install",
+            "--managed-system",
+            "--validate-only",
+            "--daemon-url",
+            "http://127.0.0.1:9999",
+            "--system-requirements-path",
+            str(requirements_path),
+            "--managed-hooks-dir",
+            str(hooks_dir),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        {
+            "daemon_url": "http://127.0.0.1:9999",
+            "codex_home": None,
+            "app_path": None,
+            "system_requirements_path": requirements_path,
+            "managed_hooks_dir": hooks_dir,
+        }
+    ]
+    assert json.loads(result.output)["ok"] is True
+
+
+def test_codex_event_hook_maps_session_start_to_event(monkeypatch: Any) -> None:
+    """Verify generic Codex lifecycle hooks become normalized daemon events.
+
+    入参：`monkeypatch` 安装 fake HTTP client。
+    返回：无返回值；断言通过代表 `SessionStart` 被映射为 `session.started`。
+    错误处理：退出码、POST URL 或 event body 不符合契约时由 pytest 报告。
+    副作用：读取测试 stdin JSON；不访问真实 daemon 或 Codex。
+    """
+
+    _install_fake_client(monkeypatch)
+
+    result = runner.invoke(
+        cli.codex_hook_app,
+        ["event"],
+        input=json.dumps(
+            {
+                "hookEventName": "SessionStart",
+                "session_id": "session-1",
+                "cwd": "/tmp/project",
+            }
+        ),
+    )
+
+    assert result.exit_code == 0
+    request = _FakeClient.requests[0]
+    body = request["kwargs"]["json"]
+    assert request["url"] == f"{cli.DEFAULT_DAEMON_URL}/events"
+    assert body["source"] == "codex"
+    assert body["session_id"] == "session-1"
+    assert body["source_event_type"] == "SessionStart"
+    assert body["normalized_type"] == "session.started"
+    assert body["cwd"] == "/tmp/project"
 
 
 def _install_fake_client(monkeypatch: Any, fail: bool = False) -> None:

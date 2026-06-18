@@ -1,14 +1,16 @@
 """Agent Deck daemon、控制命令和 Codex hook 的命令行入口。
 
-本模块只负责 CLI 参数解析、JSON/stdin 处理、本地 daemon HTTP 调用，以及打包后的
-console scripts 启动 uvicorn。它不探测硬件、不安装或编辑 Codex 配置、不持久化
-daemon 状态、不实现 broker 业务逻辑，也不修改用户文件。网络副作用仅限用户显式
-执行命令时访问配置的本地 daemon URL，并使用有界 httpx timeout。
+本模块只负责 CLI 参数解析、JSON/stdin 处理、本地 daemon HTTP 调用、Codex 检测/安装、
+Codex App 本地状态扫描命令分派，以及打包后的 console scripts 启动 uvicorn。它不探测
+硬件、不持久化 daemon 状态、不实现 broker 业务逻辑；默认命令不修改用户文件，只有用户
+显式运行 `codex-install --apply` 时才会写 Codex 配置。网络副作用仅限用户显式执行命令时
+访问配置的本地 daemon URL，并使用有界 httpx timeout。
 """
 
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,11 +21,20 @@ import typer
 import uvicorn
 
 from agent_deck import __version__
+from agent_deck.adapters.codex_app_state import (
+    build_codex_app_state_events_from_report,
+    scan_codex_app_state,
+)
+from agent_deck.adapters.codex_discovery import (
+    build_codex_detection_report,
+    install_codex_integration,
+    validate_codex_managed_system_integration,
+)
 from agent_deck.adapters.codex_quota import read_codex_quota
 from agent_deck.core.decisions import DecisionBehavior
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
 from agent_deck.rendering.asset_builder import build_codex_visual_assets
-from agent_deck.server.app import create_app
+from agent_deck.server.app import DaemonPollerConfig, create_app
 
 DEFAULT_DAEMON_URL = "http://127.0.0.1:8765"
 _DEFAULT_HTTP_TIMEOUT_SECONDS = 5.0
@@ -70,22 +81,89 @@ def daemon_callback(
             max=65535,
         ),
     ] = 8765,
+    disable_codex_app_state_poller: Annotated[
+        bool,
+        typer.Option(
+            "--disable-codex-app-state-poller",
+            help="Disable daemon polling of Codex App local state/rollouts.",
+        ),
+    ] = False,
+    codex_app_state_poll_interval_seconds: Annotated[
+        float,
+        typer.Option(
+            "--codex-app-state-poll-interval-seconds",
+            help="Seconds between Codex App local state polls.",
+            min=0.1,
+        ),
+    ] = 5.0,
+    disable_codex_quota_poller: Annotated[
+        bool,
+        typer.Option(
+            "--disable-codex-quota-poller",
+            help="Disable daemon polling of Codex app-server quota.",
+        ),
+    ] = False,
+    codex_quota_poll_interval_seconds: Annotated[
+        float,
+        typer.Option(
+            "--codex-quota-poll-interval-seconds",
+            help="Seconds between Codex quota polls; default is five minutes.",
+            min=1.0,
+        ),
+    ] = 300.0,
+    codex_quota_timeout_seconds: Annotated[
+        float,
+        typer.Option(
+            "--codex-quota-timeout-seconds",
+            help="Seconds to wait for each Codex app-server quota response.",
+            min=1.0,
+        ),
+    ] = 10.0,
+    disable_streamdock_quota_touchscreen: Annotated[
+        bool,
+        typer.Option(
+            "--disable-streamdock-quota-touchscreen",
+            help="Disable sending rendered quota panel images to StreamDock hardware.",
+        ),
+    ] = False,
+    streamdock_quota_device: Annotated[
+        str,
+        typer.Option(
+            "--streamdock-quota-device",
+            help="StreamDock device profile for quota touchscreen rendering.",
+        ),
+    ] = "n4pro",
 ) -> None:
     """Start the local daemon when no daemon subcommand is selected.
 
     入参：`ctx` 是 Typer/Click 当前命令上下文，用于判断是否已有子命令；`host`
     是 uvicorn 监听地址，默认 `127.0.0.1`；`port` 是监听 TCP 端口，范围 1-65535，
-    默认 `8765`。
+    默认 `8765`；`disable_codex_app_state_poller` 和
+    `disable_codex_quota_poller` 可关闭默认 Codex pollers；两个 interval 控制状态扫描和 quota
+    刷新周期；`codex_quota_timeout_seconds` 控制单次 quota app-server 读取超时；
+    `disable_streamdock_quota_touchscreen` 可关闭默认真实硬件触屏下发；`streamdock_quota_device`
+    是 quota 触屏目标设备 profile，当前默认 `n4pro`。
     返回：无显式返回值；`uvicorn.run` 负责阻塞运行 ASGI app。
-    错误处理：Typer 处理 CLI 参数错误，包括非法端口范围；`create_app` 或
-    `uvicorn.run` 抛出的异常会向上传播并使命令失败。
-    副作用：当没有子命令时创建 FastAPI app 并启动 uvicorn 监听指定本地地址；不探测硬件、
-    不读写用户配置、不安装 Codex hooks。
+    错误处理：Typer 处理 CLI 参数错误，包括非法端口、poll interval 或 timeout 范围；
+    `create_app` 或 `uvicorn.run` 抛出的异常会向上传播并使命令失败。
+    副作用：当没有子命令时创建 FastAPI app 并启动 uvicorn；默认启用 Codex App 本地状态
+    只读 poller、quota poller 和 StreamDock N4 Pro quota 触屏下发；quota poller 会周期性启动
+    短生命周期 Codex app-server，并在成功时可能接管 N4 Pro 触屏显示；不写用户配置、不安装
+    Codex hooks。
     """
 
     if ctx.invoked_subcommand is not None:
         return
-    uvicorn.run(create_app(), host=host, port=port)
+    poller_config = DaemonPollerConfig(
+        codex_app_state_enabled=not disable_codex_app_state_poller,
+        codex_app_state_interval_seconds=codex_app_state_poll_interval_seconds,
+        codex_quota_enabled=not disable_codex_quota_poller,
+        codex_quota_interval_seconds=codex_quota_poll_interval_seconds,
+        codex_quota_timeout_seconds=codex_quota_timeout_seconds,
+        streamdock_quota_touchscreen_enabled=not disable_streamdock_quota_touchscreen,
+        streamdock_quota_device=streamdock_quota_device,
+    )
+    uvicorn.run(create_app(poller_config=poller_config), host=host, port=port)
 
 
 @ctl_app.callback()
@@ -361,6 +439,252 @@ def codex_quota(
     _echo_json(snapshot.model_dump(mode="json"))
 
 
+@ctl_app.command("codex-app-state")
+def codex_app_state(
+    codex_home: Annotated[
+        Path | None,
+        typer.Option(
+            "--codex-home",
+            help="Optional CODEX_HOME override for Codex App local state scanning.",
+        ),
+    ] = None,
+    state_db_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--state-db-path",
+            help="Optional explicit Codex App state_*.sqlite path.",
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option(
+            "--limit",
+            help="Maximum recent Codex App threads to scan.",
+            min=1,
+        ),
+    ] = 20,
+    sync: Annotated[
+        bool,
+        typer.Option(
+            "--sync",
+            help="Post detected input.requested events to the Agent Deck daemon.",
+        ),
+    ] = False,
+    daemon_url: Annotated[
+        str,
+        typer.Option(
+            "--daemon-url",
+            help="Base URL for the local Agent Deck daemon when --sync is used.",
+        ),
+    ] = DEFAULT_DAEMON_URL,
+) -> None:
+    """Scan Codex App local state and optionally sync pending user inputs.
+
+    入参：`codex_home` 可覆盖 `~/.codex`；`state_db_path` 可直接指定 state SQLite；
+    `limit` 控制读取最近 thread 数量；`sync` 为 False 时只输出扫描报告，为 True 时把
+    待响应 `request_user_input` 转成 `input.requested` 并 POST 到 daemon；`daemon_url`
+    仅在 sync 时使用。
+    返回：无显式返回值；stdout 输出 report JSON，sync 时额外包含 `synced_events`。
+    错误处理：扫描失败、SQLite/JSONL 读取失败、daemon 不可达或响应非法时写 stderr 并
+    以 exit 1 退出；参数范围错误由 Typer 以 exit 2 处理。
+    副作用：只读访问 Codex App 本地状态文件；仅在 `--sync` 时使用 bounded httpx POST
+    到 `/events`，不写 Codex 配置、不操作 App UI、不修改 SQLite/JSONL。
+    """
+
+    try:
+        report = scan_codex_app_state(
+            codex_home=codex_home,
+            state_db_path=state_db_path,
+            limit=limit,
+        )
+        if not sync:
+            _echo_json(report.model_dump(mode="json"))
+            return
+
+        events = build_codex_app_state_events_from_report(report)
+        for event in events:
+            _http_post_json(
+                _join_url(daemon_url, "events"),
+                event.model_dump(mode="json"),
+            )
+    except (httpx.HTTPError, ValueError, OSError, sqlite3.Error) as exc:
+        typer.echo(f"agent-deckctl codex-app-state: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    _echo_json(
+        {
+            "synced_events": len(events),
+            "report": report.model_dump(mode="json"),
+        }
+    )
+
+
+@ctl_app.command("codex-detect")
+def codex_detect(
+    enable_integration: Annotated[
+        bool,
+        typer.Option(
+            "--enable-integration",
+            help="Include manual Codex hooks/notify integration guidance.",
+        ),
+    ] = False,
+    daemon_url: Annotated[
+        str,
+        typer.Option(
+            "--daemon-url",
+            help="Base URL that generated Codex hook helpers should call.",
+        ),
+    ] = DEFAULT_DAEMON_URL,
+    codex_home: Annotated[
+        Path | None,
+        typer.Option(
+            "--codex-home",
+            help="Optional CODEX_HOME override for read-only config path detection.",
+        ),
+    ] = None,
+    app_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--app-path",
+            help="Optional Codex.app bundle path override.",
+        ),
+    ] = None,
+) -> None:
+    """Print a read-only Codex detection report and optional integration guide.
+
+    入参：`enable_integration` 控制是否附加 hooks/notify 手动接入说明；`daemon_url`
+    用于生成 helper 命令；`codex_home` 可覆盖 `CODEX_HOME`；`app_path` 可覆盖 macOS
+    Codex.app bundle 路径。
+    返回：无显式返回值；成功时输出 JSON report。
+    错误处理：路径解析或 report 构造失败时写 stderr 并以 exit 1 退出。
+    副作用：只读查询 PATH、环境变量和少量路径存在性；不写 `~/.codex`，不启动 Codex，
+    不连接 daemon 或硬件。
+    """
+
+    try:
+        report = build_codex_detection_report(
+            enable_integration=enable_integration,
+            daemon_url=daemon_url,
+            codex_home=codex_home,
+            app_path=app_path,
+        )
+    except Exception as exc:
+        typer.echo(f"agent-deckctl codex-detect: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    _echo_json(report.model_dump(mode="json"))
+
+
+@ctl_app.command("codex-install")
+def codex_install(
+    apply: Annotated[
+        bool,
+        typer.Option(
+            "--apply",
+            help="Write Codex config changes after backing up existing files.",
+        ),
+    ] = False,
+    daemon_url: Annotated[
+        str,
+        typer.Option(
+            "--daemon-url",
+            help="Base URL that generated Codex hook helpers should call.",
+        ),
+    ] = DEFAULT_DAEMON_URL,
+    codex_home: Annotated[
+        Path | None,
+        typer.Option(
+            "--codex-home",
+            help="Optional CODEX_HOME override for config install.",
+        ),
+    ] = None,
+    app_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--app-path",
+            help="Optional Codex.app bundle path override for the embedded detection report.",
+        ),
+    ] = None,
+    managed_system: Annotated[
+        bool,
+        typer.Option(
+            "--managed-system",
+            help="Install Codex lifecycle hooks as system managed requirements.",
+        ),
+    ] = False,
+    system_requirements_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--system-requirements-path",
+            help="Optional system requirements.toml path override for managed-system.",
+        ),
+    ] = None,
+    managed_hooks_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--managed-hooks-dir",
+            help="Optional managed hook wrapper directory override for managed-system.",
+        ),
+    ] = None,
+    validate_only: Annotated[
+        bool,
+        typer.Option(
+            "--validate-only",
+            help="Read-only validation for managed-system Codex integration.",
+        ),
+    ] = False,
+) -> None:
+    """Dry-run or apply Codex hooks/notify integration.
+
+    入参：`apply` 默认 False，表示只输出安装计划；显式 `--apply` 才允许写入配置；
+    `daemon_url` 用于生成 helper 命令；`codex_home` 可覆盖 `CODEX_HOME`；`app_path`
+    可覆盖检测报告里的 Codex.app bundle 路径；`managed_system` 改用系统 requirements
+    managed hooks；`system_requirements_path` 与 `managed_hooks_dir` 用于测试或自定义系统路径；
+    `validate_only` 只读验证 managed-system 当前状态。
+    返回：无显式返回值；成功时输出 JSON install result 或 validation result。
+    错误处理：需要人工合并、路径解析、写入失败或非法选项组合时写 stderr 并以 exit 1 退出。
+    副作用：dry-run 不写文件；`--apply` 可能创建或修改用户级 config/hooks，或在
+    `--managed-system` 下写系统 requirements 与 wrapper，并在修改已有文件前创建备份；
+    `--validate-only` 不写文件。
+    """
+
+    if validate_only and not managed_system:
+        typer.echo(
+            "agent-deckctl codex-install: --validate-only requires --managed-system",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if validate_only and apply:
+        typer.echo(
+            "agent-deckctl codex-install: --validate-only cannot be combined with --apply",
+            err=True,
+        )
+        raise typer.Exit(1)
+    try:
+        if validate_only:
+            validation = validate_codex_managed_system_integration(
+                daemon_url=daemon_url,
+                codex_home=codex_home,
+                app_path=app_path,
+                system_requirements_path=system_requirements_path,
+                managed_hooks_dir=managed_hooks_dir,
+            )
+            _echo_json(validation.model_dump(mode="json"))
+            return
+        result = install_codex_integration(
+            apply=apply,
+            daemon_url=daemon_url,
+            codex_home=codex_home,
+            app_path=app_path,
+            mode="managed-system" if managed_system else "user",
+            system_requirements_path=system_requirements_path,
+            managed_hooks_dir=managed_hooks_dir,
+        )
+    except Exception as exc:
+        typer.echo(f"agent-deckctl codex-install: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    _echo_json(result.model_dump(mode="json"))
+
+
 @codex_hook_app.callback()
 def codex_hook_callback() -> None:
     """Provide the Codex hook helper command group.
@@ -374,6 +698,12 @@ def codex_hook_callback() -> None:
 
 @codex_hook_app.command()
 def notify(
+    payload_json: Annotated[
+        str | None,
+        typer.Argument(
+            help="Optional Codex notify JSON argument; stdin is used when omitted.",
+        ),
+    ] = None,
     daemon_url: Annotated[
         str,
         typer.Option(
@@ -384,15 +714,15 @@ def notify(
 ) -> None:
     """Forward a Codex notify payload as a best-effort turn.completed event.
 
-    入参：`daemon_url` 是 daemon base URL；stdin 必须是非空 JSON object，字段会尽力映射到
-    Codex `TURN_COMPLETED` normalized event。
+    入参：`payload_json` 是 Codex 官方 notify 传入的单个 JSON 参数，可省略并从 stdin
+    读取以兼容测试和手工管道；`daemon_url` 是 daemon base URL。
     返回：无显式返回值；成功时不要求输出固定内容。
-    错误处理：stdin 为空、非法 JSON 或非 object 时以 exit 2 退出；daemon 不可达、HTTP
-    非 2xx 或 JSON 解码失败时写 stderr 但 exit 0。
-    副作用：读取 stdin，并可能用 bounded httpx POST 到 `/events`；不修改配置或文件。
+    错误处理：payload 为空、非法 JSON 或非 object 时以 exit 2 退出；daemon 不可达、
+    HTTP 非 2xx 或 JSON 解码失败时写 stderr 但 exit 0。
+    副作用：读取 argv 或 stdin，并可能用 bounded httpx POST 到 `/events`；不修改配置或文件。
     """
 
-    payload = _read_json_object_from_stdin()
+    payload = _read_json_object_from_text_or_stdin(payload_json)
     event = _event_from_hook_payload(
         payload,
         normalized_type=EventType.TURN_COMPLETED,
@@ -405,6 +735,42 @@ def notify(
         )
     except (httpx.HTTPError, ValueError) as exc:
         typer.echo(f"agent-deck-codex-hook notify: {exc}", err=True)
+
+
+@codex_hook_app.command()
+def event(
+    daemon_url: Annotated[
+        str,
+        typer.Option(
+            "--daemon-url",
+            help="Base URL for the local Agent Deck daemon.",
+        ),
+    ] = DEFAULT_DAEMON_URL,
+) -> None:
+    """Forward a generic Codex lifecycle hook payload as a normalized event.
+
+    入参：`daemon_url` 是 daemon base URL；stdin 必须是非空 JSON object，`hookEventName`
+    或同义字段会映射到 Agent Deck normalized event type。
+    返回：无显式返回值；成功时不要求输出固定内容。
+    错误处理：stdin 为空、非法 JSON 或非 object 时以 exit 2 退出；daemon 不可达、HTTP
+    非 2xx 或 JSON 解码失败时写 stderr 但 exit 0，避免阻断 Codex 普通 lifecycle hooks。
+    副作用：读取 stdin，并可能用 bounded httpx POST 到 `/events`；不修改配置或文件。
+    """
+
+    payload = _read_json_object_from_stdin()
+    normalized_type = _normalized_event_type_from_codex_hook(payload)
+    event = _event_from_hook_payload(
+        payload,
+        normalized_type=normalized_type,
+        default_source_event_type="codex-hook",
+    )
+    try:
+        _http_post_json(
+            _join_url(daemon_url, "events"),
+            event.model_dump(mode="json"),
+        )
+    except (httpx.HTTPError, ValueError) as exc:
+        typer.echo(f"agent-deck-codex-hook event: {exc}", err=True)
 
 
 @codex_hook_app.command("permission-request")
@@ -540,6 +906,31 @@ def _read_json_object_from_stdin() -> dict[str, Any]:
     return payload
 
 
+def _read_json_object_from_text_or_stdin(raw: str | None) -> dict[str, Any]:
+    """Read a JSON object from an optional string or stdin.
+
+    入参：`raw` 是可选 JSON 字符串；为 None 时读取当前进程 stdin。
+    返回：解析后的 dict。
+    错误处理：内容为空、JSON 非法或顶层不是 object 时写 stderr 并以 exit 2 退出。
+    副作用：当 raw 为 None 时消耗 stdin；不访问网络、硬件或文件。
+    """
+
+    if raw is None:
+        return _read_json_object_from_stdin()
+    if not raw.strip():
+        typer.echo("payload must contain a JSON object", err=True)
+        raise typer.Exit(2)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        typer.echo(f"payload must contain valid JSON: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if not isinstance(payload, dict):
+        typer.echo("payload JSON must be an object", err=True)
+        raise typer.Exit(2)
+    return payload
+
+
 def _event_from_hook_payload(
     payload: dict[str, Any],
     *,
@@ -555,12 +946,19 @@ def _event_from_hook_payload(
     副作用：读取当前 UTC 时间；不访问网络、硬件或文件。
     """
 
-    session_id = _string_field(payload, "session_id", "sessionId", default="codex-hook")
+    session_id = _string_field(
+        payload,
+        "session_id",
+        "sessionId",
+        "thread-id",
+        default="codex-hook",
+    )
     source_event_type = _string_field(
         payload,
         "event_type",
         "eventType",
         "hookEventName",
+        "hook_event_name",
         default=default_source_event_type,
     )
     return NormalizedEvent.build(
@@ -569,14 +967,42 @@ def _event_from_hook_payload(
         normalized_type=normalized_type,
         session_id=session_id,
         agent_id=_optional_string_field(payload, "agent_id", "agentId"),
-        thread_id=_optional_string_field(payload, "thread_id", "threadId"),
-        turn_id=_optional_string_field(payload, "turn_id", "turnId"),
+        thread_id=_optional_string_field(payload, "thread_id", "threadId", "thread-id"),
+        turn_id=_optional_string_field(payload, "turn_id", "turnId", "turn-id"),
         cwd=_optional_string_field(payload, "cwd", "workspace"),
         title=_optional_string_field(payload, "title", "summary"),
         summary=_optional_string_field(payload, "message", "summary"),
         payload=payload,
         occurred_at=datetime.now(UTC),
     )
+
+
+def _normalized_event_type_from_codex_hook(payload: dict[str, Any]) -> EventType:
+    """Map a Codex hook event name to an Agent Deck normalized event type.
+
+    入参：`payload` 是 Codex hook JSON object；优先读取 `hookEventName`、`hook_event_name`
+    或 event type 同义字段。
+    返回：对应 `EventType`；未知 hook 收敛为 `HEARTBEAT`，避免错误推进会话状态。
+    错误处理：本函数不抛业务异常；非字符串或空字符串字段会被忽略。
+    副作用：无；只读取内存 payload。
+    """
+
+    hook_name = _string_field(
+        payload,
+        "hookEventName",
+        "hook_event_name",
+        "event_type",
+        "eventType",
+        default="codex-hook",
+    )
+    return {
+        "SessionStart": EventType.SESSION_STARTED,
+        "PreToolUse": EventType.TOOL_STARTED,
+        "PostToolUse": EventType.TOOL_COMPLETED,
+        "PermissionRequest": EventType.APPROVAL_REQUESTED,
+        "Stop": EventType.TURN_COMPLETED,
+        "SubagentStart": EventType.SUBAGENT_STARTED,
+    }.get(hook_name, EventType.HEARTBEAT)
 
 
 def _decision_request_from_hook_payload(

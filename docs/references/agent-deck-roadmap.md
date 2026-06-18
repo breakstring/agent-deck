@@ -94,34 +94,49 @@ flowchart LR
 6. Codex notify helper
    作为 fallback 接收 `agent-turn-complete`。
 
-7. state reducer
+7. Codex App local state scanner
+   只读扫描 `~/.codex/state_*.sqlite` 和 thread rollout JSONL，检测 Plan Mode
+   `request_user_input` 是否仍未出现 `function_call_output`，并映射为 `input.requested`。
+   该能力作为 Codex App 私有本地状态 fallback，不替代官方 hooks；daemon 默认以 5 秒间隔
+   自动轮询，可通过 CLI 关闭或调整间隔。
+
+8. state reducer
    把事件归约为 AgentState。
 
-8. DeckMode 和 layout plan
+9. DeckMode 和 layout plan
    建立 `overview`、`agent_detail`、`decision`、`quick_prompt`、`settings` 内部运行场景，并输出硬件无关的 layout plan。
 
-9. decision broker
+10. decision broker
    支持 pending decision、timeout、allow、deny、cleanup。
 
-10. N4 Pro driver
+11. N4 Pro driver
    枚举设备、初始化、按键图标、触屏背景、LED、输入回调、断线恢复。
 
-11. N4 Pro renderer
+12. N4 Pro renderer
     根据 DeckMode 生成 slot icons、详情屏、决策界面、LED 聚合状态。
 
-12. Codex 视觉资产生成器
+13. Codex 视觉资产生成器
     将 `assets/codex/codex.gif` 按目标设备 profile 预渲染成状态帧序列、每状态
     `preview.gif` 和 `manifest.json`。动态图标遵循官方图标包建议：10-20fps、
     理想情况下 5 秒以内；第一版 N4 Pro key profile 默认 10fps，并保留完整动画周期的
     时间轴重采样，而不是截取源 GIF 前几帧。
 
-13. action executor
+14. Codex quota poller + N4 Pro touch panel
+    通过 Codex app-server 读取 quota，默认 5 分钟刷新一次；成功后保存 runtime snapshot，
+    渲染到底部 N4 Pro touch-bar viewport，并默认下发到 `streamdock_quota_device=n4pro`。
+    渲染层显示剩余百分比，不改 adapter 的 `used_percent` 原始语义。未来没有触屏能力的设备
+    应通过 device profile 禁用该 panel 或切换到其他显示方式。
+
+15. action executor
     实现 focus target、tmux、AppleScript 激活、递归熔断。
 
-14. installer / doctor
+16. installer / doctor
     检查 Codex 配置、SDK、设备权限、端口占用、官方软件设备占用，提供 dry-run patch。
+    Codex 安装器保留 user-level 默认模式，并提供 `--managed-system` 高级模式：写系统
+    `/etc/codex/requirements.toml` managed hooks、设置 `[hooks].managed_dir`、安装稳定
+    wrapper、清理用户级重复 Agent Deck hooks；正式写入前提供 `--validate-only` 只读检查。
 
-15. 手动验收脚本
+17. 手动验收脚本
     提供模拟事件和真实 Codex 验证步骤。
 
 P1 验收清单：
@@ -131,6 +146,8 @@ P1 验收清单：
 - `doctor` 能识别或提示官方 Stream Dock 软件占用设备的情况。
 - Codex turn 状态能显示到 slot。
 - PermissionRequest 能在硬件上显示并返回 allow/deny。
+- Codex App Plan Mode `request_user_input` 未完成时能被只读扫描为 `waiting_user`。
+- Codex quota 能自动刷新到 daemon runtime，并显示到 N4 Pro 底部虚拟视窗。
 - 超时默认策略按配置执行。
 - 拔插设备服务不崩溃。
 - `pytest` 通过。
@@ -326,11 +343,15 @@ P4 关键设计点：
 - `uninstall`
 - `simulate`
 - `status`
+- `codex-detect`
+- `codex-install`
 - `logs`
 
 ## 决策 backlog
 
-1. 第一版是否自动修改 `~/.codex/config.toml`，还是默认 dry-run？
+1. `codex-install` 已默认 dry-run，`--apply` 仅在无人工合并冲突时写入；已有非 Agent Deck
+   `notify` 会通过 Agent Deck fan-out wrapper 保留；managed-system 路径增加
+   `--validate-only` 检查，后续需要补 uninstall/rollback。
 2. 是否允许用户把 PermissionRequest helper 的服务不可达策略从默认 deny 改成 fall-through？
 3. Codex Desktop App 的 OTel 表现是否和 CLI 一致，需要实测。
 4. 第一版聚焦目标优先支持 Terminal、iTerm2、Warp 还是 Codex App？

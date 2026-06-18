@@ -1,14 +1,18 @@
 """FastAPI application factory for the local Agent Deck daemon API.
 
 This module wires the MVP in-memory runtime for normalized events, approval
-decisions, layout planning, and a fake hardware surface. It deliberately does
-not bind sockets, probe StreamDock devices, install hooks, read or write user
-configuration, persist state, or render to real hardware; callers such as a
-future CLI entry point are responsible for hosting the returned ASGI app.
+decisions, layout planning, optional Codex pollers, and a fake hardware surface.
+It deliberately does not bind sockets, probe StreamDock devices, install hooks,
+write user configuration, persist state, or render to real hardware; callers such
+as CLI entry points are responsible for hosting the returned ASGI app and
+choosing whether Codex local-state/quota polling is enabled.
 """
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -16,6 +20,8 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent_deck.adapters.codex_app_state import build_codex_app_state_events
+from agent_deck.adapters.codex_quota import CodexQuotaSnapshot, read_codex_quota
 from agent_deck.core.decisions import (
     DecisionBehavior,
     DecisionBroker,
@@ -26,7 +32,43 @@ from agent_deck.core.events import EventType, NormalizedEvent
 from agent_deck.core.modes import DeckSelection
 from agent_deck.core.state import AgentState, AgentStateStore
 from agent_deck.hardware.fake import FakeHardwareSurface
+from agent_deck.hardware.streamdock_touchscreen import (
+    StreamDockTouchscreenRenderResult,
+    render_touchscreen_image_to_n4pro,
+)
 from agent_deck.rendering.layout import LayoutPlan, build_layout_plan
+from agent_deck.rendering.quota_touchscreen import render_quota_touchscreen
+
+CodexAppStateEventReader = Callable[[], tuple[NormalizedEvent, ...]]
+CodexQuotaReader = Callable[..., CodexQuotaSnapshot]
+QuotaTouchscreenSink = Callable[[Any], StreamDockTouchscreenRenderResult]
+
+
+class DaemonPollerConfig(BaseModel):
+    """Configure optional daemon-side Codex polling loops.
+
+    入参：`codex_app_state_enabled` 控制是否扫描 Codex App 本地 state/rollout；
+    `codex_app_state_interval_seconds` 是扫描间隔；`codex_quota_enabled` 控制是否读取
+    Codex app-server quota；`codex_quota_interval_seconds` 是 quota 间隔，默认 5 分钟；
+    `codex_quota_timeout_seconds` 是单次 app-server 读取超时；
+    `streamdock_quota_touchscreen_enabled` 控制是否把 quota 触屏图下发到真实硬件；
+    `streamdock_quota_device` 是目标设备能力 profile，当前只支持 `n4pro`；`poll_on_start`
+    控制启动时是否先同步一次，便于 daemon 刚启动就有状态。
+    返回：frozen Pydantic model，供 `create_app` lifespan 使用。
+    错误处理：非正间隔或 timeout 由 Pydantic 校验为 422/ValidationError。
+    副作用：模型自身不读取文件、不启动进程、不创建后台任务。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    codex_app_state_enabled: bool = False
+    codex_app_state_interval_seconds: float = Field(default=5.0, gt=0)
+    codex_quota_enabled: bool = False
+    codex_quota_interval_seconds: float = Field(default=300.0, gt=0)
+    codex_quota_timeout_seconds: float = Field(default=10.0, gt=0)
+    streamdock_quota_touchscreen_enabled: bool = False
+    streamdock_quota_device: str = "n4pro"
+    poll_on_start: bool = True
 
 
 class DecisionRequestBody(BaseModel):
@@ -70,7 +112,8 @@ class _DaemonRuntime:
 
     入参：`store` 是 normalized event reducer；`broker` 管理 pending approval；
     `surface` 记录 fake render 帧；`selection` 保存当前 deck 选择；两个 id 集合分别
-    记录已反映到 store 的 pending decision 和已同步终态的 decision。
+    记录已反映到 store 的 pending decision 和已同步终态的 decision；poller 字段保存
+    Codex App state 与 quota 的最近一次同步状态。
     返回：dataclass 实例，供 app.state 持有并在路由间共享。
     错误处理：本类不主动校验依赖类型；handler 调用时底层异常按原语义传播。
     副作用：后续方法会修改这些内存对象；不会访问真实硬件、文件或网络。
@@ -82,6 +125,12 @@ class _DaemonRuntime:
     selection: DeckSelection
     reflected_pending_decision_ids: set[str]
     terminal_synced_decision_ids: set[str]
+    codex_app_state_last_polled_at: datetime | None
+    codex_app_state_last_error: str | None
+    codex_quota_snapshot: CodexQuotaSnapshot | None
+    codex_quota_updated_at: datetime | None
+    codex_quota_last_error: str | None
+    streamdock_quota_touchscreen_result: StreamDockTouchscreenRenderResult | None
 
     def apply_event(self, event: NormalizedEvent) -> dict[str, Any]:
         """Apply an event, render the latest layout, and return response data.
@@ -101,6 +150,105 @@ class _DaemonRuntime:
             "layout": _dump_model(layout),
             "render_count": self.surface.render_count,
         }
+
+    def apply_polled_events(self, events: tuple[NormalizedEvent, ...]) -> None:
+        """Apply events produced by a daemon poller and render once.
+
+        入参：`events` 是 adapter 已生成的 normalized event tuple，可能为空。
+        返回：无显式返回值。
+        错误处理：任一事件 reducer 或 layout 校验失败会向调用方传播，由 poller 捕获记录。
+        副作用：修改 store 中对应 agent 状态；有事件时 render fake surface 一帧。
+        """
+
+        for event in events:
+            state = self.store.apply(event)
+            self._reflect_pending_decisions_for_agent(state.agent_key)
+        if events:
+            self.render_current()
+
+    def mark_codex_app_state_poll_success(self, polled_at: datetime) -> None:
+        """Record a successful Codex App state poll.
+
+        入参：`polled_at` 是本次扫描完成时间，必须 timezone-aware。
+        返回：无显式返回值。
+        错误处理：本方法不主动校验 datetime；调用方负责传入 UTC aware 时间。
+        副作用：更新 runtime 内存诊断字段。
+        """
+
+        self.codex_app_state_last_polled_at = polled_at
+        self.codex_app_state_last_error = None
+
+    def mark_codex_app_state_poll_error(
+        self,
+        error: Exception,
+        *,
+        polled_at: datetime,
+    ) -> None:
+        """Record a failed Codex App state poll without crashing the daemon.
+
+        入参：`error` 是扫描异常；`polled_at` 是失败发生时间。
+        返回：无显式返回值。
+        错误处理：本方法不抛业务异常；错误文本会被截断以避免异常对象过长。
+        副作用：更新 runtime 内存诊断字段，不修改 agent 状态。
+        """
+
+        self.codex_app_state_last_polled_at = polled_at
+        self.codex_app_state_last_error = _short_error(error)
+
+    def update_codex_quota(
+        self,
+        snapshot: CodexQuotaSnapshot,
+        *,
+        updated_at: datetime,
+    ) -> Any:
+        """Store a quota snapshot and render it into the fake touch panel.
+
+        入参：`snapshot` 是 quota adapter 返回的最新快照；`updated_at` 是读取完成时间。
+        返回：刚渲染出的 800x480 触屏背景图，供真实硬件 sink 复用。
+        错误处理：Pillow 渲染失败会向调用方传播，由 poller 捕获记录为 last_error。
+        副作用：更新 runtime quota 快照，渲染 N4 Pro 800x480 触屏背景图到 fake surface。
+        """
+
+        self.codex_quota_snapshot = snapshot
+        self.codex_quota_updated_at = updated_at
+        self.codex_quota_last_error = None
+        image = render_quota_touchscreen(snapshot)
+        self.surface.render_touchscreen_image(
+            image,
+            source="codex_quota",
+        )
+        return image
+
+    def update_streamdock_quota_touchscreen_result(
+        self,
+        result: StreamDockTouchscreenRenderResult,
+    ) -> None:
+        """Record the latest real StreamDock quota touchscreen render result.
+
+        入参：`result` 是真实硬件 sink 返回的结果。
+        返回：无显式返回值。
+        错误处理：本方法不主动抛异常；字段合法性由结果模型保证。
+        副作用：更新 runtime 内存诊断字段，不访问硬件。
+        """
+
+        self.streamdock_quota_touchscreen_result = result
+
+    def mark_codex_quota_poll_error(
+        self,
+        error: Exception,
+        *,
+        polled_at: datetime,
+    ) -> None:
+        """Record a failed quota poll without clearing the last good snapshot.
+
+        入参：`error` 是 quota adapter 或 renderer 异常；`polled_at` 是失败发生时间。
+        返回：无显式返回值。
+        错误处理：本方法不抛业务异常；错误文本会被截断。
+        副作用：更新 quota 诊断字段；保留 `codex_quota_snapshot` 以便 UI 继续展示旧值。
+        """
+
+        self.codex_quota_updated_at = polled_at
+        self.codex_quota_last_error = _short_error(error)
 
     def create_decision(self, body: DecisionRequestBody) -> PendingDecision:
         """Create a pending decision and sync existing agent pending state.
@@ -200,6 +348,26 @@ class _DaemonRuntime:
             "decisions": [_dump_model(decision) for decision in self.broker.pending()],
             "layout": _dump_model(layout),
             "render_count": self.surface.render_count,
+            "pollers": {
+                "codex_app_state": {
+                    "last_polled_at": _dump_datetime(
+                        self.codex_app_state_last_polled_at
+                    ),
+                    "last_error": self.codex_app_state_last_error,
+                },
+            },
+            "codex_quota": {
+                "snapshot": _dump_optional_model(self.codex_quota_snapshot),
+                "updated_at": _dump_datetime(self.codex_quota_updated_at),
+                "last_error": self.codex_quota_last_error,
+                "touchscreen_render_count": self.surface.touchscreen_render_count,
+                "touchscreen_image_size": _image_size(
+                    self.surface.last_touchscreen_image
+                ),
+                "streamdock_touchscreen": _dump_optional_model(
+                    self.streamdock_quota_touchscreen_result
+                ),
+            },
         }
 
     def render_current(self) -> LayoutPlan:
@@ -319,15 +487,26 @@ class _DaemonRuntime:
         self.store.mark_decision_resolved(decision.agent_key)
 
 
-def create_app() -> FastAPI:
-    """Create the local daemon FastAPI app without opening external resources.
+def create_app(
+    *,
+    poller_config: DaemonPollerConfig | None = None,
+    codex_app_state_event_reader: CodexAppStateEventReader = build_codex_app_state_events,
+    codex_quota_reader: CodexQuotaReader = read_codex_quota,
+    quota_touchscreen_sink: QuotaTouchscreenSink = render_touchscreen_image_to_n4pro,
+) -> FastAPI:
+    """Create the local daemon FastAPI app without binding sockets.
 
-    入参：无；MVP foundation 暂不接收配置、端口或硬件参数。
+    入参：`poller_config` 控制是否启动 Codex App state 和 quota 后台 pollers；为空时不启用
+    任何 poller，保持测试和嵌入调用无外部 I/O；`codex_app_state_event_reader` 和
+    `codex_quota_reader` 是可注入 reader，生产默认读取真实本机 Codex 状态；`quota_touchscreen_sink`
+    是真实硬件触屏下发函数，仅在配置启用时调用，测试可替换。
     返回：配置好路由且持有 in-memory runtime 的 `FastAPI` ASGI app。
-    错误处理：对象构造失败会直接抛出；正常调用不打开 socket 或真实硬件。
-    副作用：仅分配内存对象并注册路由；不访问网络、文件、硬件或用户配置。
+    错误处理：对象构造失败会直接抛出；poller 单次失败会记录到 status，不让 app 启动失败。
+    副作用：总是分配内存对象并注册路由；只有显式启用 poller 时，lifespan startup 才会只读访问
+    Codex 本地状态或启动短生命周期 Codex app-server 子进程。
     """
 
+    resolved_poller_config = poller_config or DaemonPollerConfig()
     runtime = _DaemonRuntime(
         store=AgentStateStore(),
         broker=DecisionBroker(),
@@ -335,8 +514,67 @@ def create_app() -> FastAPI:
         selection=DeckSelection(),
         reflected_pending_decision_ids=set(),
         terminal_synced_decision_ids=set(),
+        codex_app_state_last_polled_at=None,
+        codex_app_state_last_error=None,
+        codex_quota_snapshot=None,
+        codex_quota_updated_at=None,
+        codex_quota_last_error=None,
+        streamdock_quota_touchscreen_result=None,
     )
-    app = FastAPI(title="Agent Deck Daemon API")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> Any:
+        """Start and stop optional daemon poller tasks.
+
+        入参：`app` 是 FastAPI 实例，按 lifespan 协议传入。
+        返回：async context manager；yield 后应用开始接收请求。
+        错误处理：单次 poll 异常由 poll-once helper 记录；shutdown 取消任务并吞掉取消异常。
+        副作用：可能创建 asyncio background tasks；不会绑定 socket 或访问真实硬件。
+        """
+
+        tasks: list[asyncio.Task[None]] = []
+        if resolved_poller_config.poll_on_start:
+            await _run_enabled_pollers_once(
+                runtime,
+                resolved_poller_config,
+                codex_app_state_event_reader,
+                codex_quota_reader,
+                quota_touchscreen_sink,
+            )
+        if resolved_poller_config.codex_app_state_enabled:
+            tasks.append(
+                asyncio.create_task(
+                    _poll_codex_app_state_loop(
+                        runtime,
+                        interval_seconds=resolved_poller_config.codex_app_state_interval_seconds,
+                        event_reader=codex_app_state_event_reader,
+                    )
+                )
+            )
+        if resolved_poller_config.codex_quota_enabled:
+            tasks.append(
+                asyncio.create_task(
+                    _poll_codex_quota_loop(
+                        runtime,
+                        interval_seconds=resolved_poller_config.codex_quota_interval_seconds,
+                        timeout_seconds=resolved_poller_config.codex_quota_timeout_seconds,
+                        quota_reader=codex_quota_reader,
+                        streamdock_touchscreen_enabled=resolved_poller_config.streamdock_quota_touchscreen_enabled,
+                        streamdock_device=resolved_poller_config.streamdock_quota_device,
+                        quota_touchscreen_sink=quota_touchscreen_sink,
+                    )
+                )
+            )
+        try:
+            yield
+        finally:
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with suppress(asyncio.CancelledError):
+                    await task
+
+    app = FastAPI(title="Agent Deck Daemon API", lifespan=lifespan)
     app.state.runtime = runtime
 
     @app.post("/events")
@@ -414,6 +652,175 @@ def create_app() -> FastAPI:
     return app
 
 
+async def _run_enabled_pollers_once(
+    runtime: _DaemonRuntime,
+    config: DaemonPollerConfig,
+    codex_app_state_event_reader: CodexAppStateEventReader,
+    codex_quota_reader: CodexQuotaReader,
+    quota_touchscreen_sink: QuotaTouchscreenSink,
+) -> None:
+    """Run each enabled poller once during app startup.
+
+    入参：`runtime` 是 daemon 内存状态；`config` 是 poller 配置；两个 reader 和触屏 sink 是
+    可注入数据源/输出端。
+    返回：无显式返回值。
+    错误处理：单个 poller 的异常由 poll-once helper 记录，另一个 poller 仍会继续执行。
+    副作用：可能只读访问 Codex 本地状态、启动短生命周期 app-server、更新 runtime 和 fake surface。
+    """
+
+    if config.codex_app_state_enabled:
+        await _poll_codex_app_state_once(runtime, codex_app_state_event_reader)
+    if config.codex_quota_enabled:
+        await _poll_codex_quota_once(
+            runtime,
+            timeout_seconds=config.codex_quota_timeout_seconds,
+            quota_reader=codex_quota_reader,
+            streamdock_touchscreen_enabled=config.streamdock_quota_touchscreen_enabled,
+            streamdock_device=config.streamdock_quota_device,
+            quota_touchscreen_sink=quota_touchscreen_sink,
+        )
+
+
+async def _poll_codex_app_state_loop(
+    runtime: _DaemonRuntime,
+    *,
+    interval_seconds: float,
+    event_reader: CodexAppStateEventReader,
+) -> None:
+    """Periodically scan Codex App local state and apply generated events.
+
+    入参：`runtime` 是 daemon 内存状态；`interval_seconds` 是两次扫描间隔；`event_reader`
+    是同步 reader，会通过 `asyncio.to_thread` 调用。
+    返回：不主动返回；任务被取消时结束。
+    错误处理：单次扫描异常被记录到 runtime，不终止循环；取消异常正常传播给 shutdown。
+    副作用：周期性只读访问 Codex 本地状态并更新 in-memory store。
+    """
+
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await _poll_codex_app_state_once(runtime, event_reader)
+
+
+async def _poll_codex_quota_loop(
+    runtime: _DaemonRuntime,
+    *,
+    interval_seconds: float,
+    timeout_seconds: float,
+    quota_reader: CodexQuotaReader,
+    streamdock_touchscreen_enabled: bool,
+    streamdock_device: str,
+    quota_touchscreen_sink: QuotaTouchscreenSink,
+) -> None:
+    """Periodically refresh Codex quota and render the virtual touch panel.
+
+    入参：`runtime` 是 daemon 内存状态；`interval_seconds` 默认应远大于状态扫描间隔；
+    `timeout_seconds` 是单次 quota app-server 读取超时；`quota_reader` 是同步 reader；
+    `streamdock_touchscreen_enabled` 控制是否真实下发；`streamdock_device` 是目标设备 profile；
+    `quota_touchscreen_sink` 是真实触屏输出端。
+    返回：不主动返回；任务被取消时结束。
+    错误处理：单次读取或渲染异常被记录到 runtime，不终止循环。
+    副作用：周期性启动短生命周期 Codex app-server 子进程，并在成功时渲染内存触屏图。
+    """
+
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await _poll_codex_quota_once(
+            runtime,
+            timeout_seconds=timeout_seconds,
+            quota_reader=quota_reader,
+            streamdock_touchscreen_enabled=streamdock_touchscreen_enabled,
+            streamdock_device=streamdock_device,
+            quota_touchscreen_sink=quota_touchscreen_sink,
+        )
+
+
+async def _poll_codex_app_state_once(
+    runtime: _DaemonRuntime,
+    event_reader: CodexAppStateEventReader,
+) -> None:
+    """Run one Codex App state poll and update runtime diagnostics.
+
+    入参：`runtime` 是 daemon 内存状态；`event_reader` 返回 normalized events。
+    返回：无显式返回值。
+    错误处理：reader 或 reducer 异常会被捕获并记录到 `codex_app_state_last_error`。
+    副作用：可能更新 agent state store 和 fake layout render。
+    """
+
+    polled_at = datetime.now(UTC)
+    try:
+        events = await asyncio.to_thread(event_reader)
+        runtime.apply_polled_events(events)
+        runtime.mark_codex_app_state_poll_success(polled_at)
+    except Exception as exc:  # noqa: BLE001 - poller 必须保护 daemon 主循环。
+        runtime.mark_codex_app_state_poll_error(exc, polled_at=polled_at)
+
+
+async def _poll_codex_quota_once(
+    runtime: _DaemonRuntime,
+    *,
+    timeout_seconds: float,
+    quota_reader: CodexQuotaReader,
+    streamdock_touchscreen_enabled: bool,
+    streamdock_device: str,
+    quota_touchscreen_sink: QuotaTouchscreenSink,
+) -> None:
+    """Run one Codex quota poll and update runtime diagnostics.
+
+    入参：`runtime` 是 daemon 内存状态；`timeout_seconds` 是 reader 超时秒数；`quota_reader`
+    返回 `CodexQuotaSnapshot`；`streamdock_touchscreen_enabled` 控制是否真实下发；`streamdock_device`
+    当前支持 `n4pro`；`quota_touchscreen_sink` 接收渲染图并写真实硬件。
+    返回：无显式返回值。
+    错误处理：reader 或触屏渲染异常会被捕获并记录到 `codex_quota_last_error`。
+    副作用：可能启动 Codex app-server 子进程，并在成功时渲染 fake touchscreen image。
+    """
+
+    polled_at = datetime.now(UTC)
+    try:
+        snapshot = await asyncio.to_thread(
+            quota_reader,
+            timeout_seconds=timeout_seconds,
+        )
+        image = runtime.update_codex_quota(snapshot, updated_at=polled_at)
+        if streamdock_touchscreen_enabled:
+            result = await _send_quota_touchscreen_to_streamdock(
+                image,
+                streamdock_device=streamdock_device,
+                quota_touchscreen_sink=quota_touchscreen_sink,
+            )
+            runtime.update_streamdock_quota_touchscreen_result(result)
+    except Exception as exc:  # noqa: BLE001 - poller 必须保护 daemon 主循环。
+        runtime.mark_codex_quota_poll_error(exc, polled_at=polled_at)
+
+
+async def _send_quota_touchscreen_to_streamdock(
+    image: Any,
+    *,
+    streamdock_device: str,
+    quota_touchscreen_sink: QuotaTouchscreenSink,
+) -> StreamDockTouchscreenRenderResult:
+    """Send a rendered quota touchscreen image to the configured StreamDock device.
+
+    入参：`image` 是 quota renderer 输出的 800x480 图；`streamdock_device` 是目标设备 profile；
+    `quota_touchscreen_sink` 是实际输出端。
+    返回：真实输出端的结果，或不支持设备 profile 的失败结果。
+    错误处理：sink 异常会转换为 `ok=False` 结果，避免中断 quota poller。
+    副作用：当设备为 `n4pro` 时，会在线程中调用真实 sink，可能接管硬件触屏。
+    """
+
+    if streamdock_device.lower() != "n4pro":
+        return StreamDockTouchscreenRenderResult(
+            ok=False,
+            error=f"unsupported StreamDock quota device: {streamdock_device}",
+        )
+    try:
+        return await asyncio.to_thread(quota_touchscreen_sink, image)
+    except Exception as exc:  # noqa: BLE001 - 硬件输出失败应进入 status，而不是杀 daemon。
+        return StreamDockTouchscreenRenderResult(
+            ok=False,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+
 def _dump_model(model: BaseModel) -> dict[str, Any]:
     """Serialize Pydantic models into JSON-compatible dictionaries.
 
@@ -424,3 +831,60 @@ def _dump_model(model: BaseModel) -> dict[str, Any]:
     """
 
     return model.model_dump(mode="json")
+
+
+def _dump_optional_model(model: BaseModel | None) -> dict[str, Any] | None:
+    """Serialize an optional Pydantic model for status output.
+
+    入参：`model` 是可选 Pydantic model。
+    返回：model 为 None 时返回 None，否则返回 JSON-safe dict。
+    错误处理：不可序列化字段由 Pydantic 抛出。
+    副作用：只复制内存数据。
+    """
+
+    if model is None:
+        return None
+    return _dump_model(model)
+
+
+def _dump_datetime(value: datetime | None) -> str | None:
+    """Serialize an optional datetime for status output.
+
+    入参：`value` 是可选 datetime。
+    返回：ISO 8601 字符串或 None。
+    错误处理：datetime 格式化异常按 Python 语义传播。
+    副作用：无；只读取内存值。
+    """
+
+    return value.isoformat() if value is not None else None
+
+
+def _image_size(image: Any | None) -> list[int] | None:
+    """Return a JSON-safe image size for diagnostics.
+
+    入参：`image` 通常是 Pillow `Image`，也可为空或测试替身。
+    返回：`[width, height]`；缺少合法 `size` 属性时返回 None。
+    错误处理：本函数不抛业务异常；无法识别尺寸时降级为 None。
+    副作用：无；只读取对象属性。
+    """
+
+    size = getattr(image, "size", None)
+    if (
+        isinstance(size, tuple)
+        and len(size) == 2
+        and all(isinstance(item, int) for item in size)
+    ):
+        return [size[0], size[1]]
+    return None
+
+
+def _short_error(error: Exception) -> str:
+    """Format a bounded poller error string for status output.
+
+    入参：`error` 是 poller 捕获的异常。
+    返回：包含异常类型和消息的短字符串，最多 500 个字符。
+    错误处理：异常消息格式化失败时按 Python repr/str 语义传播。
+    副作用：无；不记录日志、不访问外部 I/O。
+    """
+
+    return f"{type(error).__name__}: {error}"[:500]

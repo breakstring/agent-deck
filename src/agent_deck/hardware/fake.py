@@ -1,9 +1,10 @@
 """In-memory fake hardware surface for Agent Deck tests.
 
 This module provides a hardware-independent surface that records rendered
-`LayoutPlan` frames and queues synthetic hardware input events. It intentionally
-does not probe StreamDock devices, start servers, invoke CLI hooks, read files,
-write files, perform network I/O, modify global state, or start threads.
+`LayoutPlan` frames, optional touchscreen image frames, and queues synthetic
+hardware input events. It intentionally does not probe StreamDock devices, start
+servers, invoke CLI hooks, read files, write files, perform network I/O, modify
+global state, or start threads.
 """
 
 from __future__ import annotations
@@ -171,11 +172,12 @@ def _freeze_value(value: Any) -> Any:
 
 
 class FakeHardwareSurface:
-    """Record rendered layout frames and expose a FIFO synthetic input queue.
+    """Record rendered frames and expose a FIFO synthetic input queue.
 
     入参：构造时不需要外部依赖。
-    返回：实例提供 `last_plan`、`render_count`、`render`、`emit_input` 和 `drain_inputs`。
-    错误处理：本类不主动捕获 `LayoutPlan` 或 `HardwareInput` 校验错误；调用方应传入已校验模型。
+    返回：实例提供 layout frame、触屏图像 frame 和硬件输入队列的测试替身接口。
+    错误处理：本类不主动捕获 `LayoutPlan`、图像对象或 `HardwareInput` 校验错误；调用方应传入
+    已校验对象。
     副作用：仅修改本实例内存字段和队列；不访问硬件、网络、文件系统或线程。
     """
 
@@ -183,13 +185,16 @@ class FakeHardwareSurface:
         """Create an empty fake surface.
 
         入参：无。
-        返回：无显式返回值；初始化后 `last_plan` 为 None，`render_count` 为 0。
+        返回：无显式返回值；初始化后 layout 和 touchscreen frame 都为空。
         错误处理：本方法不主动抛业务异常。
         副作用：仅初始化本实例内存状态。
         """
 
         self.last_plan: LayoutPlan | None = None
         self.render_count = 0
+        self.last_touchscreen_image: Any | None = None
+        self.last_touchscreen_image_source: str | None = None
+        self.touchscreen_render_count = 0
         self._inputs: list[HardwareInput] = []
 
     def render(self, plan: LayoutPlan) -> None:
@@ -203,6 +208,20 @@ class FakeHardwareSurface:
 
         self.last_plan = plan
         self.render_count += 1
+
+    def render_touchscreen_image(self, image: Any, *, source: str) -> None:
+        """Record a rendered touchscreen image frame.
+
+        入参：`image` 是调用方生成的触屏背景图对象，通常是 Pillow `Image`；`source` 是稳定来源
+        标签，例如 `codex_quota`，用于测试和诊断区分不同 panel。
+        返回：无返回值；调用后 `last_touchscreen_image` 指向该图像，计数增加 1。
+        错误处理：本方法不校验 image 类型；传错对象时只会按普通赋值保存。
+        副作用：修改本实例的触屏图像快照字段；不访问真实硬件或文件系统。
+        """
+
+        self.last_touchscreen_image = image
+        self.last_touchscreen_image_source = source
+        self.touchscreen_render_count += 1
 
     def emit_input(self, event: HardwareInput) -> None:
         """Append one synthetic hardware input event to the FIFO queue.

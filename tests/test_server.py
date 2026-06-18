@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
+from agent_deck.adapters.codex_quota import CodexQuotaSnapshot
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
-from agent_deck.server.app import create_app
+from agent_deck.hardware.streamdock_touchscreen import StreamDockTouchscreenRenderResult
+from agent_deck.server.app import DaemonPollerConfig, create_app
 
 
 def test_events_start_session_renders_status_and_layout() -> None:
@@ -41,6 +44,159 @@ def test_events_start_session_renders_status_and_layout() -> None:
     assert body["layout"]["touchscreen"]["title"] == "session-1"
     assert body["layout"]["touchscreen"]["selected_agent_key"] == "codex:session-1"
     assert body["render_count"] > 0
+
+
+def test_codex_app_state_poller_applies_input_requested_event() -> None:
+    """Verify daemon startup poller syncs Codex App input requests into state.
+
+    入参：无；测试内注入 fake Codex App state reader 和启用状态轮询的配置。
+    返回：无返回值；断言通过代表 poller 能把 `input.requested` 映射为 `waiting_user`。
+    错误处理：若 startup poller 未执行、状态未归约或 status 未暴露 agent，由 pytest 报告。
+    副作用：仅修改测试 app 的内存 runtime，不读取真实 `~/.codex` 或连接 daemon。
+    """
+
+    def fake_codex_app_state_reader() -> tuple[NormalizedEvent, ...]:
+        """返回一个待用户输入事件供 daemon poller 消费。
+
+        入参：无。
+        返回：包含单个 `EventType.INPUT_REQUESTED` 的事件 tuple。
+        错误处理：事件构造失败由 Pydantic 抛出并交给 pytest。
+        副作用：只创建内存事件。
+        """
+
+        occurred_at = datetime.now(UTC)
+        return (
+            NormalizedEvent.build(
+                source=AgentSource.CODEX,
+                source_event_type="codex-app.request_user_input",
+                normalized_type=EventType.INPUT_REQUESTED,
+                session_id="thread-1",
+                thread_id="thread-1",
+                title="请求用户选择选项",
+                summary="请选择一个测试选项",
+                payload={"call_id": "call-1"},
+                occurred_at=occurred_at,
+                received_at=occurred_at,
+            ),
+        )
+
+    app = create_app(
+        poller_config=DaemonPollerConfig(codex_app_state_enabled=True),
+        codex_app_state_event_reader=fake_codex_app_state_reader,
+    )
+    with TestClient(app) as client:
+        status = client.get("/status").json()
+
+    assert status["agents"][0]["agent_key"] == "codex:thread-1"
+    assert status["agents"][0]["status"] == "waiting_user"
+    assert status["agents"][0]["last_summary"] == "请选择一个测试选项"
+    assert status["pollers"]["codex_app_state"]["last_error"] is None
+    assert status["pollers"]["codex_app_state"]["last_polled_at"] is not None
+
+
+def test_codex_quota_poller_updates_status_and_touchscreen_frame() -> None:
+    """Verify daemon quota poller refreshes snapshot and virtual touch panel.
+
+    入参：无；测试内注入 fake quota reader 和启用 quota 轮询的配置。
+    返回：无返回值；断言通过代表 quota 被读取、状态暴露，并渲染了 N4 Pro 触屏背景图。
+    错误处理：若 reader 未调用、状态缺失或触屏 frame 未记录，由 pytest 报告。
+    副作用：只在内存中生成 Pillow 图像，不启动 Codex app-server 或访问真实 N4 Pro。
+    """
+
+    calls: list[dict[str, object]] = []
+
+    def fake_quota_reader(**kwargs: object) -> CodexQuotaSnapshot:
+        """返回固定 quota snapshot 并记录 daemon 传入的 timeout。
+
+        入参：`kwargs` 是 daemon poller 转发给 quota adapter 的参数。
+        返回：固定 `CodexQuotaSnapshot`。
+        错误处理：模型字段非法时由 Pydantic 报告。
+        副作用：把调用参数追加到测试内存列表。
+        """
+
+        calls.append(kwargs)
+        return _quota_snapshot()
+
+    app = create_app(
+        poller_config=DaemonPollerConfig(
+            codex_quota_enabled=True,
+            codex_quota_timeout_seconds=1.5,
+        ),
+        codex_quota_reader=fake_quota_reader,
+    )
+    with TestClient(app) as client:
+        status = client.get("/status").json()
+
+    assert calls == [{"timeout_seconds": 1.5}]
+    assert status["codex_quota"]["snapshot"]["plan_short_label"] == "ProLite"
+    assert status["codex_quota"]["snapshot"]["primary"]["used_percent"] == 28
+    assert status["codex_quota"]["last_error"] is None
+    assert status["codex_quota"]["updated_at"] is not None
+    assert status["codex_quota"]["touchscreen_render_count"] == 1
+    assert status["codex_quota"]["touchscreen_image_size"] == [800, 480]
+    assert status["codex_quota"]["streamdock_touchscreen"] is None
+
+
+def test_codex_quota_poller_sends_touchscreen_to_streamdock_sink() -> None:
+    """Verify enabled quota poller sends the rendered image to the real-device sink.
+
+    入参：无；测试内注入 fake quota reader 和 fake StreamDock sink。
+    返回：无返回值；断言通过代表 daemon 复用 800x480 图下发，并在 status 暴露结果。
+    错误处理：若 sink 未调用、图片尺寸错误或结果未记录，由 pytest 报告。
+    副作用：只调用测试 fake sink，不访问真实 N4 Pro。
+    """
+
+    sink_images: list[object] = []
+
+    def fake_quota_reader(**_: object) -> CodexQuotaSnapshot:
+        """返回固定 quota snapshot。
+
+        入参：忽略 daemon 传入的 reader 参数。
+        返回：固定 `CodexQuotaSnapshot`。
+        错误处理：字段非法由 Pydantic 抛出。
+        副作用：无。
+        """
+
+        return _quota_snapshot()
+
+    def fake_sink(image: object) -> StreamDockTouchscreenRenderResult:
+        """记录 daemon 传入的触屏图像并模拟硬件下发成功。
+
+        入参：`image` 是 quota renderer 输出的 Pillow 图像。
+        返回：固定成功结果。
+        错误处理：无。
+        副作用：把 image 追加到测试内存列表。
+        """
+
+        sink_images.append(image)
+        return StreamDockTouchscreenRenderResult(
+            ok=True,
+            device_type="FakeN4ProDevice",
+            path="n4pro-path",
+            sdk_result="0",
+        )
+
+    app = create_app(
+        poller_config=DaemonPollerConfig(
+            codex_quota_enabled=True,
+            streamdock_quota_touchscreen_enabled=True,
+            streamdock_quota_device="n4pro",
+        ),
+        codex_quota_reader=fake_quota_reader,
+        quota_touchscreen_sink=fake_sink,
+    )
+    with TestClient(app) as client:
+        status = client.get("/status").json()
+
+    assert len(sink_images) == 1
+    assert getattr(sink_images[0], "size") == (800, 480)
+    assert status["codex_quota"]["streamdock_touchscreen"] == {
+        "device_type": "FakeN4ProDevice",
+        "error": None,
+        "ok": True,
+        "path": "n4pro-path",
+        "sdk_result": "0",
+    }
 
 
 def test_decision_request_updates_pending_status_and_decision_layout() -> None:
@@ -432,3 +588,32 @@ async def _request_decision_async(
     )
     assert response.status_code == 200
     return response.json()["decision_id"]
+
+
+def _quota_snapshot() -> CodexQuotaSnapshot:
+    """构造固定 quota snapshot 供 daemon poller 测试使用。
+
+    入参：无。
+    返回：包含 ProLite、5 小时窗口和 weekly 窗口的 `CodexQuotaSnapshot`。
+    错误处理：字段非法时由 Pydantic 抛出并交给 pytest。
+    副作用：无；只创建内存模型。
+    """
+
+    tz = ZoneInfo("Asia/Shanghai")
+    return CodexQuotaSnapshot(
+        plan_type="prolite",
+        plan_short_label="ProLite",
+        plan_display_name="ProLite",
+        primary={
+            "used_percent": 28,
+            "window_duration_mins": 300,
+            "resets_at": datetime(2026, 6, 17, 19, 51, 2, tzinfo=tz),
+        },
+        secondary={
+            "used_percent": 8,
+            "window_duration_mins": 10080,
+            "resets_at": datetime(2026, 6, 24, 13, 47, 28, tzinfo=tz),
+        },
+        credits_balance="0",
+        raw={},
+    )

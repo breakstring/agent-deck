@@ -63,12 +63,15 @@ flowchart TB
     Notify["notify command"]
     Hooks["command hooks"]
     OTel["OTel log exporter"]
+    AppState["state_*.sqlite + rollout JSONL"]
   end
 
   Notify --> HookHelper["agent-deck-codex-hook"]
   Hooks --> HookHelper
   OTel --> OTelReceiver["agent-deckd /v1/logs"]
+  AppState --> AppScanner["agent-deckctl codex-app-state"]
   HookHelper --> EventAPI["agent-deckd /events"]
+  AppScanner --> EventAPI
 
   EventAPI --> Normalizer["Codex Event Normalizer"]
   OTelReceiver --> Normalizer
@@ -144,12 +147,25 @@ Codex 当前运行 `type: "command"` handler，所以 hook helper 负责把 stdi
         ]
       }
     ],
-    "Stop": [
+    "SessionStart": [
       {
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "agent-deck-codex-hook stop",
+            "command": "agent-deck-codex-hook event",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agent-deck-codex-hook event",
             "timeout": 5
           }
         ]
@@ -159,12 +175,42 @@ Codex 当前运行 `type: "command"` handler，所以 hook helper 负责把 stdi
 }
 ```
 
-安装器可以写入 `~/.codex/hooks.json` 或引导用户配置。由于非 managed hooks 需要 Codex 内部 review/trust，安装器必须输出后续动作：
+`agent-deckctl codex-detect --enable-integration` 当前只输出手动接入片段，不自动写入
+`~/.codex`。`agent-deckctl codex-install` 默认同样只做 dry-run；只有显式传入
+`--apply` 时才会备份并写入配置。安装器支持两种 Codex hook 安装模式：
+
+1. user-level 默认模式
+   写入用户级 `~/.codex/config.toml` / `hooks.json`。这种模式不需要管理员权限，
+   适合单用户开发环境，但非 managed hooks 需要 Codex 内部 review/trust。
+
+2. managed-system 高级模式
+   先运行 `agent-deckctl codex-install --managed-system --validate-only` 做只读验证；
+   通过后再用管理员权限运行 `agent-deckctl codex-install --managed-system --apply`
+   写入系统 `/etc/codex/requirements.toml` 的 managed hooks。该文件必须包含
+   `[hooks].managed_dir` 指向已存在的绝对目录，并安装稳定 wrapper 到
+   `/usr/local/lib/agent-deck/codex-hooks/agent-deck-codex-hook`。这种模式需要管理员权限，
+   managed hooks 由 Codex policy 信任，不需要 `/hooks` 手动 trust；安装器会清理用户级
+   `hooks.json` 中的 Agent Deck entries，避免 user hooks 与 managed hooks 重复上报。
+
+user-level 模式下安装器必须输出后续动作：
+
+- 输出 `merge_dry_run`，只读检查用户级 `config.toml` / `hooks.json` 的存在性和是否已包含
+  `agent-deck-codex-hook`。
+- 若现有 `notify` 不属于 Agent Deck，提示 `manual_merge_required`，避免覆盖用户已有命令。
+- 若 `hooks.json` 缺失，提示创建并使用输出中的 `integration.hooks_json`。
+- `codex-install --apply` 遇到 `manual_merge_required` 必须拒绝自动写入，要求用户人工合并。
+- `codex-install --managed-system --validate-only` 必须只读检查生成 TOML、系统
+  requirements、managed wrapper 和用户级重复 hooks；不得写入 `/etc`、`/usr/local` 或
+  `~/.codex`。
 
 - 打开 Codex。
 - 运行 `/hooks`。
 - 检查 `agent-deck-codex-hook`。
 - trust 该 hook。
+
+managed-system 模式不默认开启 `allow_managed_hooks_only`，避免禁用用户自己的 hooks、
+项目 hooks 或插件 hooks。它只托管 Agent Deck lifecycle hooks；`notify` 仍作为用户级
+turn-complete fallback 保留在 `~/.codex/config.toml`。
 
 ### Codex notify
 
@@ -175,6 +221,54 @@ Codex 当前运行 `type: "command"` handler，所以 hook helper 负责把 stdi
 ```toml
 notify = ["agent-deck-codex-hook", "notify"]
 ```
+
+### Codex App 本地状态扫描
+
+Codex Desktop App 的 Plan Mode `request_user_input` 不是 `PermissionRequest` hook，也不会
+进入当前 command hook 链路。第一版用只读扫描补足这个状态来源：
+
+- `agent-deckctl codex-app-state` 读取 `~/.codex/state_*.sqlite` 的 `threads` 表，再读取
+  thread 对应 rollout JSONL。
+- 扫描器查找 `payload.type == "function_call"` 且 `payload.name == "request_user_input"` 的
+  记录；如果同一 `call_id` 后续没有 `function_call_output`，则认为该 thread 正在等待用户输入。
+- 待用户输入映射为 `EventType.INPUT_REQUESTED`，进入 `AgentStateStore` 后显示为
+  `waiting_user`，可复用现有 `ASK` / `needs_user` 视觉状态。
+- `agent-deckctl codex-app-state --sync` 才会把检测出的 `input.requested` 事件 POST 到
+  `agent-deckd /events`；默认命令只打印只读报告。
+
+边界：
+
+- 这是 Codex App 私有本地存储的 best-effort 扫描，不是官方稳定接口。
+- 扫描器不操作 Codex App UI，不写 SQLite/JSONL，不采集完整 prompt；payload 只携带问题、
+  选项标签、call id、rollout path 和行号。
+- 如果用户已经选择了选项，rollout 会出现 `function_call_output`，该请求应恢复为
+  `observed`，不会继续显示为等待用户。
+
+`agent-deckd` 默认启用 daemon-side Codex App state poller，启动时先同步一次，之后默认
+每 5 秒只读扫描一次。命令行可通过 `--disable-codex-app-state-poller` 关闭，或通过
+`--codex-app-state-poll-interval-seconds` 调整间隔。
+
+### Codex quota 轮询与底部虚拟视窗
+
+Codex quota 来自短生命周期 `codex -s read-only -a untrusted app-server` 的
+`account/rateLimits/read`。第一版不把 quota 作为 agent 状态事件，而是作为 daemon runtime
+中的独立快照：
+
+- `agent-deckd` 默认启用 quota poller，启动时先读取一次，之后默认每 300 秒刷新一次。
+- 每次成功读取后，runtime 保存 `CodexQuotaSnapshot`，并用 `render_quota_touchscreen` 渲染
+  N4 Pro 的 800x480 触屏背景图；内容只落在底部 `N4PRO_TOUCH_BAR_VIEWPORT`。
+- daemon 默认把这张图下发到 `--streamdock-quota-device n4pro` 对应的真实硬件触屏；没有触屏能力
+  或不希望接管硬件时，可用 `--disable-streamdock-quota-touchscreen` 关闭。
+- `/status` 暴露最新 quota snapshot、更新时间、最近错误、触屏图渲染计数和真实
+  StreamDock 下发结果，便于判断是 quota 读取失败、图片渲染失败还是设备被占用。
+- quota 渲染层展示剩余百分比，即 `100 - used_percent`；adapter 仍保留 app-server
+  返回的原始 `used_percent` 语义。
+
+命令行可用 `--disable-codex-quota-poller` 关闭 quota 刷新，用
+`--codex-quota-poll-interval-seconds` 调整刷新间隔，用 `--codex-quota-timeout-seconds`
+控制单次 app-server 读取超时。`--streamdock-quota-device` 当前默认 `n4pro`，未来扩展到没有
+触屏或触屏尺寸不同的设备时，应通过设备能力 profile 决定是否显示 quota panel 以及使用哪种
+renderer。
 
 由于 `notify` 和 `otel` 不能由项目级 `.codex/config.toml` 设置，安装器只能改用户级 `~/.codex/config.toml`，并必须先备份。
 
@@ -595,21 +689,24 @@ enabled = false
 ### 手动验证
 
 1. `agent-deckctl doctor` 能检测 Python、SDK、N4 Pro、Codex 配置。
-2. `agent-deckctl simulate codex-session` 能在无 Codex 时点亮 slot。
-3. 启动 Codex 后，N4 Pro slot 能显示 session 状态。
-4. Codex 执行需要 approval 的操作时，N4 Pro 出现 allow/deny。
-5. 按 deny 后 Codex 不执行操作。
-6. 按 allow 后 Codex 继续操作。
-7. 拔掉 N4 Pro 后服务不崩溃。
-8. 重插 N4 Pro 后屏幕恢复。
-9. 关闭 `agent-deckd` 后 PermissionRequest helper 按配置 fail-closed。
+2. `agent-deckctl codex-detect --enable-integration` 能输出 Codex hooks/notify 手动接入片段。
+3. `agent-deckctl codex-install` 默认 dry-run，不写 Codex 配置。
+4. `agent-deckctl codex-install --apply` 在无冲突时备份并写入 Codex 用户级配置。
+5. `agent-deckctl simulate codex-session` 能在无 Codex 时点亮 slot。
+6. 启动 Codex 后，N4 Pro slot 能显示 session 状态。
+7. Codex 执行需要 approval 的操作时，N4 Pro 出现 allow/deny。
+8. 按 deny 后 Codex 不执行操作。
+9. 按 allow 后 Codex 继续操作。
+10. 拔掉 N4 Pro 后服务不崩溃。
+11. 重插 N4 Pro 后屏幕恢复。
+12. 关闭 `agent-deckd` 后 PermissionRequest helper 按配置 fail-closed。
 
 ## 第一版交付物
 
 - `uv` 项目配置和锁文件。
 - Python package skeleton。
 - `agent-deckd` 常驻服务。
-- `agent-deckctl doctor/install/status/simulate`。
+- `agent-deckctl doctor/install/status/simulate/codex-detect`。
 - `agent-deck-codex-hook`。
 - Codex OTel receiver。
 - Codex hook/notify helper。
