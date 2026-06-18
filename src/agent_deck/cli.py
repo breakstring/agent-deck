@@ -24,7 +24,9 @@ import uvicorn
 from agent_deck import __version__
 from agent_deck.config import (
     AgentDeckConfigError,
+    PermissionRequestMode,
     load_agent_deck_config,
+    resolve_agent_deck_config_path,
     resolve_hardware_renderer_defaults,
 )
 from agent_deck.adapters.codex_app_state import (
@@ -1040,39 +1042,72 @@ def permission_request(
         ),
     ] = DEFAULT_DAEMON_URL,
     timeout_seconds: Annotated[
-        float,
+        float | None,
         typer.Option(
             "--timeout-seconds",
-            help="Seconds to wait for an Agent Deck permission decision.",
+            help="Legacy fallback seconds for Agent Deck permission decisions.",
+            min=0.001,
         ),
-    ] = 25,
+    ] = None,
+    config_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--config",
+            help="Agent Deck TOML config path; defaults to AGENT_DECK_CONFIG, cwd, or user config.",
+        ),
+    ] = None,
 ) -> None:
-    """Request and wait for a Codex permission decision with fail-closed output.
+    """Handle a Codex permission request according to Agent Deck config.
 
-    入参：`daemon_url` 是 daemon base URL；`timeout_seconds` 是 request 与 wait 的审批等待秒数；
-    stdin 必须是非空 JSON object，字段会尽力映射到 daemon decision request。
-    返回：无显式返回值；stdout 始终输出 Codex hook JSON decision payload。
+    入参：`daemon_url` 是 daemon base URL；`timeout_seconds` 是旧安装命令可能传入的等待秒数，
+    配置文件存在时以 `codex.permission_request.timeout_seconds` 为准；`config_path` 是可选
+    Agent Deck TOML 配置路径；stdin 必须是非空 JSON object。
+    返回：无显式返回值；`passthrough` 模式 stdout 为空，Codex 会继续原生审批；`handle`
+    和 `deny` 模式会输出 Codex hook JSON decision payload。
     错误处理：stdin 为空、非法 JSON 或非 object 时以 exit 2 退出；daemon 不可达、HTTP
-    非 2xx、缺少 decision id 或 JSON 解码失败时写 stderr、输出 deny JSON，并 exit 0。
-    副作用：读取 stdin，并可能用 bounded httpx POST `/decisions/request` 后 GET
-    `/decisions/{id}/wait`；不安装 hook、不读写用户配置。
+    非 2xx、缺少 decision id 或 JSON 解码失败时写 stderr；handle 模式 fail-closed 输出 deny，
+    passthrough 模式不输出 decision。配置读取失败时写 stderr 并 passthrough。
+    副作用：读取 stdin 和可选配置文件；handle 模式可能用 bounded httpx POST
+    `/decisions/request` 后 GET `/decisions/{id}/wait`；不安装 hook、不写用户配置。
     """
 
     payload = _read_json_object_from_stdin()
-    request_body = _decision_request_from_hook_payload(payload, timeout_seconds)
+    try:
+        local_config = load_agent_deck_config(
+            resolve_agent_deck_config_path(config_path)
+        )
+    except AgentDeckConfigError as exc:
+        typer.echo(f"agent-deck-codex-hook permission-request: {exc}", err=True)
+        return
+    permission_config = local_config.codex.permission_request
+    if permission_config.mode == PermissionRequestMode.PASSTHROUGH:
+        return
+    if permission_config.mode == PermissionRequestMode.DENY:
+        _echo_json(
+            _codex_permission_output(
+                DecisionBehavior.DENY.value,
+                permission_config.deny_message,
+            )
+        )
+        return
+    effective_timeout_seconds = permission_config.timeout_seconds
+    request_body = _decision_request_from_hook_payload(
+        payload,
+        effective_timeout_seconds,
+    )
     try:
         request_payload = _http_post_json(
             _join_url(daemon_url, "decisions", "request"),
             request_body,
-            timeout=max(_DEFAULT_HTTP_TIMEOUT_SECONDS, timeout_seconds + 1),
+            timeout=max(_DEFAULT_HTTP_TIMEOUT_SECONDS, effective_timeout_seconds + 1),
         )
         decision_id = request_payload.get("decision_id")
         if not isinstance(decision_id, str) or not decision_id:
             raise ValueError("daemon response missing decision_id")
         result = _http_get_json(
             _join_url(daemon_url, "decisions", decision_id, "wait"),
-            params={"timeout_seconds": timeout_seconds},
-            timeout=max(_DEFAULT_HTTP_TIMEOUT_SECONDS, timeout_seconds + 1),
+            params={"timeout_seconds": effective_timeout_seconds},
+            timeout=max(_DEFAULT_HTTP_TIMEOUT_SECONDS, effective_timeout_seconds + 1),
         )
         behavior = _decision_behavior_from_daemon(result.get("behavior"))
         message = result.get("message", "")

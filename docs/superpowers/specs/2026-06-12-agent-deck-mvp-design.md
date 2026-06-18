@@ -237,6 +237,9 @@ Codex Desktop App 的 Plan Mode `request_user_input` 不是 `PermissionRequest` 
   明显测试标题/路径。筛选出的会话按 rollout 中未完成普通 `function_call` 推断为
   `running_tool`，否则作为近期 `idle` 会话；daemon 用幂等 observed-state upsert 同步这些状态，
   避免重复伪造 `tool.started` 导致工具计数累加。
+- 扫描器观测到的 `idle` 是弱信号。如果同一个 session 刚由 hook/事件链路进入 `thinking` 或
+  `running_tool`，状态 store 会在短暂 grace window 内保留 live working 状态，只刷新标题、
+  cwd、摘要和最近观测时间，避免 5 秒扫描轮询打断正在播放的 working 动画。
 - `agent-deckctl codex-app-state --sync` 才会把检测出的 `input.requested` 事件 POST 到
   `agent-deckd /events`；默认命令只打印只读报告。
 
@@ -280,6 +283,7 @@ Codex quota 来自短生命周期 `codex -s read-only -a untrusted app-server` �
 `fps` 和 `frame_root` 默认值写在 `agent-deck.toml`；CLI 提供 `--device-profile`、
 `--render-interval-seconds` 和 `--renderer-fps` 作为临时覆盖项。未来扩展到没有触屏或触屏尺寸
 不同的设备时，应通过设备能力 profile 决定是否显示 quota panel 以及使用哪种 renderer。
+当前 N4 Pro 默认渲染节奏是 3 秒一次、10fps，用来对齐 30 帧 key 动画资产并播放完整动画周期。
 
 由于 `notify` 和 `otel` 不能由项目级 `.codex/config.toml` 设置，安装器只能改用户级 `~/.codex/config.toml`，并必须先备份。
 
@@ -524,6 +528,11 @@ LED 显示全局聚合状态：
 
 状态归约必须基于事件序列和时间窗口，不能只看最后一条事件。
 
+被动扫描状态必须低于 live hook 事件的优先级。尤其是 Codex App scanner 的 `idle`
+观测不能因为用户在另一个会话输入、或 SQLite 轮询暂时看不到未完成调用，就把所有会话统一降级；
+归约时必须按 `source + session_id` 定位单个会话，并只在同一会话超过 grace window 后才允许
+`idle` 观测覆盖近期 `thinking` / `running_tool`。
+
 ## 决策 broker
 
 `PermissionRequest` 流程：
@@ -630,8 +639,11 @@ brightness = 80
 enable_otel = true
 enable_hooks = true
 enable_notify = true
-permission_timeout_seconds = 30
-permission_timeout_behavior = "deny"
+
+[codex.permission_request]
+mode = "passthrough" # passthrough | handle | deny
+timeout_seconds = 25
+deny_message = "Denied by Agent Deck."
 
 [actions.focus]
 enabled = true
@@ -659,13 +671,14 @@ enabled = false
 ### `agent-deckd` 不可达
 
 - 普通 event helper：静默失败或写 stderr，不影响 Codex。
-- PermissionRequest helper：默认 deny，更安全。后续可以提供显式配置项允许用户改成 fall-through。
+- PermissionRequest helper：默认 `passthrough`，不输出 decision，让 Codex 原生审批继续；配置
+  `mode = "handle"` 后才由 Agent Deck 接管审批，此时 daemon 不可达或等待超时默认 deny。
 
 ### 硬件断连
 
 - 状态 store 继续运行。
 - 渲染队列暂停。
-- hook 决策不能依赖硬件时，超时默认 deny。
+- `mode = "handle"` 的 hook 决策不能依赖硬件时，超时默认 deny。
 - 重连后重新 init、清屏、full redraw。
 
 ### Codex 配置冲突
@@ -710,7 +723,8 @@ enabled = false
 9. 按 allow 后 Codex 继续操作。
 10. 拔掉 N4 Pro 后服务不崩溃。
 11. 重插 N4 Pro 后屏幕恢复。
-12. 关闭 `agent-deckd` 后 PermissionRequest helper 按配置 fail-closed。
+12. 关闭 `agent-deckd` 后，PermissionRequest helper 在默认 `passthrough` 下回到 Codex 原生审批，
+    在 `handle` 下按配置 fail-closed。
 
 ## 第一版交付物
 
@@ -729,7 +743,7 @@ enabled = false
 ## 开放问题
 
 1. 第一版是否默认修改 `~/.codex/config.toml`，还是只提供 dry-run patch？
-2. 是否允许用户把 PermissionRequest helper 的服务不可达策略从默认 deny 改成 fall-through？
+2. PermissionRequest `handle` 模式是否需要额外支持“daemon 不可达时仍 passthrough”的策略？
 3. 你的 Codex 主要运行形态是 Codex Desktop App、CLI、IDE extension，还是混合？
 4. 聚焦动作优先支持 Terminal、iTerm2、Warp、Codex App 中的哪一个？
 5. 快捷 prompt 第一版是否开启，还是只做复制到剪贴板？

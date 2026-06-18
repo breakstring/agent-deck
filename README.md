@@ -27,3 +27,18 @@ Python 项目使用 `uv` 管理。
 ```bash
 ./run.sh --disable-hardware-renderer
 ```
+
+默认硬件渲染节奏是 `render_interval_seconds = 3.0`、`fps = 10`，对应当前 30 帧的
+N4 Pro Codex 动画资产；这样每次下发按钮图标时能播放一个完整 working 动画周期，而不是
+只反复看到前几帧。
+
+`agent-deck.toml` 还控制 Codex 权限审批 hook 的运行策略。默认：
+
+```toml
+[codex.permission_request]
+mode = "passthrough"
+```
+
+这表示即使系统级 Codex managed hooks 已安装，Agent Deck 也不会替 Codex 做 allow/deny 决策，
+Codex 会继续显示原生审批界面。只有改成 `mode = "handle"` 时，PermissionRequest 才会进入
+Agent Deck 的 decision broker；改成 `mode = "deny"` 则会直接拒绝。

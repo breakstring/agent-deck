@@ -141,6 +141,41 @@ def test_tool_completed_without_pending_returns_to_thinking_and_clears_tool() ->
     assert state.pending_decision_count == 0
 
 
+def test_observed_idle_does_not_interrupt_recent_live_working_state() -> None:
+    """Verify passive scanner idle cannot immediately hide live working.
+
+    入参：无；测试内先用 hook 事件把 agent 置为 running_tool，再用 5 秒后的 scanner idle
+    观测刷新同一 session。
+    返回：无返回值；断言通过代表短时间内 idle 观测只更新上下文，不降级 working 视觉状态。
+    错误处理：若 status、active tool 或时间字段不符合 sticky working 契约，由 pytest 报告。
+    副作用：仅修改测试内的 `AgentStateStore` 内存状态。
+    """
+
+    store = AgentStateStore()
+    tool_at = datetime(2026, 6, 12, 8, 2, tzinfo=UTC)
+    store.apply(
+        _event(EventType.TOOL_STARTED, tool_at, tool_name="shell", summary="running")
+    )
+    observed_at = tool_at + timedelta(seconds=5)
+
+    state = store.upsert_observed_state(
+        source=AgentSource.CODEX,
+        session_id="session-1",
+        observed_at=observed_at,
+        status=AgentStatus.IDLE,
+        title="Codex renamed",
+        cwd="/repo/new",
+        summary="recent unarchived thread",
+    )
+
+    assert state.status == AgentStatus.RUNNING_TOOL
+    assert state.status_since == tool_at
+    assert state.last_event_at == observed_at
+    assert state.display_name == "Codex renamed"
+    assert state.cwd == "/repo/new"
+    assert state.active_tool == "shell"
+
+
 def test_tool_completed_with_pending_keeps_approval_needed() -> None:
     """Verify pending approvals dominate tool completion status.
 

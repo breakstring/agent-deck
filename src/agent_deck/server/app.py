@@ -90,8 +90,8 @@ class DaemonPollerConfig(BaseModel):
     streamdock_quota_device: str = "n4pro"
     streamdock_n4pro_renderer_enabled: bool = False
     streamdock_n4pro_frame_root: Path = Path("assets/codex/generated/n4pro-key-112-fps10")
-    streamdock_n4pro_render_interval_seconds: float = Field(default=2.0, gt=0)
-    streamdock_n4pro_renderer_fps: int = Field(default=5, gt=0)
+    streamdock_n4pro_render_interval_seconds: float = Field(default=3.0, gt=0)
+    streamdock_n4pro_renderer_fps: int = Field(default=10, gt=0)
     poll_on_start: bool = True
 
 

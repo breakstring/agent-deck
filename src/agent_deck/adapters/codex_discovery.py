@@ -1266,7 +1266,7 @@ def build_codex_integration_guide(
         warnings=(
             "本命令不会自动写入 Codex 配置；请先人工合并并保留备份。",
             "非 managed hooks 需要在 /hooks 中 review/trust；未 trust 前 Codex 会跳过这些 hooks。",
-            "PermissionRequest 在 Agent Deck daemon 不可达时会 fail-closed 返回 deny。",
+            "PermissionRequest helper 默认 passthrough；仅当 agent-deck.toml 配置 mode=handle 时由 Agent Deck 接管审批并在 daemon 不可达时 fail-closed。",
             "notify 只是 turn 完成提醒 fallback；实时工具和审批状态以 hooks 为准。",
         ),
     )

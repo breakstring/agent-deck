@@ -16,6 +16,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
 
+_OBSERVED_IDLE_WORKING_GRACE = timedelta(seconds=30)
+
 
 class AgentStatus(StrEnum):
     """Represent the UI-facing lifecycle state for one agent session.
@@ -243,6 +245,8 @@ class AgentStateStore:
         入参：`source` 和 `session_id` 组成稳定 agent key；`observed_at` 是观测时间，
         必须 timezone-aware；`status` 是扫描器确认的当前状态；`title`/`cwd`/`summary`
         是展示上下文；`active_tool` 仅在 `status=RUNNING_TOOL` 时用于展示活跃工具名。
+        被动扫描器的 `IDLE` 观测是弱信号：若当前会话刚进入 `THINKING` 或 `RUNNING_TOOL`
+        不久，则保留 live working 状态，避免本地 rollout 扫描打断正在播放的 working 动画。
         返回：更新后的 `AgentState`。
         错误处理：naive datetime 或非法模型字段由 ValueError/Pydantic 抛出。
         副作用：更新本实例内存状态和活跃工具集合；不访问外部 I/O。
@@ -252,12 +256,22 @@ class AgentStateStore:
         agent_key = f"{source.value}:{session_id}"
         current = self._states.get(agent_key)
         pending_count = current.pending_decision_count if current is not None else 0
-        next_status = (
+        observed_status = (
             AgentStatus.APPROVAL_NEEDED
             if pending_count > 0 and status != AgentStatus.WAITING_USER
             else status
         )
-        next_active_tool = active_tool if next_status == AgentStatus.RUNNING_TOOL else None
+        next_status = _preserve_recent_live_working_status(
+            current,
+            observed_status,
+            observed_at,
+        )
+        next_active_tool = _observed_active_tool(
+            current=current,
+            next_status=next_status,
+            observed_status=observed_status,
+            observed_active_tool=active_tool,
+        )
         if current is None:
             updated = AgentState(
                 agent_key=agent_key,
@@ -467,6 +481,56 @@ def _derive_non_terminal_state(
     if active_tool is not None:
         return AgentStatus.RUNNING_TOOL, active_tool
     return fallback_status, None
+
+
+def _preserve_recent_live_working_status(
+    current: AgentState | None,
+    observed_status: AgentStatus,
+    observed_at: datetime,
+) -> AgentStatus:
+    """Prevent weak scanner idle observations from interrupting recent work.
+
+    入参：`current` 是 store 中已有状态；`observed_status` 是被动扫描器本轮观测出的状态；
+    `observed_at` 是本轮扫描时间，必须 timezone-aware。
+    返回：最终要写入的状态；当 scanner 观测为 `IDLE` 且当前状态刚处于 `THINKING` 或
+    `RUNNING_TOOL` 时返回当前 working 状态，其余情况返回观测状态。
+    错误处理：本函数不主动校验时间；调用方已在 public 方法入口校验。
+    副作用：无；只读取内存模型，不访问外部 I/O。
+    """
+
+    if current is None:
+        return observed_status
+    if observed_status != AgentStatus.IDLE:
+        return observed_status
+    if current.status not in {AgentStatus.THINKING, AgentStatus.RUNNING_TOOL}:
+        return observed_status
+    if observed_at - current.status_since > _OBSERVED_IDLE_WORKING_GRACE:
+        return observed_status
+    return current.status
+
+
+def _observed_active_tool(
+    *,
+    current: AgentState | None,
+    next_status: AgentStatus,
+    observed_status: AgentStatus,
+    observed_active_tool: str | None,
+) -> str | None:
+    """Choose the active tool to store after an observed-state upsert.
+
+    入参：`current` 是旧状态；`next_status` 是最终状态；`observed_status` 是扫描器原始观测；
+    `observed_active_tool` 是扫描器提供的工具名，可为空。
+    返回：当最终状态是 `RUNNING_TOOL` 时返回要展示的工具名；如果本轮只是保留 recent live
+    working，则沿用旧 active tool；非 running 状态返回 None。
+    错误处理：本函数不抛业务异常。
+    副作用：无；只读取内存字段。
+    """
+
+    if next_status != AgentStatus.RUNNING_TOOL:
+        return None
+    if observed_status == AgentStatus.RUNNING_TOOL:
+        return observed_active_tool
+    return current.active_tool if current is not None else observed_active_tool
 
 
 def _add_tool(active_tools: dict[str, int], tool_name: str | None) -> dict[str, int]:

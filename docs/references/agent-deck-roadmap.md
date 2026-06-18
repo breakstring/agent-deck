@@ -100,7 +100,9 @@ flowchart LR
    同一扫描链路也筛选“未归档 + 最近 1 小时 + 最多 10 个 + 排除明显测试 thread”的有效
    Codex App 会话，把 waiting/running/idle 观测态幂等同步到 daemon state store。该能力作为
    Codex App 私有本地状态 fallback，不替代官方 hooks；daemon 默认以 5 秒间隔自动轮询，
-   可通过 CLI 关闭或调整间隔、窗口、扫描上限和会话数量。
+   可通过 CLI 关闭或调整间隔、窗口、扫描上限和会话数量。被动扫描得到的 idle 是弱信号，
+   不应立即覆盖同一 session 刚由 hook 推入的 thinking/running_tool 状态，避免用户正在看的
+   working 动画被本地扫描打断。
 
 8. state reducer
    把事件归约为 AgentState。
@@ -123,6 +125,7 @@ flowchart LR
     下发 quota 背景和按键动画。该模式默认替代旧的 quota-only 真实触屏下发，避免
     多个 SDK `init()` 路径互相清屏；需要纯内存/fake 运行时可用 `--disable-hardware-renderer`。
     渲染间隔、FPS、设备 profile 和帧目录默认值放在 `agent-deck.toml`，CLI 只提供通用覆盖项。
+    当前默认节奏为 3 秒一次、10fps，对齐 30 帧 N4 Pro key 动画资产的完整周期。
 
 13. Codex 视觉资产生成器
     将 `assets/codex/codex.gif` 按目标设备 profile 预渲染成状态帧序列、每状态
@@ -364,7 +367,8 @@ P4 关键设计点：
 1. `codex-install` 已默认 dry-run，`--apply` 仅在无人工合并冲突时写入；已有非 Agent Deck
    `notify` 会通过 Agent Deck fan-out wrapper 保留；managed-system 路径增加
    `--validate-only` 检查，后续需要补 uninstall/rollback。
-2. 是否允许用户把 PermissionRequest helper 的服务不可达策略从默认 deny 改成 fall-through？
+2. PermissionRequest helper 已默认 `passthrough`；后续需要补 `handle` 模式下硬件/CLI resolve
+   闭环，以及是否允许 handle 模式在 daemon 不可达时回退到 passthrough。
 3. Codex Desktop App 的 OTel 表现是否和 CLI 一致，需要实测。
 4. 第一版聚焦目标优先支持 Terminal、iTerm2、Warp 还是 Codex App？
 5. 快捷 prompt 是否第一版启用自动输入，还是只复制到剪贴板？

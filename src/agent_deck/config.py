@@ -8,11 +8,17 @@ TOML 文件。配置字段刻意使用硬件中立命名，当前默认设备 pr
 
 from __future__ import annotations
 
+import os
 import tomllib
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+_CONFIG_ENV = "AGENT_DECK_CONFIG"
+_CWD_CONFIG_PATH = Path("agent-deck.toml")
+_USER_CONFIG_PATH = Path.home() / "Library/Application Support/AgentDeck/config.toml"
 
 
 class AgentDeckConfigError(ValueError):
@@ -40,16 +46,64 @@ class HardwareRendererConfig(BaseModel):
 
     enabled: bool = True
     device_profile: str = Field(default="n4pro", min_length=1)
-    render_interval_seconds: float = Field(default=2.0, gt=0)
-    fps: int = Field(default=5, gt=0, le=20)
+    render_interval_seconds: float = Field(default=3.0, gt=0)
+    fps: int = Field(default=10, gt=0, le=20)
     frame_root: Path = Path("assets/codex/generated/n4pro-key-112-fps10")
+
+
+class PermissionRequestMode(StrEnum):
+    """定义 Codex PermissionRequest hook 的 Agent Deck 响应策略。
+
+    入参：枚举值来自本地 TOML 配置。
+    返回：字符串枚举，可直接参与 Pydantic 校验和 CLI 分支判断。
+    错误处理：未知模式由 Pydantic 报告配置校验失败。
+    副作用：无；定义枚举不访问外部资源。
+    """
+
+    PASSTHROUGH = "passthrough"
+    HANDLE = "handle"
+    DENY = "deny"
+
+
+class CodexPermissionRequestConfig(BaseModel):
+    """配置 Agent Deck 是否接管 Codex 权限审批请求。
+
+    入参：`mode` 为 `passthrough` 时不返回 decision，让 Codex 原生审批继续；`handle`
+    时进入 Agent Deck decision broker；`deny` 时直接拒绝。`timeout_seconds` 是 handle
+    模式等待硬件/API 决策的秒数；`deny_message` 是 deny 模式和可控拒绝时返回给 Codex 的说明。
+    返回：frozen Pydantic model。
+    错误处理：非法 mode、非正 timeout 或空 deny_message 由 Pydantic 校验失败。
+    副作用：模型自身不访问 daemon、Codex、文件或硬件。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    mode: PermissionRequestMode = PermissionRequestMode.PASSTHROUGH
+    timeout_seconds: float = Field(default=25.0, gt=0)
+    deny_message: str = Field(default="Denied by Agent Deck.", min_length=1)
+
+
+class CodexConfig(BaseModel):
+    """配置 Agent Deck 对 Codex 专属能力的处理方式。
+
+    入参：`permission_request` 控制 sandbox/escalation 审批 hook 的响应策略。
+    返回：frozen Pydantic model。
+    错误处理：子配置非法时由 Pydantic 报告。
+    副作用：模型自身不读写外部资源。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    permission_request: CodexPermissionRequestConfig = Field(
+        default_factory=CodexPermissionRequestConfig
+    )
 
 
 class AgentDeckConfig(BaseModel):
     """Agent Deck daemon 的本地可编辑配置根模型。
 
-    入参：`hardware_renderer` 是真实硬件渲染相关默认值；后续可继续加入 agent、quota、
-    interaction 等配置域。
+    入参：`hardware_renderer` 是真实硬件渲染相关默认值；`codex` 是 Codex 专属集成能力
+    配置域；后续可继续加入 agent、quota、interaction 等配置域。
     返回：frozen Pydantic model。
     错误处理：子配置非法时由 Pydantic 返回结构化校验错误。
     副作用：模型自身不读写外部资源。
@@ -60,6 +114,27 @@ class AgentDeckConfig(BaseModel):
     hardware_renderer: HardwareRendererConfig = Field(
         default_factory=HardwareRendererConfig
     )
+    codex: CodexConfig = Field(default_factory=CodexConfig)
+
+
+def resolve_agent_deck_config_path(path: Path | None = None) -> Path:
+    """解析 Agent Deck 配置路径，支持 hook 在任意 cwd 下读取稳定配置。
+
+    入参：`path` 是 CLI 显式传入的配置路径；为 None 时依次检查 `AGENT_DECK_CONFIG`、
+    当前目录 `agent-deck.toml` 和用户级 `~/Library/Application Support/AgentDeck/config.toml`。
+    返回：要传给 `load_agent_deck_config` 的路径；路径可以不存在，此时 loader 会返回默认配置。
+    错误处理：本函数不读取文件，不因路径不存在抛错。
+    副作用：读取进程环境变量和当前目录文件存在性，不写文件、不访问网络或硬件。
+    """
+
+    if path is not None:
+        return path.expanduser()
+    env_value = os.environ.get(_CONFIG_ENV)
+    if env_value:
+        return Path(env_value).expanduser()
+    if _CWD_CONFIG_PATH.exists():
+        return _CWD_CONFIG_PATH
+    return _USER_CONFIG_PATH
 
 
 def load_agent_deck_config(path: Path) -> AgentDeckConfig:

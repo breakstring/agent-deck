@@ -282,8 +282,36 @@ def test_notify_accepts_codex_json_argument(monkeypatch: Any) -> None:
     assert body["cwd"] == "/tmp/project"
 
 
-def test_permission_request_fail_closed_json(monkeypatch: Any) -> None:
-    """Verify permission-request emits deny JSON when daemon I/O fails.
+def test_permission_request_default_passthrough_lets_codex_decide(
+    monkeypatch: Any,
+) -> None:
+    """Verify permission-request defaults to no decision and no daemon wait.
+
+    入参：`monkeypatch` 安装 fake HTTP client 以检测意外 daemon 访问。
+    返回：无返回值；断言通过代表默认 passthrough 不输出 hook decision。
+    错误处理：若输出 JSON、访问 daemon 或退出码不为 0，由 pytest 报告。
+    副作用：读取测试 stdin JSON；不访问真实 daemon。
+    """
+
+    _install_fake_client(monkeypatch)
+
+    result = runner.invoke(
+        cli.codex_hook_app,
+        ["permission-request"],
+        input=json.dumps({"session_id": "demo", "tool_name": "shell"}),
+    )
+
+    assert result.exit_code == 0
+    assert result.output == ""
+    assert result.stderr == ""
+    assert _FakeClient.requests == []
+
+
+def test_permission_request_handle_mode_fail_closed_json(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Verify handle mode emits deny JSON when daemon I/O fails.
 
     入参：`monkeypatch` 安装会抛 ConnectError 的 fake HTTP client。
     返回：无返回值；断言通过代表 stdout 是 Codex hook deny payload 且 exit 0。
@@ -292,10 +320,15 @@ def test_permission_request_fail_closed_json(monkeypatch: Any) -> None:
     """
 
     _install_fake_client(monkeypatch, fail=True)
+    config_path = tmp_path / "agent-deck.toml"
+    config_path.write_text(
+        "[codex.permission_request]\nmode = \"handle\"\n",
+        encoding="utf-8",
+    )
 
     result = runner.invoke(
         cli.codex_hook_app,
-        ["permission-request"],
+        ["permission-request", "--config", str(config_path)],
         input=json.dumps({"session_id": "demo", "tool_name": "shell"}),
     )
 
@@ -306,6 +339,44 @@ def test_permission_request_fail_closed_json(monkeypatch: Any) -> None:
     assert decision["behavior"] == "deny"
     assert "Agent Deck daemon unavailable" in decision["message"]
     assert "daemon unavailable" in result.stderr
+
+
+def test_permission_request_deny_mode_returns_configured_deny(
+    tmp_path: Path,
+) -> None:
+    """Verify deny mode blocks PermissionRequest without contacting daemon.
+
+    入参：`tmp_path` 提供临时 Agent Deck 配置文件。
+    返回：无返回值；断言通过代表 deny mode 输出 Codex deny decision。
+    错误处理：若行为不是 deny、消息不匹配或退出码不为 0，由 pytest 报告。
+    副作用：只写 pytest 临时配置并读取测试 stdin，不访问真实 daemon。
+    """
+
+    config_path = tmp_path / "agent-deck.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[codex.permission_request]",
+                "mode = \"deny\"",
+                "deny_message = \"Agent Deck permission handling disabled.\"",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        cli.codex_hook_app,
+        ["permission-request", "--config", str(config_path)],
+        input=json.dumps({"session_id": "demo", "tool_name": "shell"}),
+    )
+
+    assert result.exit_code == 0
+    body = json.loads(_json_object_text(result.output))
+    decision = body["hookSpecificOutput"]["decision"]
+    assert decision == {
+        "behavior": "deny",
+        "message": "Agent Deck permission handling disabled.",
+    }
 
 
 def test_daemon_callback_calls_uvicorn_run(monkeypatch: Any) -> None:
@@ -358,8 +429,8 @@ def test_daemon_callback_calls_uvicorn_run(monkeypatch: Any) -> None:
     assert poller_config.streamdock_quota_touchscreen_enabled is False
     assert poller_config.streamdock_quota_device == "n4pro"
     assert poller_config.streamdock_n4pro_renderer_enabled is True
-    assert poller_config.streamdock_n4pro_render_interval_seconds == 2.0
-    assert poller_config.streamdock_n4pro_renderer_fps == 5
+    assert poller_config.streamdock_n4pro_render_interval_seconds == 3.0
+    assert poller_config.streamdock_n4pro_renderer_fps == 10
 
 
 def test_daemon_callback_can_disable_codex_pollers(monkeypatch: Any) -> None:
