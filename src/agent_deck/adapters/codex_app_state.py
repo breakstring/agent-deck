@@ -19,10 +19,18 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
+from agent_deck.core.state import AgentStatus
 
 _STATE_DB_GLOB = "state_*.sqlite"
 _REQUEST_USER_INPUT_TOOL = "request_user_input"
 _CODEX_APP_REQUEST_SOURCE_EVENT = "codex-app.request_user_input"
+DEFAULT_ACTIVE_SESSION_WINDOW_SECONDS = 3600
+DEFAULT_ACTIVE_SESSION_LIMIT = 10
+DEFAULT_ACTIVE_SESSION_EXCLUDE_PATTERNS: tuple[str, ...] = (
+    "请求用户选择选项",
+    "codex-a-b-c",
+    "smoke",
+)
 
 
 class CodexUserInputRequest(BaseModel):
@@ -99,6 +107,27 @@ class CodexAppStateReport(BaseModel):
     threads: tuple[CodexAppThreadSnapshot, ...] = Field(default_factory=tuple)
 
 
+class CodexAppActiveSession(BaseModel):
+    """描述一个适合显示到硬件按钮上的 Codex App 活动会话。
+
+    入参：字段来自 scan report 和 rollout 推断；`status` 是 Agent Deck 内部状态枚举，
+    `reason` 用于解释为什么判定为该状态。
+    返回：不可变 Pydantic model，可由 CLI/daemon 渲染按钮或输出诊断 JSON。
+    错误处理：字段类型或状态枚举非法时由 Pydantic 报告。
+    副作用：模型自身不读取文件、不访问 Codex、不操作硬件。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    thread_id: str
+    title: str | None
+    cwd: str | None
+    rollout_path: str
+    updated_at: int
+    status: AgentStatus
+    reason: str
+
+
 def scan_codex_app_state(
     *,
     codex_home: Path | None = None,
@@ -128,6 +157,60 @@ def scan_codex_app_state(
         threads=threads,
     )
 
+
+def select_active_codex_app_sessions(
+    report: CodexAppStateReport,
+    *,
+    now: datetime | None = None,
+    active_window_seconds: int = DEFAULT_ACTIVE_SESSION_WINDOW_SECONDS,
+    max_sessions: int = DEFAULT_ACTIVE_SESSION_LIMIT,
+    exclude_patterns: Iterable[str] = DEFAULT_ACTIVE_SESSION_EXCLUDE_PATTERNS,
+) -> tuple[CodexAppActiveSession, ...]:
+    """从 Codex App scan report 中筛选适合展示的近期有效会话。
+
+    入参：`report` 是只读扫描结果；`now` 默认当前 UTC，用于计算最近窗口；
+    `active_window_seconds` 是 thread `updated_at` 距当前时间的最大秒数，默认 1 小时；
+    `max_sessions` 是最多返回数量，N4 Pro 默认 10 个主按键槽；`exclude_patterns` 是
+    在 title/cwd/rollout_path 中命中即排除的大小写不敏感子串。
+    返回：按 `updated_at` 倒序排列的 `CodexAppActiveSession` 元组。
+    错误处理：窗口或数量非正数时抛 `ValueError`；缺失 `updated_at` 的 thread 被跳过。
+    副作用：可能只读解析每个候选 thread 的 rollout JSONL 以推断状态；不写文件、不访问网络。
+    """
+
+    if active_window_seconds <= 0:
+        raise ValueError("active_window_seconds must be positive")
+    if max_sessions <= 0:
+        raise ValueError("max_sessions must be positive")
+
+    reference_time = _ensure_utc(now or datetime.now(UTC))
+    cutoff_epoch = int(reference_time.timestamp()) - active_window_seconds
+    normalized_patterns = tuple(
+        pattern.casefold()
+        for pattern in exclude_patterns
+        if isinstance(pattern, str) and pattern.strip()
+    )
+
+    sessions: list[CodexAppActiveSession] = []
+    for thread in report.threads:
+        if thread.updated_at is None or thread.updated_at < cutoff_epoch:
+            continue
+        if _thread_matches_exclude_patterns(thread, normalized_patterns):
+            continue
+        status, reason = _infer_thread_agent_status(thread)
+        sessions.append(
+            CodexAppActiveSession(
+                thread_id=thread.thread_id,
+                title=thread.title,
+                cwd=thread.cwd,
+                rollout_path=thread.rollout_path,
+                updated_at=thread.updated_at,
+                status=status,
+                reason=reason,
+            )
+        )
+
+    sessions.sort(key=lambda session: session.updated_at, reverse=True)
+    return tuple(sessions[:max_sessions])
 
 def build_codex_app_state_events(
     *,
@@ -307,6 +390,101 @@ def _latest_pending_user_input(rollout_path: Path) -> CodexUserInputRequest | No
     if not pending:
         return None
     return max(pending, key=lambda request: (request.requested_at, request.line_number))
+
+
+def _infer_thread_agent_status(thread: CodexAppThreadSnapshot) -> tuple[AgentStatus, str]:
+    """根据 Codex App thread 快照和 rollout 粗略推断 Agent 状态。
+
+    入参：`thread` 是扫描器已经解析出的 thread 快照。
+    返回：`(AgentStatus, reason)`；优先返回等待用户输入，其次返回仍有未完成工具调用，
+    否则把最近有效会话归为 idle。
+    错误处理：rollout 文件不存在或无法读出未完成工具调用时降级为 idle；JSON 单行错误被跳过。
+    副作用：只读解析 rollout JSONL；不修改 Codex 文件、不连接 daemon、不操作硬件。
+    """
+
+    if thread.pending_user_input is not None:
+        return AgentStatus.WAITING_USER, "pending request_user_input"
+    pending_tool = _latest_pending_non_user_tool_call(Path(thread.rollout_path))
+    if pending_tool is not None:
+        return AgentStatus.RUNNING_TOOL, f"pending tool call: {pending_tool}"
+    return AgentStatus.IDLE, "recent unarchived thread"
+
+
+def _latest_pending_non_user_tool_call(rollout_path: Path) -> str | None:
+    """找出 rollout 中最新一个未返回 output 的非 `request_user_input` 工具调用。
+
+    入参：`rollout_path` 是 thread 对应 JSONL 文件。
+    返回：工具名；没有未完成普通工具调用或文件缺失时返回 None。
+    错误处理：单行 JSON 或字段结构异常会跳过该行；文件编码错误由运行时传播。
+    副作用：只读打开 rollout 文件。
+    """
+
+    if not rollout_path.exists():
+        return None
+
+    pending_calls: dict[str, tuple[str, int]] = {}
+    with rollout_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            row = _loads_json_object(line)
+            if row is None:
+                continue
+            payload = row.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            call_id = _optional_string(payload.get("call_id"))
+            if not call_id:
+                continue
+            payload_type = payload.get("type")
+            if payload_type == "function_call_output":
+                pending_calls.pop(call_id, None)
+                continue
+            if payload_type != "function_call":
+                continue
+            name = _optional_string(payload.get("name"))
+            if name is None or name == _REQUEST_USER_INPUT_TOOL:
+                continue
+            pending_calls[call_id] = (name, line_number)
+
+    if not pending_calls:
+        return None
+    name, _ = max(pending_calls.values(), key=lambda item: item[1])
+    return name
+
+
+def _thread_matches_exclude_patterns(
+    thread: CodexAppThreadSnapshot,
+    patterns: tuple[str, ...],
+) -> bool:
+    """判断 thread 是否命中活动会话排除规则。
+
+    入参：`thread` 是扫描快照；`patterns` 是已 casefold 的非空子串集合。
+    返回：任意模式命中 title/cwd/rollout_path 时返回 True。
+    错误处理：空模式集合直接返回 False。
+    副作用：无；只读取内存字段。
+    """
+
+    if not patterns:
+        return False
+    haystack = "\n".join(
+        value.casefold()
+        for value in (thread.title, thread.cwd, thread.rollout_path)
+        if value is not None
+    )
+    return any(pattern in haystack for pattern in patterns)
+
+
+def _ensure_utc(value: datetime) -> datetime:
+    """把 timezone-aware datetime 规范化到 UTC。
+
+    入参：`value` 是当前参考时间。
+    返回：UTC timezone-aware datetime。
+    错误处理：naive datetime 抛 `ValueError`，避免活动窗口计算依赖隐式本地时区。
+    副作用：无；只处理内存值。
+    """
+
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    return value.astimezone(UTC)
 
 
 def _user_input_request_from_payload(

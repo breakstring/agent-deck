@@ -12,10 +12,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+from PIL import Image
 from typer.testing import CliRunner
 
 from agent_deck import __version__
 from agent_deck import cli
+from agent_deck.core.state import AgentStatus
 from agent_deck.rendering.asset_builder import CodexVisualAssetBuildResult
 
 
@@ -698,6 +700,219 @@ def test_codex_app_state_sync_posts_pending_events(
     assert request["kwargs"]["json"]["normalized_type"] == "input.requested"
     payload = json.loads(result.output)
     assert payload["synced_events"] == 1
+
+
+def test_codex_sessions_preview_renders_sessions_and_quota(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Verify `codex-sessions-preview` wires active sessions, quota and N4 Pro sink.
+
+    入参：`monkeypatch` 替换 scanner、quota reader、quota renderer 和硬件动画 sink；
+    `tmp_path` 提供 fake Codex home 和 generated frame root。
+    返回：无返回值；断言通过代表 CLI 使用活动会话状态帧，并同时传递 quota 背景。
+    错误处理：退出码、参数转发、帧路径或 JSON 输出不符合契约时由 pytest 报告。
+    副作用：只写 pytest 临时 PNG 帧，不访问真实 Codex、daemon 或 N4 Pro。
+    """
+
+    codex_home = tmp_path / ".codex"
+    frame_root = tmp_path / "frames"
+    working_dir = frame_root / "working"
+    working_dir.mkdir(parents=True)
+    frame_path = working_dir / "frame_000.png"
+    Image.new("RGB", (112, 112), (8, 9, 10)).save(frame_path)
+    calls: dict[str, Any] = {}
+
+    class FakeReport:
+        """测试用 Codex App scan report。
+
+        入参：无。
+        返回：fake 对象，仅用于透传给 active session selector。
+        错误处理：无。
+        副作用：无。
+        """
+
+    class FakeSession:
+        """测试用活动 Codex 会话。
+
+        入参：无。
+        返回：提供 CLI 需要的 `status` 和 `model_dump`。
+        错误处理：无。
+        副作用：无。
+        """
+
+        status = AgentStatus.RUNNING_TOOL
+
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            """返回固定活动会话 JSON。
+
+            入参：`mode` 是 Pydantic 兼容参数，测试要求为 `json`。
+            返回：固定 session JSON object。
+            错误处理：mode 非 json 时断言失败。
+            副作用：无。
+            """
+
+            assert mode == "json"
+            return {"thread_id": "thread-1", "status": "running_tool"}
+
+    class FakeQuota:
+        """测试用 quota snapshot。
+
+        入参：无。
+        返回：提供 CLI 输出需要的 `model_dump`。
+        错误处理：无。
+        副作用：无。
+        """
+
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            """返回固定 quota JSON。
+
+            入参：`mode` 是 Pydantic 兼容参数，测试要求为 `json`。
+            返回：固定 quota JSON object。
+            错误处理：mode 非 json 时断言失败。
+            副作用：无。
+            """
+
+            assert mode == "json"
+            return {"plan_short_label": "ProLite"}
+
+    class FakeRenderResult:
+        """测试用 N4 Pro 动画结果。
+
+        入参：无。
+        返回：提供 CLI 输出需要的 `ok` 和 `model_dump`。
+        错误处理：无。
+        副作用：无。
+        """
+
+        ok = True
+
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            """返回固定动画结果 JSON。
+
+            入参：`mode` 是 Pydantic 兼容参数，测试要求为 `json`。
+            返回：固定 render JSON object。
+            错误处理：mode 非 json 时断言失败。
+            副作用：无。
+            """
+
+            assert mode == "json"
+            return {"ok": True, "frames_rendered": 2}
+
+    report = FakeReport()
+    session = FakeSession()
+    quota = FakeQuota()
+
+    def fake_scan_codex_app_state(**kwargs: Any) -> FakeReport:
+        """捕获 CLI 传给 Codex App scanner 的参数。
+
+        入参：`kwargs` 是 CLI 转发的 scanner 选项。
+        返回：固定 fake report。
+        错误处理：无。
+        副作用：记录 scanner 调用参数。
+        """
+
+        calls["scan"] = kwargs
+        return report
+
+    def fake_select_active_codex_app_sessions(
+        report_arg: object,
+        **kwargs: Any,
+    ) -> tuple[FakeSession]:
+        """捕获 CLI 传给活动会话选择器的参数。
+
+        入参：`report_arg` 是 scanner 返回对象；`kwargs` 是过滤选项。
+        返回：一个 running_tool 会话。
+        错误处理：无。
+        副作用：记录 selector 调用参数。
+        """
+
+        calls["select"] = {"report": report_arg, **kwargs}
+        return (session,)
+
+    def fake_read_codex_quota(**kwargs: Any) -> FakeQuota:
+        """捕获 CLI 传给 quota reader 的参数。
+
+        入参：`kwargs` 是 quota 超时配置。
+        返回：固定 fake quota。
+        错误处理：无。
+        副作用：记录 quota 调用参数。
+        """
+
+        calls["quota"] = kwargs
+        return quota
+
+    def fake_render_quota_touchscreen(snapshot: object) -> Image.Image:
+        """捕获 CLI 传给 quota touchscreen renderer 的 snapshot。
+
+        入参：`snapshot` 是 quota reader 返回对象。
+        返回：固定 800x480 背景图。
+        错误处理：无。
+        副作用：记录 renderer 输入。
+        """
+
+        calls["quota_snapshot"] = snapshot
+        return Image.new("RGB", (800, 480), (1, 2, 3))
+
+    def fake_animate_key_images_on_n4pro(**kwargs: Any) -> FakeRenderResult:
+        """捕获 CLI 传给真实硬件动画 sink 的参数。
+
+        入参：`kwargs` 包含背景图、按键帧路径、时长和 fps。
+        返回：固定成功结果。
+        错误处理：无。
+        副作用：记录硬件 sink 参数。
+        """
+
+        calls["animate"] = kwargs
+        return FakeRenderResult()
+
+    monkeypatch.setattr(cli, "scan_codex_app_state", fake_scan_codex_app_state)
+    monkeypatch.setattr(
+        cli,
+        "select_active_codex_app_sessions",
+        fake_select_active_codex_app_sessions,
+    )
+    monkeypatch.setattr(cli, "read_codex_quota", fake_read_codex_quota)
+    monkeypatch.setattr(cli, "render_quota_touchscreen", fake_render_quota_touchscreen)
+    monkeypatch.setattr(
+        cli,
+        "animate_key_images_on_n4pro",
+        fake_animate_key_images_on_n4pro,
+    )
+
+    result = runner.invoke(
+        cli.ctl_app,
+        [
+            "codex-sessions-preview",
+            "--codex-home",
+            str(codex_home),
+            "--frame-root",
+            str(frame_root),
+            "--duration-seconds",
+            "0.2",
+            "--fps",
+            "10",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls["scan"] == {
+        "codex_home": codex_home,
+        "state_db_path": None,
+        "limit": 80,
+    }
+    assert calls["select"]["report"] is report
+    assert calls["select"]["active_window_seconds"] == 3600
+    assert calls["select"]["max_sessions"] == 10
+    assert calls["quota"] == {"timeout_seconds": 10.0}
+    assert calls["quota_snapshot"] is quota
+    assert calls["animate"]["key_frame_paths"] == {1: (frame_path.resolve(),)}
+    assert calls["animate"]["duration_seconds"] == 0.2
+    assert calls["animate"]["fps"] == 10
+    payload = json.loads(result.output)
+    assert payload["sessions"] == [{"thread_id": "thread-1", "status": "running_tool"}]
+    assert payload["key_count"] == 1
+    assert payload["render"]["ok"] is True
 
 
 def test_codex_detect_enable_integration_prints_report(monkeypatch: Any) -> None:

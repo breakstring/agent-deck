@@ -13,9 +13,10 @@
 from __future__ import annotations
 
 import tempfile
+import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
@@ -137,6 +138,28 @@ class StreamDockN4ProRenderResult(BaseModel):
     error: str | None = None
 
 
+class StreamDockN4ProAnimationResult(BaseModel):
+    """一次 N4 Pro 长连接按键动画预览结果。
+
+    入参：`ok` 表示动画循环是否完整执行；`device_type`/`path` 描述选中的设备；
+    `background_result` 是启动时写入 frame background 的 SDK 返回值；`frames_rendered`
+    是已刷新帧数；`key_count` 是参与动画的按键数；`error` 是失败说明。
+    返回：frozen Pydantic model，可由 CLI 输出 JSON 或测试断言。
+    错误处理：字段类型非法时由 Pydantic 报告。
+    副作用：模型自身不访问硬件或文件。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    ok: bool
+    device_type: str | None = None
+    path: str | None = None
+    background_result: str | None = None
+    frames_rendered: int = 0
+    key_count: int = 0
+    error: str | None = None
+
+
 def render_images_to_n4pro(
     *,
     background_image: Image.Image | None = None,
@@ -234,6 +257,143 @@ def render_images_to_n4pro(
         )
     except Exception as exc:
         return StreamDockN4ProRenderResult(
+            ok=False,
+            device_type=device_type,
+            path=path,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    finally:
+        for temp_path in temp_paths:
+            temp_path.unlink(missing_ok=True)
+        if opened:
+            try:
+                device.close(notify=False)
+            except Exception:
+                pass
+
+
+def animate_key_images_on_n4pro(
+    *,
+    background_image: Image.Image | None,
+    key_frame_paths: Mapping[int, tuple[Path, ...]],
+    duration_seconds: float,
+    fps: int,
+    manager: StreamDockN4ProManagerLike | None = None,
+    temp_dir: Path | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> StreamDockN4ProAnimationResult:
+    """在同一次 N4 Pro 设备会话里播放多个按键动画并保留背景层。
+
+    入参：`background_image` 是可选 800x480 背景图；`key_frame_paths` 是 key 到帧 PNG
+    路径元组的映射，key 必须在 1-15 且每个 key 至少一帧；`duration_seconds` 是播放时长；
+    `fps` 是目标刷新帧率；`manager` 可注入 fake 或官方 DeviceManager；`temp_dir` 是背景
+    临时 JPEG 目录；`sleep`/`monotonic` 仅供测试替换计时函数。
+    返回：`StreamDockN4ProAnimationResult`，成功时包含刷新帧数和参与按键数。
+    错误处理：非法 key、空帧、时长/FPS 非正、找不到 N4 Pro、open false、SDK 返回 -1 或
+    抛异常都会返回 `ok=False`；临时背景文件会尽力清理。
+    副作用：无 manager 时懒加载官方 SDK 并枚举真实设备；成功选中 N4 Pro 后会 open/init、
+    可选写 frame background，然后按帧循环 set_key_image/refresh，最后 close(notify=False)。
+    """
+
+    if duration_seconds <= 0:
+        return StreamDockN4ProAnimationResult(
+            ok=False,
+            error="duration_seconds must be positive",
+        )
+    if fps <= 0:
+        return StreamDockN4ProAnimationResult(ok=False, error="fps must be positive")
+    normalized_frames = {
+        key: tuple(paths) for key, paths in key_frame_paths.items()
+    }
+    invalid_keys = sorted(key for key in normalized_frames if key not in range(1, 16))
+    if invalid_keys:
+        return StreamDockN4ProAnimationResult(
+            ok=False,
+            error=f"keys must be in range 1..15: {invalid_keys}",
+        )
+    empty_keys = sorted(key for key, paths in normalized_frames.items() if not paths)
+    if empty_keys:
+        return StreamDockN4ProAnimationResult(
+            ok=False,
+            error=f"keys must have at least one frame: {empty_keys}",
+        )
+    if background_image is None and not normalized_frames:
+        return StreamDockN4ProAnimationResult(
+            ok=False,
+            error="at least one background or key animation is required",
+        )
+
+    active_manager = manager if manager is not None else _load_default_manager()
+    device = _first_n4pro_device(active_manager.enumerate())
+    if device is None:
+        return StreamDockN4ProAnimationResult(ok=False, error="no N4 Pro device found")
+
+    device_type = type(device).__name__
+    path = _safe_path(device)
+    opened = False
+    temp_paths: list[Path] = []
+    frame_budget = max(1, int(round(duration_seconds * fps)))
+    frame_interval = 1.0 / fps
+    try:
+        open_result = device.open()
+        if open_result is False:
+            return StreamDockN4ProAnimationResult(
+                ok=False,
+                device_type=device_type,
+                path=path,
+                error="open failed: SDK returned false",
+            )
+        opened = True
+        device.init()
+
+        background_result: object | None = None
+        if background_image is not None:
+            background_path = _save_temp_jpeg(background_image, temp_dir=temp_dir)
+            temp_paths.append(background_path)
+            background_result = device.set_frame_background(str(background_path))
+            if background_result == -1:
+                return StreamDockN4ProAnimationResult(
+                    ok=False,
+                    device_type=device_type,
+                    path=path,
+                    background_result=str(background_result),
+                    error="set_frame_background failed: SDK returned -1",
+                )
+
+        frames_rendered = 0
+        next_frame_at = monotonic()
+        for frame_index in range(frame_budget):
+            for key, paths in normalized_frames.items():
+                frame_path = paths[frame_index % len(paths)]
+                key_result = device.set_key_image(key, str(frame_path))
+                if key_result == -1:
+                    return StreamDockN4ProAnimationResult(
+                        ok=False,
+                        device_type=device_type,
+                        path=path,
+                        background_result=_stringify_optional(background_result),
+                        frames_rendered=frames_rendered,
+                        key_count=len(normalized_frames),
+                        error=f"set_key_image failed for key {key}: SDK returned -1",
+                    )
+            device.refresh()
+            frames_rendered += 1
+            next_frame_at += frame_interval
+            delay = next_frame_at - monotonic()
+            if delay > 0 and frame_index + 1 < frame_budget:
+                sleep(delay)
+
+        return StreamDockN4ProAnimationResult(
+            ok=True,
+            device_type=device_type,
+            path=path,
+            background_result=_stringify_optional(background_result),
+            frames_rendered=frames_rendered,
+            key_count=len(normalized_frames),
+        )
+    except Exception as exc:
+        return StreamDockN4ProAnimationResult(
             ok=False,
             device_type=device_type,
             path=path,

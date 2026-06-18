@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 from agent_deck.adapters.codex_app_state import (
     build_codex_app_state_events,
     scan_codex_app_state,
+    select_active_codex_app_sessions,
 )
 from agent_deck.core.events import EventType
+from agent_deck.core.state import AgentStatus
 
 
 def _create_state_db(path: Path, rollout_path: Path) -> None:
@@ -144,6 +147,101 @@ def _write_rollout(path: Path) -> None:
     )
 
 
+def _write_tool_rollout(path: Path, *, completed: bool = False) -> None:
+    """写入包含普通工具调用的 Codex rollout JSONL。
+
+    入参：`path` 是输出 JSONL 路径；`completed` 控制是否补匹配的 `function_call_output`。
+    返回：无返回值。
+    错误处理：文件写入或 JSON 序列化失败由标准异常报告。
+    副作用：在 pytest 临时目录写入一个 JSONL 文件。
+    """
+
+    rows: list[dict[str, object]] = [
+        {
+            "timestamp": "2026-06-18T09:00:00.000Z",
+            "payload": {
+                "type": "function_call",
+                "call_id": "tool-call",
+                "name": "shell",
+                "arguments": "{}",
+            },
+        }
+    ]
+    if completed:
+        rows.append(
+            {
+                "timestamp": "2026-06-18T09:00:01.000Z",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "tool-call",
+                    "output": "{}",
+                },
+            }
+        )
+    path.write_text(
+        "".join(f"{json.dumps(row, ensure_ascii=False)}\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def _create_state_db_with_threads(
+    path: Path,
+    rows: list[tuple[str, Path, int, str, str]],
+) -> None:
+    """创建包含多条 Codex thread 的最小 state SQLite 数据库。
+
+    入参：`path` 是数据库路径；`rows` 每项为 `(id, rollout_path, updated_at, cwd, title)`。
+    返回：无返回值。
+    错误处理：SQLite 写入失败由 sqlite3 抛出并交给 pytest。
+    副作用：在 pytest 临时目录创建 SQLite 文件。
+    """
+
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        create table threads (
+            id text primary key,
+            rollout_path text not null,
+            created_at integer not null,
+            updated_at integer not null,
+            source text not null,
+            model_provider text not null,
+            cwd text not null,
+            title text not null,
+            sandbox_policy text not null,
+            approval_mode text not null,
+            archived integer not null default 0,
+            preview text not null default ''
+        )
+        """
+    )
+    for thread_id, rollout_path, updated_at, cwd, title in rows:
+        conn.execute(
+            """
+            insert into threads (
+                id, rollout_path, created_at, updated_at, source, model_provider,
+                cwd, title, sandbox_policy, approval_mode, archived, preview
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                thread_id,
+                str(rollout_path),
+                updated_at - 10,
+                updated_at,
+                "vscode",
+                "openai",
+                cwd,
+                title,
+                "{}",
+                "never",
+                0,
+                "preview",
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+
 def test_scan_codex_app_state_detects_pending_user_input(tmp_path: Path) -> None:
     """验证扫描器能发现未完成的 Codex App request_user_input。
 
@@ -202,3 +300,63 @@ def test_build_codex_app_state_events_maps_waiting_input(tmp_path: Path) -> None
     assert event.title == "请求用户选择选项"
     assert event.summary == "请选择一个测试选项"
     assert event.payload["call_id"] == "pending-call"
+
+
+def test_select_active_codex_app_sessions_filters_and_infers_status(
+    tmp_path: Path,
+) -> None:
+    """验证活动会话选择器过滤旧/测试 thread 并推断未完成工具调用。
+
+    入参：`tmp_path` 提供 fake Codex home、state DB 和多个 rollout JSONL。
+    返回：无返回值；断言通过代表 1 小时窗口、排除模式和 running_tool 推断生效。
+    错误处理：筛选数量、顺序或状态不符合预期时由 pytest 断言报告。
+    副作用：只读扫描 pytest 临时目录中的 fake 文件。
+    """
+
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    active_rollout = tmp_path / "active.jsonl"
+    test_rollout = tmp_path / "test.jsonl"
+    old_rollout = tmp_path / "old.jsonl"
+    _write_tool_rollout(active_rollout)
+    _write_tool_rollout(test_rollout)
+    _write_tool_rollout(old_rollout, completed=True)
+    now_epoch = 1781773200
+    _create_state_db_with_threads(
+        codex_home / "state_5.sqlite",
+        [
+            (
+                "active-thread",
+                active_rollout,
+                now_epoch - 30,
+                "/Users/kenn/Projects/agent-deck",
+                "实现 Codex 状态按钮",
+            ),
+            (
+                "test-thread",
+                test_rollout,
+                now_epoch - 20,
+                "/Users/kenn/Documents/Codex/2026-06-18/codex-a-b-c",
+                "请求用户选择选项",
+            ),
+            (
+                "old-thread",
+                old_rollout,
+                now_epoch - 7200,
+                "/repo",
+                "两小时前的会话",
+            ),
+        ],
+    )
+
+    report = scan_codex_app_state(codex_home=codex_home, limit=10)
+    sessions = select_active_codex_app_sessions(
+        report,
+        now=datetime.fromtimestamp(now_epoch, tz=UTC),
+        active_window_seconds=3600,
+        max_sessions=10,
+    )
+
+    assert [session.thread_id for session in sessions] == ["active-thread"]
+    assert sessions[0].status == AgentStatus.RUNNING_TOOL
+    assert sessions[0].reason == "pending tool call: shell"

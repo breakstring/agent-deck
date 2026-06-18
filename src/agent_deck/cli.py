@@ -22,8 +22,10 @@ import uvicorn
 
 from agent_deck import __version__
 from agent_deck.adapters.codex_app_state import (
+    CodexAppActiveSession,
     build_codex_app_state_events_from_report,
     scan_codex_app_state,
+    select_active_codex_app_sessions,
 )
 from agent_deck.adapters.codex_discovery import (
     build_codex_detection_report,
@@ -33,7 +35,10 @@ from agent_deck.adapters.codex_discovery import (
 from agent_deck.adapters.codex_quota import read_codex_quota
 from agent_deck.core.decisions import DecisionBehavior
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
+from agent_deck.hardware.streamdock_n4pro import animate_key_images_on_n4pro
 from agent_deck.rendering.asset_builder import build_codex_visual_assets
+from agent_deck.rendering.quota_touchscreen import render_quota_touchscreen
+from agent_deck.rendering.visuals import resolve_visual_icon_spec
 from agent_deck.server.app import DaemonPollerConfig, create_app
 
 DEFAULT_DAEMON_URL = "http://127.0.0.1:8765"
@@ -517,6 +522,185 @@ def codex_app_state(
             "report": report.model_dump(mode="json"),
         }
     )
+
+
+@ctl_app.command("codex-sessions-preview")
+def codex_sessions_preview(
+    codex_home: Annotated[
+        Path | None,
+        typer.Option(
+            "--codex-home",
+            help="Optional CODEX_HOME override for Codex App local state scanning.",
+        ),
+    ] = None,
+    state_db_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--state-db-path",
+            help="Optional explicit Codex App state_*.sqlite path.",
+        ),
+    ] = None,
+    scan_limit: Annotated[
+        int,
+        typer.Option(
+            "--scan-limit",
+            help="Maximum recent Codex App threads to scan before filtering.",
+            min=1,
+        ),
+    ] = 80,
+    active_window_seconds: Annotated[
+        int,
+        typer.Option(
+            "--active-window-seconds",
+            help="Only show unarchived Codex App threads updated within this window.",
+            min=1,
+        ),
+    ] = 3600,
+    max_sessions: Annotated[
+        int,
+        typer.Option(
+            "--max-sessions",
+            help="Maximum sessions to render onto N4 Pro buttons.",
+            min=1,
+            max=10,
+        ),
+    ] = 10,
+    frame_root: Annotated[
+        Path,
+        typer.Option(
+            "--frame-root",
+            help="Generated Codex N4 Pro key frame directory.",
+        ),
+    ] = Path("assets/codex/generated/n4pro-key-112-fps10"),
+    duration_seconds: Annotated[
+        float,
+        typer.Option(
+            "--duration-seconds",
+            help="How long to play the real-device preview animation.",
+            min=0.1,
+        ),
+    ] = 30.0,
+    fps: Annotated[
+        int,
+        typer.Option(
+            "--fps",
+            help="Target N4 Pro button animation refresh rate.",
+            min=1,
+            max=20,
+        ),
+    ] = 10,
+    quota_timeout_seconds: Annotated[
+        float,
+        typer.Option(
+            "--quota-timeout-seconds",
+            help="Seconds to wait for Codex app-server quota responses.",
+            min=1,
+        ),
+    ] = 10.0,
+) -> None:
+    """把最近有效 Codex 会话状态和 quota 一起预览到真实 N4 Pro。
+
+    入参：`codex_home`/`state_db_path`/`scan_limit` 控制 Codex App 本地扫描；
+    `active_window_seconds` 和 `max_sessions` 控制“有效会话”过滤；`frame_root` 指向
+    `generate-codex-assets` 产出的按键帧目录；`duration_seconds`/`fps` 控制真机动画时长；
+    `quota_timeout_seconds` 控制 quota app-server 读取超时。
+    返回：无显式返回值；成功时输出本次扫描、筛选、渲染和硬件下发结果 JSON。
+    错误处理：扫描、quota、帧目录或硬件写入失败时写 stderr 并 exit 1；参数范围错误由 Typer
+    以 exit 2 处理。
+    副作用：只读访问 Codex App 本地状态和 rollout；启动短生命周期 Codex app-server 读取
+    quota；接管真实 N4 Pro 一次 open/init，在底部背景显示 quota，并循环写主按键动画。
+    """
+
+    try:
+        report = scan_codex_app_state(
+            codex_home=codex_home,
+            state_db_path=state_db_path,
+            limit=scan_limit,
+        )
+        sessions = select_active_codex_app_sessions(
+            report,
+            active_window_seconds=active_window_seconds,
+            max_sessions=max_sessions,
+        )
+        quota_snapshot = read_codex_quota(timeout_seconds=quota_timeout_seconds)
+        background = render_quota_touchscreen(quota_snapshot)
+        key_frame_paths = _codex_session_key_frame_paths(
+            frame_root=frame_root,
+            sessions=sessions,
+        )
+        render_result = animate_key_images_on_n4pro(
+            background_image=background,
+            key_frame_paths=key_frame_paths,
+            duration_seconds=duration_seconds,
+            fps=fps,
+        )
+    except Exception as exc:
+        typer.echo(f"agent-deckctl codex-sessions-preview: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    payload = {
+        "active_window_seconds": active_window_seconds,
+        "max_sessions": max_sessions,
+        "sessions": [session.model_dump(mode="json") for session in sessions],
+        "key_count": len(key_frame_paths),
+        "quota": quota_snapshot.model_dump(mode="json"),
+        "render": render_result.model_dump(mode="json"),
+    }
+    if not render_result.ok:
+        _echo_json(payload)
+        raise typer.Exit(1)
+    _echo_json(payload)
+
+
+def _codex_session_key_frame_paths(
+    *,
+    frame_root: Path,
+    sessions: tuple[CodexAppActiveSession, ...],
+) -> dict[int, tuple[Path, ...]]:
+    """把活动 Codex 会话映射成 N4 Pro 物理按钮编号和本地动画帧路径。
+
+    入参：`frame_root` 是生成资产根目录；`sessions` 是已过滤并排序的活动会话列表。
+    返回：dict，key 为 N4 Pro 物理按钮编号 1..10，value 为该状态对应的 PNG 帧路径元组。
+    错误处理：frame root、状态子目录、offline 静态图或任何帧文件缺失时抛 `FileNotFoundError`。
+    副作用：只读取文件系统元数据，不打开图片、不访问硬件。
+    """
+
+    resolved_root = frame_root.expanduser().resolve()
+    if not resolved_root.is_dir():
+        raise FileNotFoundError(f"Codex key frame root not found: {resolved_root}")
+
+    mapping: dict[int, tuple[Path, ...]] = {}
+    for index, session in enumerate(sessions[:10], start=1):
+        spec = resolve_visual_icon_spec(session.status)
+        mapping[index] = _codex_variant_frame_paths(
+            frame_root=resolved_root,
+            variant_id=spec.variant_id,
+        )
+    return mapping
+
+
+def _codex_variant_frame_paths(*, frame_root: Path, variant_id: str) -> tuple[Path, ...]:
+    """读取某个 Codex 按键视觉变体的帧路径。
+
+    入参：`frame_root` 是已解析的生成资产根目录；`variant_id` 是 `visuals` 映射出的变体名。
+    返回：按文件名排序的 PNG 帧路径元组；offline 静态图返回单帧元组。
+    错误处理：缺少对应目录或 PNG 帧时抛 `FileNotFoundError`。
+    副作用：只读取文件系统元数据。
+    """
+
+    if variant_id == "offline":
+        offline_path = frame_root / "offline.png"
+        if not offline_path.is_file():
+            raise FileNotFoundError(f"Codex offline frame not found: {offline_path}")
+        return (offline_path,)
+
+    variant_dir = frame_root / variant_id
+    if not variant_dir.is_dir():
+        raise FileNotFoundError(f"Codex variant frame directory not found: {variant_dir}")
+    frames = tuple(sorted(variant_dir.glob("frame_*.png")))
+    if not frames:
+        raise FileNotFoundError(f"Codex variant has no PNG frames: {variant_dir}")
+    return frames
 
 
 @ctl_app.command("codex-detect")

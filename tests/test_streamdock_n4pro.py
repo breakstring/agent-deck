@@ -10,7 +10,10 @@ from pathlib import Path
 
 from PIL import Image
 
-from agent_deck.hardware.streamdock_n4pro import render_images_to_n4pro
+from agent_deck.hardware.streamdock_n4pro import (
+    animate_key_images_on_n4pro,
+    render_images_to_n4pro,
+)
 
 
 class FakeN4ProUnifiedDevice:
@@ -215,6 +218,58 @@ def test_render_images_to_n4pro_writes_background_and_keys_once(
     assert device.calls[-1] == ("close", False)
     assert device.paths_seen
     assert all(not path.exists() for path in device.paths_seen)
+
+
+def test_animate_key_images_on_n4pro_keeps_one_device_session(
+    tmp_path: Path,
+) -> None:
+    """验证按键动画预览在一次设备会话里写背景并循环刷新按键。
+
+    入参：`tmp_path` 提供临时背景和按键帧目录。
+    返回：无返回值；断言通过表示 open/init 只发生一次，按键帧循环写入并 refresh。
+    错误处理：调用顺序、帧数或临时文件清理不符合预期时由 pytest 报告。
+    副作用：在 pytest 临时目录写入 PNG/JPEG 文件；不访问真实 N4 Pro。
+    """
+
+    frame_a = tmp_path / "frame_a.png"
+    frame_b = tmp_path / "frame_b.png"
+    Image.new("RGB", (112, 112), (10, 20, 30)).save(frame_a)
+    Image.new("RGB", (112, 112), (30, 20, 10)).save(frame_b)
+    device = FakeN4ProUnifiedDevice(background_result=0, key_result=0)
+    manager = FakeUnifiedManager([device])
+    background = Image.new("RGB", (800, 480), (1, 2, 3))
+
+    result = animate_key_images_on_n4pro(
+        background_image=background,
+        key_frame_paths={1: (frame_a, frame_b)},
+        duration_seconds=0.3,
+        fps=10,
+        manager=manager,
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+
+    assert result.ok is True
+    assert result.frames_rendered == 3
+    assert result.key_count == 1
+    assert [name for name, _ in device.calls] == [
+        "open",
+        "init",
+        "set_frame_background",
+        "set_key_image",
+        "refresh",
+        "set_key_image",
+        "refresh",
+        "set_key_image",
+        "refresh",
+        "close",
+    ]
+    assert [call for call in device.calls if call[0] == "set_key_image"] == [
+        ("set_key_image", 1),
+        ("set_key_image", 1),
+        ("set_key_image", 1),
+    ]
+    assert device.calls[-1] == ("close", False)
 
 
 def test_render_images_to_n4pro_rejects_invalid_key() -> None:
