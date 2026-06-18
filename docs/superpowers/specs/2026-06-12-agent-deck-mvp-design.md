@@ -263,11 +263,11 @@ Codex quota 来自短生命周期 `codex -s read-only -a untrusted app-server` �
 - `agent-deckd` 默认启用 quota poller，启动时先读取一次，之后默认每 300 秒刷新一次。
 - 每次成功读取后，runtime 保存 `CodexQuotaSnapshot`，并用 `render_quota_touchscreen` 渲染
   N4 Pro 的 800x480 触屏背景图；内容只落在底部 `N4PRO_TOUCH_BAR_VIEWPORT`。
-- daemon 默认把这张图下发到 `--streamdock-quota-device n4pro` 对应的真实硬件触屏；没有触屏能力
-  或不希望接管硬件时，可用 `--disable-streamdock-quota-touchscreen` 关闭。
-- 当启用 `--enable-streamdock-n4pro-renderer` 时，daemon 使用统一 N4 Pro renderer 在同一次
-  设备会话里写 quota 背景和 Codex 状态按钮动画；此时 quota-only 真实触屏 sink 自动关闭，
-  避免两条硬件写入路径互相 `init()` 清屏。
+- daemon 默认执行真实硬件渲染；`agent-deck.toml` 的默认 device profile 是 `n4pro`，因此当前
+  内部会使用统一 N4 Pro renderer 在同一次设备会话里写 quota 背景和 Codex 状态按钮动画。
+  此时 quota-only 真实触屏 sink 自动关闭，避免两条硬件写入路径互相 `init()` 清屏。
+- 没有触屏能力、不希望接管硬件，或需要排查旧 quota-only 下发链路时，可用
+  `--disable-hardware-renderer` 和 `--disable-streamdock-quota-touchscreen` 组合关闭真实硬件写入。
 - `/status` 暴露最新 quota snapshot、更新时间、最近错误、触屏图渲染计数和真实
   StreamDock 下发结果；统一 renderer 还会暴露最近一次背景+按钮下发结果，便于判断是
   quota 读取失败、图片渲染失败、帧目录缺失还是设备被占用。
@@ -276,9 +276,10 @@ Codex quota 来自短生命周期 `codex -s read-only -a untrusted app-server` �
 
 命令行可用 `--disable-codex-quota-poller` 关闭 quota 刷新，用
 `--codex-quota-poll-interval-seconds` 调整刷新间隔，用 `--codex-quota-timeout-seconds`
-控制单次 app-server 读取超时。`--streamdock-quota-device` 当前默认 `n4pro`，未来扩展到没有
-触屏或触屏尺寸不同的设备时，应通过设备能力 profile 决定是否显示 quota panel 以及使用哪种
-renderer。
+控制单次 app-server 读取超时。真实硬件渲染的 `device_profile`、`render_interval_seconds`、
+`fps` 和 `frame_root` 默认值写在 `agent-deck.toml`；CLI 提供 `--device-profile`、
+`--render-interval-seconds` 和 `--renderer-fps` 作为临时覆盖项。未来扩展到没有触屏或触屏尺寸
+不同的设备时，应通过设备能力 profile 决定是否显示 quota panel 以及使用哪种 renderer。
 
 由于 `notify` 和 `otel` 不能由项目级 `.codex/config.toml` 设置，安装器只能改用户级 `~/.codex/config.toml`，并必须先备份。
 

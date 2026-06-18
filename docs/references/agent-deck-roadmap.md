@@ -116,11 +116,13 @@ flowchart LR
 
 12. N4 Pro renderer
     根据 DeckMode 生成 slot icons、详情屏、决策界面、LED 聚合状态。
-    当前 daemon 已提供显式 `--enable-streamdock-n4pro-renderer` 模式：从 runtime layout
+    当前 daemon 默认执行真实硬件渲染，`agent-deck.toml` 的默认 device profile 是 `n4pro`：
+    内部 N4 Pro renderer 从 runtime layout
     读取前 10 个 Codex agent slot 的 `VisualIconSpec.variant_id`，加载
     `assets/codex/generated/n4pro-key-112-fps10/` 下的预渲染帧，并在同一次 N4 Pro 设备会话里
-    下发 quota 背景和按键动画。该模式启用时会替代旧的 quota-only 真实触屏下发，避免
-    多个 SDK `init()` 路径互相清屏。
+    下发 quota 背景和按键动画。该模式默认替代旧的 quota-only 真实触屏下发，避免
+    多个 SDK `init()` 路径互相清屏；需要纯内存/fake 运行时可用 `--disable-hardware-renderer`。
+    渲染间隔、FPS、设备 profile 和帧目录默认值放在 `agent-deck.toml`，CLI 只提供通用覆盖项。
 
 13. Codex 视觉资产生成器
     将 `assets/codex/codex.gif` 按目标设备 profile 预渲染成状态帧序列、每状态
@@ -130,11 +132,10 @@ flowchart LR
 
 14. Codex quota poller + N4 Pro touch panel
     通过 Codex app-server 读取 quota，默认 5 分钟刷新一次；成功后保存 runtime snapshot，
-    渲染到底部 N4 Pro touch-bar viewport，并默认下发到 `streamdock_quota_device=n4pro`。
+    渲染到底部 N4 Pro touch-bar viewport，并默认交给真实硬件 renderer 下发。
     渲染层显示剩余百分比，不改 adapter 的 `used_percent` 原始语义。未来没有触屏能力的设备
-    应通过 device profile 禁用该 panel 或切换到其他显示方式。若 daemon 启用统一 N4 Pro
-    renderer，则 quota poller 只更新 runtime snapshot 和 fake touch panel，不再单独调用
-    quota-only 真实硬件 sink。
+    应通过 device profile 禁用该 panel 或切换到其他显示方式。若 daemon 禁用真实硬件
+    renderer，则可回退到 quota-only 真实硬件 sink 或纯 fake surface。
 
 15. action executor
     实现 focus target、tmux、AppleScript 激活、递归熔断。

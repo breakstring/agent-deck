@@ -355,9 +355,9 @@ def test_daemon_callback_calls_uvicorn_run(monkeypatch: Any) -> None:
     assert poller_config.codex_quota_enabled is True
     assert poller_config.codex_quota_interval_seconds == 300.0
     assert poller_config.codex_quota_timeout_seconds == 10.0
-    assert poller_config.streamdock_quota_touchscreen_enabled is True
+    assert poller_config.streamdock_quota_touchscreen_enabled is False
     assert poller_config.streamdock_quota_device == "n4pro"
-    assert poller_config.streamdock_n4pro_renderer_enabled is False
+    assert poller_config.streamdock_n4pro_renderer_enabled is True
     assert poller_config.streamdock_n4pro_render_interval_seconds == 2.0
     assert poller_config.streamdock_n4pro_renderer_fps == 5
 
@@ -386,6 +386,7 @@ def test_daemon_callback_can_disable_codex_pollers(monkeypatch: Any) -> None:
             "--disable-codex-app-state-poller",
             "--disable-codex-quota-poller",
             "--disable-streamdock-quota-touchscreen",
+            "--disable-hardware-renderer",
         ],
     )
 
@@ -394,16 +395,18 @@ def test_daemon_callback_can_disable_codex_pollers(monkeypatch: Any) -> None:
     assert poller_config.codex_app_state_enabled is False
     assert poller_config.codex_quota_enabled is False
     assert poller_config.streamdock_quota_touchscreen_enabled is False
+    assert poller_config.streamdock_n4pro_renderer_enabled is False
 
 
-def test_daemon_callback_can_enable_unified_n4pro_renderer(
+def test_daemon_callback_configures_default_unified_n4pro_renderer(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
-    """Verify daemon CLI enables unified N4 Pro renderer without quota-only sink.
+    """Verify daemon CLI configures default unified N4 Pro renderer.
 
     入参：`monkeypatch` 替换 `uvicorn.run` 与 `create_app`；`tmp_path` 提供 fake frame root。
-    返回：无返回值；断言通过代表 unified renderer 参数进入 poller config，并和旧硬件 sink 互斥。
+    返回：无返回值；断言通过代表 unified renderer 默认启用、参数进入 poller config，
+    并和旧硬件 sink 互斥。
     错误处理：命令失败、配置未启用或互斥失效时由 pytest 报告。
     副作用：只运行 Typer in-process，不启动真实 daemon 或访问硬件。
     """
@@ -421,13 +424,12 @@ def test_daemon_callback_can_enable_unified_n4pro_renderer(
     result = runner.invoke(
         cli.daemon_app,
         [
-            "--enable-streamdock-n4pro-renderer",
-            "--streamdock-n4pro-render-interval-seconds",
+            "--render-interval-seconds",
             "1.5",
-            "--streamdock-n4pro-renderer-fps",
+            "--renderer-fps",
             "7",
-            "--streamdock-n4pro-frame-root",
-            str(frame_root),
+            "--config",
+            str(tmp_path / "missing-agent-deck.toml"),
         ],
     )
 
@@ -437,6 +439,55 @@ def test_daemon_callback_can_enable_unified_n4pro_renderer(
     assert poller_config.streamdock_n4pro_renderer_enabled is True
     assert poller_config.streamdock_n4pro_render_interval_seconds == 1.5
     assert poller_config.streamdock_n4pro_renderer_fps == 7
+    assert poller_config.streamdock_n4pro_frame_root == Path(
+        "assets/codex/generated/n4pro-key-112-fps10"
+    )
+
+
+def test_daemon_callback_reads_hardware_renderer_config(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Verify daemon CLI reads generic hardware renderer defaults from TOML.
+
+    入参：`monkeypatch` 替换 `uvicorn.run` 与 `create_app`；`tmp_path` 提供 fake config。
+    返回：无返回值；断言通过代表通用配置文件映射到当前 N4 Pro renderer 实现参数。
+    错误处理：命令失败或配置未进入 poller config 时由 pytest 报告。
+    副作用：只写 pytest 临时 TOML，不启动真实 daemon 或访问硬件。
+    """
+
+    create_app_calls: list[dict[str, Any]] = []
+    config_path = tmp_path / "agent-deck.toml"
+    frame_root = tmp_path / "frames"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[hardware_renderer]",
+                "enabled = true",
+                'device_profile = "n4pro"',
+                "render_interval_seconds = 3.5",
+                "fps = 8",
+                f'frame_root = "{frame_root}"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_app = object()
+    monkeypatch.setattr(
+        cli,
+        "create_app",
+        lambda **kwargs: create_app_calls.append(kwargs) or fake_app,
+    )
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
+
+    result = runner.invoke(cli.daemon_app, ["--config", str(config_path)])
+
+    assert result.exit_code == 0
+    poller_config = create_app_calls[0]["poller_config"]
+    assert poller_config.streamdock_quota_device == "n4pro"
+    assert poller_config.streamdock_n4pro_renderer_enabled is True
+    assert poller_config.streamdock_n4pro_render_interval_seconds == 3.5
+    assert poller_config.streamdock_n4pro_renderer_fps == 8
     assert poller_config.streamdock_n4pro_frame_root == frame_root
 
 

@@ -1,0 +1,6 @@
+[hardware_renderer]
+enabled = true
+device_profile = "n4pro"
+render_interval_seconds = 2.0
+fps = 5
+frame_root = "assets/codex/generated/n4pro-key-112-fps10"

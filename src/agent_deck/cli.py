@@ -4,8 +4,8 @@
 Codex App 本地状态扫描命令分派、真实 N4 Pro 预览命令，以及打包后的 console scripts
 启动 uvicorn。它不持久化 daemon 状态、不实现 broker 业务逻辑；默认命令不修改用户文件，
 只有用户显式运行 `codex-install --apply` 时才会写 Codex 配置。网络副作用限于用户显式执行
-命令时访问配置的本地 daemon URL，并使用有界 httpx timeout；真实硬件副作用仅在用户显式
-启用 N4 Pro preview/renderer 相关命令或 daemon 选项时发生。
+命令时访问配置的本地 daemon URL，并使用有界 httpx timeout；daemon 默认会按本地配置启用
+真实硬件渲染，用户可用 `--disable-hardware-renderer` 临时关闭。
 """
 
 from __future__ import annotations
@@ -22,6 +22,11 @@ import typer
 import uvicorn
 
 from agent_deck import __version__
+from agent_deck.config import (
+    AgentDeckConfigError,
+    load_agent_deck_config,
+    resolve_hardware_renderer_defaults,
+)
 from agent_deck.adapters.codex_app_state import (
     CodexAppActiveSession,
     build_codex_app_state_events_from_report,
@@ -160,44 +165,44 @@ def daemon_callback(
             help="Disable sending rendered quota panel images to StreamDock hardware.",
         ),
     ] = False,
-    streamdock_quota_device: Annotated[
-        str,
+    config_path: Annotated[
+        Path,
         typer.Option(
-            "--streamdock-quota-device",
-            help="StreamDock device profile for quota touchscreen rendering.",
+            "--config",
+            help="Agent Deck TOML config path for daemon defaults.",
         ),
-    ] = "n4pro",
-    enable_streamdock_n4pro_renderer: Annotated[
+    ] = Path("agent-deck.toml"),
+    disable_hardware_renderer: Annotated[
         bool,
         typer.Option(
-            "--enable-streamdock-n4pro-renderer",
-            help="Enable unified N4 Pro rendering for quota background and animated Codex keys.",
+            "--disable-hardware-renderer",
+            help="Disable real hardware rendering; daemon still updates in-memory/fake layout.",
         ),
     ] = False,
-    streamdock_n4pro_render_interval_seconds: Annotated[
-        float,
+    device_profile: Annotated[
+        str | None,
         typer.Option(
-            "--streamdock-n4pro-render-interval-seconds",
-            help="Seconds per unified N4 Pro render window.",
+            "--device-profile",
+            help="Override hardware device profile from config; default config uses n4pro.",
+        ),
+    ] = None,
+    render_interval_seconds: Annotated[
+        float | None,
+        typer.Option(
+            "--render-interval-seconds",
+            help="Override real hardware render interval from config.",
             min=0.5,
         ),
-    ] = 2.0,
-    streamdock_n4pro_renderer_fps: Annotated[
-        int,
+    ] = None,
+    renderer_fps: Annotated[
+        int | None,
         typer.Option(
-            "--streamdock-n4pro-renderer-fps",
-            help="Button animation FPS for the unified N4 Pro renderer.",
+            "--renderer-fps",
+            help="Override real hardware button animation FPS from config.",
             min=1,
             max=20,
         ),
-    ] = 5,
-    streamdock_n4pro_frame_root: Annotated[
-        Path,
-        typer.Option(
-            "--streamdock-n4pro-frame-root",
-            help="Generated Codex N4 Pro key frame directory.",
-        ),
-    ] = Path("assets/codex/generated/n4pro-key-112-fps10"),
+    ] = None,
 ) -> None:
     """Start the local daemon when no daemon subcommand is selected.
 
@@ -207,23 +212,40 @@ def daemon_callback(
     `disable_codex_quota_poller` 可关闭默认 Codex pollers；状态 scan limit、active window
     和 active session limit 控制 Codex App 最近有效会话筛选；两个 interval 控制状态扫描和
     quota 刷新周期；`codex_quota_timeout_seconds` 控制单次 quota app-server 读取超时；
-    `disable_streamdock_quota_touchscreen` 可关闭默认真实硬件触屏下发；`streamdock_quota_device`
-    是 quota 触屏目标设备 profile，当前默认 `n4pro`；`enable_streamdock_n4pro_renderer`
-    启用统一 N4 Pro quota 背景+按钮动画 renderer，并自动替代 quota-only 硬件下发；
-    `streamdock_n4pro_render_interval_seconds`、`streamdock_n4pro_renderer_fps` 和
-    `streamdock_n4pro_frame_root` 控制统一 renderer 的播放窗口、帧率和 generated 帧目录。
+    `disable_streamdock_quota_touchscreen` 可关闭旧 quota-only 真实硬件触屏下发；
+    `config_path` 指向 daemon 默认配置；`disable_hardware_renderer` 可关闭默认真实硬件渲染；
+    `device_profile`、`render_interval_seconds` 和 `renderer_fps` 是面向临时调试的通用覆盖项，
+    未传时沿用配置文件，当前默认设备 profile 为 `n4pro`。
     返回：无显式返回值；`uvicorn.run` 负责阻塞运行 ASGI app。
     错误处理：Typer 处理 CLI 参数错误，包括非法端口、poll interval 或 timeout 范围；
     `create_app` 或 `uvicorn.run` 抛出的异常会向上传播并使命令失败。
     副作用：当没有子命令时创建 FastAPI app 并启动 uvicorn；默认启用 Codex App 本地状态
-    只读 poller、quota poller 和 StreamDock N4 Pro quota 触屏下发；quota poller 会周期性启动
-    短生命周期 Codex app-server，并在成功时可能接管 N4 Pro 触屏显示；若启用统一 renderer，
-    则由统一 renderer 接管 N4 Pro 背景和按钮，旧 quota-only sink 不再下发；不写用户配置、
-    不安装 Codex hooks。
+    只读 poller、quota poller 和真实硬件渲染；quota poller 会周期性启动短生命周期 Codex
+    app-server；默认由统一硬件 renderer 接管背景和按钮，旧 quota-only sink 不再下发；
+    若需要纯内存/fake 运行，可用 `--disable-hardware-renderer`；
+    不写用户配置、不安装 Codex hooks。
     """
 
     if ctx.invoked_subcommand is not None:
         return
+    try:
+        local_config = load_agent_deck_config(config_path)
+        hardware_renderer = resolve_hardware_renderer_defaults(
+            local_config,
+            disabled=disable_hardware_renderer,
+            device_profile=device_profile,
+            render_interval_seconds=render_interval_seconds,
+            fps=renderer_fps,
+        )
+    except (AgentDeckConfigError, ValueError) as exc:
+        typer.echo(f"agent-deckd: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if hardware_renderer.device_profile != "n4pro" and hardware_renderer.enabled:
+        typer.echo(
+            "agent-deckd: 当前真实硬件 renderer 只支持 device_profile=n4pro",
+            err=True,
+        )
+        raise typer.Exit(2)
     poller_config = DaemonPollerConfig(
         codex_app_state_enabled=not disable_codex_app_state_poller,
         codex_app_state_interval_seconds=codex_app_state_poll_interval_seconds,
@@ -235,15 +257,15 @@ def daemon_callback(
         codex_quota_timeout_seconds=codex_quota_timeout_seconds,
         streamdock_quota_touchscreen_enabled=(
             not disable_streamdock_quota_touchscreen
-            and not enable_streamdock_n4pro_renderer
+            and not hardware_renderer.enabled
         ),
-        streamdock_quota_device=streamdock_quota_device,
-        streamdock_n4pro_renderer_enabled=enable_streamdock_n4pro_renderer,
+        streamdock_quota_device=hardware_renderer.device_profile,
+        streamdock_n4pro_renderer_enabled=hardware_renderer.enabled,
         streamdock_n4pro_render_interval_seconds=(
-            streamdock_n4pro_render_interval_seconds
+            hardware_renderer.render_interval_seconds
         ),
-        streamdock_n4pro_renderer_fps=streamdock_n4pro_renderer_fps,
-        streamdock_n4pro_frame_root=streamdock_n4pro_frame_root,
+        streamdock_n4pro_renderer_fps=hardware_renderer.fps,
+        streamdock_n4pro_frame_root=hardware_renderer.frame_root,
     )
     uvicorn.run(create_app(poller_config=poller_config), host=host, port=port)
 
