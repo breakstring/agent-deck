@@ -191,6 +191,7 @@ def test_codex_quota_poller_sends_touchscreen_to_streamdock_sink() -> None:
     assert len(sink_images) == 1
     assert getattr(sink_images[0], "size") == (800, 480)
     assert status["codex_quota"]["streamdock_touchscreen"] == {
+        "background_api": None,
         "device_type": "FakeN4ProDevice",
         "error": None,
         "ok": True,
