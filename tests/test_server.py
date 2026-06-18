@@ -389,6 +389,7 @@ def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
         "key_count": 1,
         "ok": True,
         "path": "n4pro-path",
+        "timing_seconds": {},
     }
     assert status["streamdock_n4pro_renderer"]["last_error"] is None
     assert status["codex_quota"]["streamdock_touchscreen"] is None

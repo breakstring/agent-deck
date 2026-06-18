@@ -40,7 +40,7 @@ from agent_deck.core.state import AgentState, AgentStateStore
 from agent_deck.hardware.fake import FakeHardwareSurface
 from agent_deck.hardware.streamdock_n4pro import (
     StreamDockN4ProAnimationResult,
-    animate_key_images_on_n4pro,
+    StreamDockN4ProPersistentAnimator,
 )
 from agent_deck.hardware.streamdock_touchscreen import (
     StreamDockTouchscreenRenderResult,
@@ -596,7 +596,7 @@ def create_app(
     codex_app_active_sessions_reader: CodexAppActiveSessionsReader = read_codex_app_active_sessions,
     codex_quota_reader: CodexQuotaReader = read_codex_quota,
     quota_touchscreen_sink: QuotaTouchscreenSink = render_touchscreen_image_to_n4pro,
-    streamdock_n4pro_renderer_sink: StreamDockN4ProRendererSink = animate_key_images_on_n4pro,
+    streamdock_n4pro_renderer_sink: StreamDockN4ProRendererSink | None = None,
 ) -> FastAPI:
     """Create the local daemon FastAPI app without binding sockets.
 
@@ -605,7 +605,8 @@ def create_app(
     `codex_app_active_sessions_reader` 读取最近有效 Codex App 会话，生产默认只读扫描本机状态；
     `codex_quota_reader` 是可注入 reader，生产默认读取真实本机 Codex quota；
     `quota_touchscreen_sink` 是 quota-only 真实硬件触屏下发函数，仅在配置启用时调用；
-    `streamdock_n4pro_renderer_sink` 是统一背景+按钮真实硬件下发函数，测试可替换。
+    `streamdock_n4pro_renderer_sink` 是统一背景+按钮真实硬件下发函数，测试可替换；为空时
+    使用 daemon 专用 persistent sink，避免每轮渲染都 close/open N4 Pro。
     返回：配置好路由且持有 in-memory runtime 的 `FastAPI` ASGI app。
     错误处理：对象构造失败会直接抛出；poller 单次失败会记录到 status，不让 app 启动失败。
     副作用：总是分配内存对象并注册路由；只有显式启用 poller 时，lifespan startup 才会只读访问
@@ -613,6 +614,9 @@ def create_app(
     """
 
     resolved_poller_config = poller_config or DaemonPollerConfig()
+    resolved_streamdock_n4pro_renderer_sink: StreamDockN4ProRendererSink = (
+        streamdock_n4pro_renderer_sink or StreamDockN4ProPersistentAnimator()
+    )
     runtime = _DaemonRuntime(
         store=AgentStateStore(),
         broker=DecisionBroker(),
@@ -650,7 +654,7 @@ def create_app(
                 codex_app_active_sessions_reader,
                 codex_quota_reader,
                 quota_touchscreen_sink,
-                streamdock_n4pro_renderer_sink,
+                resolved_streamdock_n4pro_renderer_sink,
             )
         if resolved_poller_config.codex_app_state_enabled:
             tasks.append(
@@ -697,7 +701,7 @@ def create_app(
                         ),
                         fps=resolved_poller_config.streamdock_n4pro_renderer_fps,
                         frame_root=resolved_poller_config.streamdock_n4pro_frame_root,
-                        renderer_sink=streamdock_n4pro_renderer_sink,
+                        renderer_sink=resolved_streamdock_n4pro_renderer_sink,
                     )
                 )
             )
@@ -709,6 +713,13 @@ def create_app(
             for task in tasks:
                 with suppress(asyncio.CancelledError):
                     await task
+            close_renderer = getattr(
+                resolved_streamdock_n4pro_renderer_sink,
+                "close",
+                None,
+            )
+            if callable(close_renderer):
+                close_renderer()
 
     app = FastAPI(title="Agent Deck Daemon API", lifespan=lifespan)
     app.state.runtime = runtime

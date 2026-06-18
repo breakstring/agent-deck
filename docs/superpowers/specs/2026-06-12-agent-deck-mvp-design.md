@@ -286,6 +286,8 @@ Codex quota 来自短生命周期 `codex -s read-only -a untrusted app-server` �
 当前 N4 Pro 默认渲染节奏是 3 秒一次、10fps，用来对齐 30 帧 key 动画资产并播放完整动画周期。
 渲染循环调度时必须把单次硬件播放耗时计入这个周期；如果播放本身已经用了 2.9 秒，则下一轮
 最多只等待约 0.1 秒，不能在完整动画之后再固定 sleep 一个完整 interval。
+daemon 真实硬件 renderer 默认使用 persistent N4 Pro sink，首次 open/init 后复用设备会话，
+避免每轮 `close(notify=False)` 带来的多秒级停顿；一次性 CLI preview 仍允许短会话 close。
 
 由于 `notify` 和 `otel` 不能由项目级 `.codex/config.toml` 设置，安装器只能改用户级 `~/.codex/config.toml`，并必须先备份。
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from PIL import Image
 
 from agent_deck.hardware.streamdock_n4pro import (
+    StreamDockN4ProPersistentAnimator,
     animate_key_images_on_n4pro,
     render_images_to_n4pro,
 )
@@ -269,6 +270,89 @@ def test_animate_key_images_on_n4pro_keeps_one_device_session(
         ("set_key_image", 1),
         ("set_key_image", 1),
     ]
+    assert device.calls[-1] == ("close", False)
+
+
+def test_animate_key_images_on_n4pro_reports_timing_diagnostics(
+    tmp_path: Path,
+) -> None:
+    """验证按键动画结果会暴露关键阶段耗时。
+
+    入参：`tmp_path` 提供临时帧文件；测试内注入 deterministic monotonic 和 no-op sleep。
+    返回：无返回值；断言通过表示 status 可用于判断停顿来自 setup、播放还是 close。
+    错误处理：缺少 timing 字段或字段值不符合递增时钟时由 pytest 报告。
+    副作用：只写 pytest 临时 PNG 文件；不访问真实 N4 Pro。
+    """
+
+    frame = tmp_path / "frame.png"
+    Image.new("RGB", (112, 112), (10, 20, 30)).save(frame)
+    device = FakeN4ProUnifiedDevice(background_result=0, key_result=0)
+    manager = FakeUnifiedManager([device])
+    times = iter((0.0, 0.1, 0.2, 0.3, 0.9, 1.0, 1.1, 1.2))
+
+    result = animate_key_images_on_n4pro(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={1: (frame,)},
+        duration_seconds=0.5,
+        fps=2,
+        manager=manager,
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+        monotonic=lambda: next(times),
+    )
+
+    assert result.ok is True
+    assert result.timing_seconds == {
+        "open_init": 0.1,
+        "background": 0.1,
+        "first_frame": 0.1,
+        "playback": 0.7,
+        "close": 0.1,
+        "total": 1.2,
+    }
+
+
+def test_persistent_animator_reuses_open_device_between_calls(
+    tmp_path: Path,
+) -> None:
+    """验证 daemon 用 persistent animator 不会每轮 close/open 造成停顿。
+
+    入参：`tmp_path` 提供临时帧和背景目录。
+    返回：无返回值；断言通过表示两轮渲染只 open/init 一次，中间不 close。
+    错误处理：重复 open/init 或自动 close 会由 pytest 报告。
+    副作用：只操作 fake device 和 pytest 临时文件，不访问真实 N4 Pro。
+    """
+
+    frame = tmp_path / "frame.png"
+    Image.new("RGB", (112, 112), (10, 20, 30)).save(frame)
+    device = FakeN4ProUnifiedDevice(background_result=0, key_result=0)
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=FakeUnifiedManager([device]),
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+
+    first = animator(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={1: (frame,)},
+        duration_seconds=0.1,
+        fps=10,
+    )
+    second = animator(
+        background_image=Image.new("RGB", (800, 480), (3, 2, 1)),
+        key_frame_paths={1: (frame,)},
+        duration_seconds=0.1,
+        fps=10,
+    )
+
+    assert first.ok is True
+    assert second.ok is True
+    assert [call for call in device.calls if call[0] == "open"] == [("open", None)]
+    assert [call for call in device.calls if call[0] == "init"] == [("init", None)]
+    assert [call for call in device.calls if call[0] == "close"] == []
+
+    animator.close()
+
     assert device.calls[-1] == ("close", False)
 
 
