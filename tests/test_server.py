@@ -10,13 +10,18 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
+from PIL import Image
 
+from agent_deck.adapters.codex_app_state import CodexAppActiveSession
 from agent_deck.adapters.codex_quota import CodexQuotaSnapshot
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
+from agent_deck.core.state import AgentStatus
+from agent_deck.hardware.streamdock_n4pro import StreamDockN4ProAnimationResult
 from agent_deck.hardware.streamdock_touchscreen import StreamDockTouchscreenRenderResult
 from agent_deck.server.app import DaemonPollerConfig, create_app
 
@@ -83,6 +88,7 @@ def test_codex_app_state_poller_applies_input_requested_event() -> None:
     app = create_app(
         poller_config=DaemonPollerConfig(codex_app_state_enabled=True),
         codex_app_state_event_reader=fake_codex_app_state_reader,
+        codex_app_active_sessions_reader=lambda **_: (),
     )
     with TestClient(app) as client:
         status = client.get("/status").json()
@@ -92,6 +98,65 @@ def test_codex_app_state_poller_applies_input_requested_event() -> None:
     assert status["agents"][0]["last_summary"] == "请选择一个测试选项"
     assert status["pollers"]["codex_app_state"]["last_error"] is None
     assert status["pollers"]["codex_app_state"]["last_polled_at"] is not None
+
+
+def test_codex_app_state_poller_applies_active_sessions() -> None:
+    """Verify daemon startup poller syncs recent Codex App sessions into state.
+
+    入参：无；测试内注入空 pending-event reader 和 fake active session reader。
+    返回：无返回值；断言通过代表本地扫描出的 running_tool 会话会进入 AgentStateStore。
+    错误处理：若 active session 未创建 agent 或状态/工具名不符合预期，由 pytest 报告。
+    副作用：仅修改测试 app 的内存 runtime，不读取真实 `~/.codex`。
+    """
+
+    reader_calls: list[dict[str, object]] = []
+
+    def fake_active_sessions_reader(**kwargs: object) -> tuple[CodexAppActiveSession]:
+        """返回一个 running_tool 活动会话并记录筛选参数。
+
+        入参：`kwargs` 是 daemon 传给 active session reader 的扫描/筛选参数。
+        返回：包含单个 `CodexAppActiveSession` 的 tuple。
+        错误处理：模型字段非法时由 Pydantic 抛出。
+        副作用：记录调用参数。
+        """
+
+        reader_calls.append(kwargs)
+        return (
+            CodexAppActiveSession(
+                thread_id="thread-1",
+                title="实现 Codex 状态按钮",
+                cwd="/repo",
+                rollout_path="/tmp/rollout.jsonl",
+                updated_at=1781773200,
+                status=AgentStatus.RUNNING_TOOL,
+                reason="pending tool call: shell",
+            ),
+        )
+
+    app = create_app(
+        poller_config=DaemonPollerConfig(
+            codex_app_state_enabled=True,
+            codex_app_state_scan_limit=42,
+            codex_app_active_window_seconds=1800,
+            codex_app_active_session_limit=6,
+        ),
+        codex_app_state_event_reader=lambda: (),
+        codex_app_active_sessions_reader=fake_active_sessions_reader,
+    )
+    with TestClient(app) as client:
+        status = client.get("/status").json()
+
+    assert reader_calls == [
+        {
+            "active_window_seconds": 1800,
+            "max_sessions": 6,
+            "scan_limit": 42,
+        }
+    ]
+    assert status["agents"][0]["agent_key"] == "codex:thread-1"
+    assert status["agents"][0]["status"] == "running_tool"
+    assert status["agents"][0]["active_tool"] == "shell"
+    assert status["layout"]["keys"][0]["visual"]["variant_id"] == "working"
 
 
 def test_codex_quota_poller_updates_status_and_touchscreen_frame() -> None:
@@ -198,6 +263,134 @@ def test_codex_quota_poller_sends_touchscreen_to_streamdock_sink() -> None:
         "path": "n4pro-path",
         "sdk_result": "0",
     }
+
+
+def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
+    tmp_path: Path,
+) -> None:
+    """Verify unified N4 Pro renderer consumes quota background and key frames.
+
+    入参：`tmp_path` 提供 generated frame root；测试内注入 fake Codex state reader、
+    quota reader、legacy quota sink 和 unified N4 Pro renderer sink。
+    返回：无返回值；断言通过代表 unified renderer 启用时会组合 quota 背景和按钮帧，
+    且不会再调用 quota-only 真实触屏 sink。
+    错误处理：若 frame 映射、互斥行为或 status 诊断不符合预期，由 pytest 报告。
+    副作用：只写 pytest 临时 PNG，不访问真实 Codex 或 N4 Pro。
+    """
+
+    frame_root = tmp_path / "frames"
+    working_dir = frame_root / "working"
+    working_dir.mkdir(parents=True)
+    frame_path = working_dir / "frame_000.png"
+    Image.new("RGB", (112, 112), (3, 4, 5)).save(frame_path)
+    renderer_calls: list[dict[str, object]] = []
+    quota_touchscreen_calls: list[object] = []
+
+    def fake_codex_app_state_reader() -> tuple[NormalizedEvent, ...]:
+        """返回一个 running_tool 事件供 daemon layout 映射 working 帧。
+
+        入参：无。
+        返回：包含单个 `EventType.TOOL_STARTED` 的事件 tuple。
+        错误处理：事件构造失败由 Pydantic 抛出并交给 pytest。
+        副作用：只创建内存事件。
+        """
+
+        occurred_at = datetime.now(UTC)
+        return (
+            NormalizedEvent.build(
+                source=AgentSource.CODEX,
+                source_event_type="tool.started",
+                normalized_type=EventType.TOOL_STARTED,
+                session_id="thread-1",
+                thread_id="thread-1",
+                title="thread-1",
+                cwd="/repo",
+                tool_name="shell",
+                occurred_at=occurred_at,
+                received_at=occurred_at,
+            ),
+        )
+
+    def fake_quota_reader(**_: object) -> CodexQuotaSnapshot:
+        """返回固定 quota snapshot。
+
+        入参：忽略 daemon 传入的 reader 参数。
+        返回：固定 `CodexQuotaSnapshot`。
+        错误处理：字段非法由 Pydantic 抛出。
+        副作用：无。
+        """
+
+        return _quota_snapshot()
+
+    def fake_quota_touchscreen_sink(
+        image: object,
+    ) -> StreamDockTouchscreenRenderResult:
+        """记录意外 quota-only 硬件 sink 调用。
+
+        入参：`image` 是 quota renderer 输出。
+        返回：固定成功结果。
+        错误处理：无。
+        副作用：追加调用记录；该测试期望不会被调用。
+        """
+
+        quota_touchscreen_calls.append(image)
+        return StreamDockTouchscreenRenderResult(ok=True)
+
+    def fake_n4pro_renderer(**kwargs: object) -> StreamDockN4ProAnimationResult:
+        """记录 unified renderer 参数并模拟下发成功。
+
+        入参：`kwargs` 包含背景图、按键帧、播放时长和 fps。
+        返回：固定成功结果。
+        错误处理：无。
+        副作用：追加调用记录，不访问硬件。
+        """
+
+        renderer_calls.append(kwargs)
+        return StreamDockN4ProAnimationResult(
+            ok=True,
+            device_type="FakeN4ProDevice",
+            path="n4pro-path",
+            frames_rendered=2,
+            key_count=len(kwargs["key_frame_paths"]),
+        )
+
+    app = create_app(
+        poller_config=DaemonPollerConfig(
+            codex_app_state_enabled=True,
+            codex_quota_enabled=True,
+            streamdock_quota_touchscreen_enabled=True,
+            streamdock_n4pro_renderer_enabled=True,
+            streamdock_n4pro_frame_root=frame_root,
+            streamdock_n4pro_render_interval_seconds=0.5,
+            streamdock_n4pro_renderer_fps=4,
+        ),
+        codex_app_state_event_reader=fake_codex_app_state_reader,
+        codex_app_active_sessions_reader=lambda **_: (),
+        codex_quota_reader=fake_quota_reader,
+        quota_touchscreen_sink=fake_quota_touchscreen_sink,
+        streamdock_n4pro_renderer_sink=fake_n4pro_renderer,
+    )
+    with TestClient(app) as client:
+        status = client.get("/status").json()
+
+    assert quota_touchscreen_calls == []
+    assert len(renderer_calls) == 1
+    call = renderer_calls[0]
+    assert getattr(call["background_image"], "size") == (800, 480)
+    assert call["key_frame_paths"] == {1: (frame_path.resolve(),)}
+    assert call["duration_seconds"] == 0.5
+    assert call["fps"] == 4
+    assert status["streamdock_n4pro_renderer"]["last_result"] == {
+        "background_result": None,
+        "device_type": "FakeN4ProDevice",
+        "error": None,
+        "frames_rendered": 2,
+        "key_count": 1,
+        "ok": True,
+        "path": "n4pro-path",
+    }
+    assert status["streamdock_n4pro_renderer"]["last_error"] is None
+    assert status["codex_quota"]["streamdock_touchscreen"] is None
 
 
 def test_decision_request_updates_pending_status_and_decision_layout() -> None:

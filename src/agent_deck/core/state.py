@@ -226,6 +226,75 @@ class AgentStateStore:
         self._states[agent_key] = updated
         return updated
 
+    def upsert_observed_state(
+        self,
+        *,
+        source: AgentSource,
+        session_id: str,
+        observed_at: datetime,
+        status: AgentStatus,
+        title: str | None = None,
+        cwd: str | None = None,
+        summary: str | None = None,
+        active_tool: str | None = None,
+    ) -> AgentState:
+        """幂等写入外部扫描器观测到的当前 Agent 状态。
+
+        入参：`source` 和 `session_id` 组成稳定 agent key；`observed_at` 是观测时间，
+        必须 timezone-aware；`status` 是扫描器确认的当前状态；`title`/`cwd`/`summary`
+        是展示上下文；`active_tool` 仅在 `status=RUNNING_TOOL` 时用于展示活跃工具名。
+        返回：更新后的 `AgentState`。
+        错误处理：naive datetime 或非法模型字段由 ValueError/Pydantic 抛出。
+        副作用：更新本实例内存状态和活跃工具集合；不访问外部 I/O。
+        """
+
+        _ensure_timezone_aware_datetime(observed_at)
+        agent_key = f"{source.value}:{session_id}"
+        current = self._states.get(agent_key)
+        pending_count = current.pending_decision_count if current is not None else 0
+        next_status = (
+            AgentStatus.APPROVAL_NEEDED
+            if pending_count > 0 and status != AgentStatus.WAITING_USER
+            else status
+        )
+        next_active_tool = active_tool if next_status == AgentStatus.RUNNING_TOOL else None
+        if current is None:
+            updated = AgentState(
+                agent_key=agent_key,
+                source=source,
+                display_name=title or session_id,
+                cwd=cwd,
+                status=next_status,
+                status_since=observed_at,
+                last_event_at=observed_at,
+                last_summary=summary,
+                active_tool=next_active_tool,
+                pending_decision_count=pending_count,
+            )
+        else:
+            status_since = (
+                observed_at if current.status != next_status else current.status_since
+            )
+            updated = current.model_copy(
+                update={
+                    "display_name": title or current.display_name,
+                    "cwd": cwd if cwd is not None else current.cwd,
+                    "status": next_status,
+                    "status_since": status_since,
+                    "last_event_at": observed_at,
+                    "last_summary": summary
+                    if summary is not None
+                    else current.last_summary,
+                    "active_tool": next_active_tool,
+                    "pending_decision_count": pending_count,
+                }
+            )
+        self._states[agent_key] = updated
+        self._active_tools[agent_key] = (
+            {next_active_tool: 1} if next_active_tool is not None else {}
+        )
+        return updated
+
     def get(self, agent_key: str) -> AgentState | None:
         """Return the stored state for one agent without TTL projection.
 

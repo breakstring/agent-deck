@@ -233,6 +233,10 @@ Codex Desktop App 的 Plan Mode `request_user_input` 不是 `PermissionRequest` 
   记录；如果同一 `call_id` 后续没有 `function_call_output`，则认为该 thread 正在等待用户输入。
 - 待用户输入映射为 `EventType.INPUT_REQUESTED`，进入 `AgentStateStore` 后显示为
   `waiting_user`，可复用现有 `ASK` / `needs_user` 视觉状态。
+- 扫描器还会筛选最近有效 Codex App 会话：未归档、默认最近 1 小时、最多 10 个，并排除
+  明显测试标题/路径。筛选出的会话按 rollout 中未完成普通 `function_call` 推断为
+  `running_tool`，否则作为近期 `idle` 会话；daemon 用幂等 observed-state upsert 同步这些状态，
+  避免重复伪造 `tool.started` 导致工具计数累加。
 - `agent-deckctl codex-app-state --sync` 才会把检测出的 `input.requested` 事件 POST 到
   `agent-deckd /events`；默认命令只打印只读报告。
 
@@ -246,7 +250,9 @@ Codex Desktop App 的 Plan Mode `request_user_input` 不是 `PermissionRequest` 
 
 `agent-deckd` 默认启用 daemon-side Codex App state poller，启动时先同步一次，之后默认
 每 5 秒只读扫描一次。命令行可通过 `--disable-codex-app-state-poller` 关闭，或通过
-`--codex-app-state-poll-interval-seconds` 调整间隔。
+`--codex-app-state-poll-interval-seconds` 调整间隔；最近有效会话可通过
+`--codex-app-state-scan-limit`、`--codex-app-active-window-seconds` 和
+`--codex-app-active-session-limit` 调整。
 
 ### Codex quota 轮询与底部虚拟视窗
 
@@ -259,8 +265,12 @@ Codex quota 来自短生命周期 `codex -s read-only -a untrusted app-server` �
   N4 Pro 的 800x480 触屏背景图；内容只落在底部 `N4PRO_TOUCH_BAR_VIEWPORT`。
 - daemon 默认把这张图下发到 `--streamdock-quota-device n4pro` 对应的真实硬件触屏；没有触屏能力
   或不希望接管硬件时，可用 `--disable-streamdock-quota-touchscreen` 关闭。
+- 当启用 `--enable-streamdock-n4pro-renderer` 时，daemon 使用统一 N4 Pro renderer 在同一次
+  设备会话里写 quota 背景和 Codex 状态按钮动画；此时 quota-only 真实触屏 sink 自动关闭，
+  避免两条硬件写入路径互相 `init()` 清屏。
 - `/status` 暴露最新 quota snapshot、更新时间、最近错误、触屏图渲染计数和真实
-  StreamDock 下发结果，便于判断是 quota 读取失败、图片渲染失败还是设备被占用。
+  StreamDock 下发结果；统一 renderer 还会暴露最近一次背景+按钮下发结果，便于判断是
+  quota 读取失败、图片渲染失败、帧目录缺失还是设备被占用。
 - quota 渲染层展示剩余百分比，即 `100 - used_percent`；adapter 仍保留 app-server
   返回的原始 `used_percent` 语义。
 

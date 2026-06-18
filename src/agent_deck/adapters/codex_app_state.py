@@ -235,6 +235,38 @@ def build_codex_app_state_events(
     return build_codex_app_state_events_from_report(report)
 
 
+def read_codex_app_active_sessions(
+    *,
+    codex_home: Path | None = None,
+    state_db_path: Path | None = None,
+    scan_limit: int = 80,
+    active_window_seconds: int = DEFAULT_ACTIVE_SESSION_WINDOW_SECONDS,
+    max_sessions: int = DEFAULT_ACTIVE_SESSION_LIMIT,
+    exclude_patterns: Iterable[str] = DEFAULT_ACTIVE_SESSION_EXCLUDE_PATTERNS,
+) -> tuple[CodexAppActiveSession, ...]:
+    """扫描 Codex App 状态并返回最近有效会话列表。
+
+    入参：`codex_home` 和 `state_db_path` 控制本地状态来源；`scan_limit` 控制读取最近
+    thread 数量；`active_window_seconds`、`max_sessions` 和 `exclude_patterns` 转发给
+    `select_active_codex_app_sessions`。
+    返回：适合展示到硬件按钮上的 `CodexAppActiveSession` 元组。
+    错误处理：扫描、SQLite、rollout 读取或参数错误会向调用方传播，由 daemon poller 记录。
+    副作用：只读访问 Codex App 本地 SQLite 和 rollout JSONL；不写文件、不连接网络。
+    """
+
+    report = scan_codex_app_state(
+        codex_home=codex_home,
+        state_db_path=state_db_path,
+        limit=scan_limit,
+    )
+    return select_active_codex_app_sessions(
+        report,
+        active_window_seconds=active_window_seconds,
+        max_sessions=max_sessions,
+        exclude_patterns=exclude_patterns,
+    )
+
+
 def build_codex_app_state_events_from_report(
     report: CodexAppStateReport,
 ) -> tuple[NormalizedEvent, ...]:

@@ -1,11 +1,11 @@
 """FastAPI application factory for the local Agent Deck daemon API.
 
 This module wires the MVP in-memory runtime for normalized events, approval
-decisions, layout planning, optional Codex pollers, and a fake hardware surface.
-It deliberately does not bind sockets, probe StreamDock devices, install hooks,
-write user configuration, persist state, or render to real hardware; callers such
-as CLI entry points are responsible for hosting the returned ASGI app and
-choosing whether Codex local-state/quota polling is enabled.
+decisions, layout planning, optional Codex pollers, a fake hardware surface, and
+optional real N4 Pro render sinks. It deliberately does not bind sockets, install
+hooks, write user configuration, or persist state; callers such as CLI entry
+points are responsible for hosting the returned ASGI app and choosing whether
+Codex local-state/quota polling or real StreamDock rendering is enabled.
 """
 
 from __future__ import annotations
@@ -15,12 +15,17 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
-from agent_deck.adapters.codex_app_state import build_codex_app_state_events
+from agent_deck.adapters.codex_app_state import (
+    CodexAppActiveSession,
+    build_codex_app_state_events,
+    read_codex_app_active_sessions,
+)
 from agent_deck.adapters.codex_quota import CodexQuotaSnapshot, read_codex_quota
 from agent_deck.core.decisions import (
     DecisionBehavior,
@@ -28,32 +33,44 @@ from agent_deck.core.decisions import (
     DecisionResult,
     PendingDecision,
 )
-from agent_deck.core.events import EventType, NormalizedEvent
+from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
 from agent_deck.core.modes import DeckSelection
 from agent_deck.core.state import AgentState, AgentStateStore
 from agent_deck.hardware.fake import FakeHardwareSurface
+from agent_deck.hardware.streamdock_n4pro import (
+    StreamDockN4ProAnimationResult,
+    animate_key_images_on_n4pro,
+)
 from agent_deck.hardware.streamdock_touchscreen import (
     StreamDockTouchscreenRenderResult,
     render_touchscreen_image_to_n4pro,
 )
+from agent_deck.rendering.codex_key_frames import codex_key_frame_paths_for_key_variants
 from agent_deck.rendering.layout import LayoutPlan, build_layout_plan
 from agent_deck.rendering.quota_touchscreen import render_quota_touchscreen
 
 CodexAppStateEventReader = Callable[[], tuple[NormalizedEvent, ...]]
+CodexAppActiveSessionsReader = Callable[..., tuple[CodexAppActiveSession, ...]]
 CodexQuotaReader = Callable[..., CodexQuotaSnapshot]
 QuotaTouchscreenSink = Callable[[Any], StreamDockTouchscreenRenderResult]
+StreamDockN4ProRendererSink = Callable[..., StreamDockN4ProAnimationResult]
 
 
 class DaemonPollerConfig(BaseModel):
     """Configure optional daemon-side Codex polling loops.
 
     入参：`codex_app_state_enabled` 控制是否扫描 Codex App 本地 state/rollout；
-    `codex_app_state_interval_seconds` 是扫描间隔；`codex_quota_enabled` 控制是否读取
-    Codex app-server quota；`codex_quota_interval_seconds` 是 quota 间隔，默认 5 分钟；
+    `codex_app_state_interval_seconds` 是扫描间隔；`codex_app_state_scan_limit`、
+    `codex_app_active_window_seconds` 和 `codex_app_active_session_limit` 控制 Codex App
+    最近有效会话筛选；`codex_quota_enabled` 控制是否读取 Codex app-server quota；
+    `codex_quota_interval_seconds` 是 quota 间隔，默认 5 分钟；
     `codex_quota_timeout_seconds` 是单次 app-server 读取超时；
     `streamdock_quota_touchscreen_enabled` 控制是否把 quota 触屏图下发到真实硬件；
-    `streamdock_quota_device` 是目标设备能力 profile，当前只支持 `n4pro`；`poll_on_start`
-    控制启动时是否先同步一次，便于 daemon 刚启动就有状态。
+    `streamdock_quota_device` 是目标设备能力 profile，当前只支持 `n4pro`；
+    `streamdock_n4pro_renderer_enabled` 控制是否启用统一 N4 Pro 背景+按钮渲染循环，启用后
+    应替代 quota-only 真实触屏下发；`streamdock_n4pro_frame_root` 指向 generated 按键帧；
+    `streamdock_n4pro_render_interval_seconds` 和 `streamdock_n4pro_renderer_fps` 控制真机刷新节奏；
+    `poll_on_start` 控制启动时是否先同步一次，便于 daemon 刚启动就有状态。
     返回：frozen Pydantic model，供 `create_app` lifespan 使用。
     错误处理：非正间隔或 timeout 由 Pydantic 校验为 422/ValidationError。
     副作用：模型自身不读取文件、不启动进程、不创建后台任务。
@@ -63,11 +80,18 @@ class DaemonPollerConfig(BaseModel):
 
     codex_app_state_enabled: bool = False
     codex_app_state_interval_seconds: float = Field(default=5.0, gt=0)
+    codex_app_state_scan_limit: int = Field(default=80, gt=0)
+    codex_app_active_window_seconds: int = Field(default=3600, gt=0)
+    codex_app_active_session_limit: int = Field(default=10, gt=0)
     codex_quota_enabled: bool = False
     codex_quota_interval_seconds: float = Field(default=300.0, gt=0)
     codex_quota_timeout_seconds: float = Field(default=10.0, gt=0)
     streamdock_quota_touchscreen_enabled: bool = False
     streamdock_quota_device: str = "n4pro"
+    streamdock_n4pro_renderer_enabled: bool = False
+    streamdock_n4pro_frame_root: Path = Path("assets/codex/generated/n4pro-key-112-fps10")
+    streamdock_n4pro_render_interval_seconds: float = Field(default=2.0, gt=0)
+    streamdock_n4pro_renderer_fps: int = Field(default=5, gt=0)
     poll_on_start: bool = True
 
 
@@ -113,7 +137,7 @@ class _DaemonRuntime:
     入参：`store` 是 normalized event reducer；`broker` 管理 pending approval；
     `surface` 记录 fake render 帧；`selection` 保存当前 deck 选择；两个 id 集合分别
     记录已反映到 store 的 pending decision 和已同步终态的 decision；poller 字段保存
-    Codex App state 与 quota 的最近一次同步状态。
+    Codex App state、quota 与真实 N4 Pro renderer 的最近一次同步状态。
     返回：dataclass 实例，供 app.state 持有并在路由间共享。
     错误处理：本类不主动校验依赖类型；handler 调用时底层异常按原语义传播。
     副作用：后续方法会修改这些内存对象；不会访问真实硬件、文件或网络。
@@ -131,6 +155,9 @@ class _DaemonRuntime:
     codex_quota_updated_at: datetime | None
     codex_quota_last_error: str | None
     streamdock_quota_touchscreen_result: StreamDockTouchscreenRenderResult | None
+    streamdock_n4pro_renderer_result: StreamDockN4ProAnimationResult | None
+    streamdock_n4pro_renderer_updated_at: datetime | None
+    streamdock_n4pro_renderer_last_error: str | None
 
     def apply_event(self, event: NormalizedEvent) -> dict[str, Any]:
         """Apply an event, render the latest layout, and return response data.
@@ -164,6 +191,35 @@ class _DaemonRuntime:
             state = self.store.apply(event)
             self._reflect_pending_decisions_for_agent(state.agent_key)
         if events:
+            self.render_current()
+
+    def apply_codex_active_sessions(
+        self,
+        sessions: tuple[CodexAppActiveSession, ...],
+        *,
+        observed_at: datetime,
+    ) -> None:
+        """Apply active Codex App sessions observed by the local state scanner.
+
+        入参：`sessions` 是 adapter 按最近有效窗口筛选出的 Codex App 会话；`observed_at`
+        是本轮扫描时间。
+        返回：无显式返回值。
+        错误处理：state model 校验失败会向调用方传播，由 poller 捕获记录。
+        副作用：幂等更新 store 中对应 Codex agent 状态；有会话时 render fake surface 一帧。
+        """
+
+        for session in sessions:
+            self.store.upsert_observed_state(
+                source=AgentSource.CODEX,
+                session_id=session.thread_id,
+                observed_at=observed_at,
+                status=session.status,
+                title=session.title,
+                cwd=session.cwd,
+                summary=session.reason,
+                active_tool=_active_tool_from_reason(session.reason),
+            )
+        if sessions:
             self.render_current()
 
     def mark_codex_app_state_poll_success(self, polled_at: datetime) -> None:
@@ -232,6 +288,42 @@ class _DaemonRuntime:
         """
 
         self.streamdock_quota_touchscreen_result = result
+
+    def update_streamdock_n4pro_renderer_result(
+        self,
+        result: StreamDockN4ProAnimationResult,
+        *,
+        rendered_at: datetime,
+    ) -> None:
+        """Record the latest unified N4 Pro real-device render result.
+
+        入参：`result` 是统一背景+按键 renderer sink 返回的结果；`rendered_at` 是本次
+        下发完成时间。
+        返回：无显式返回值。
+        错误处理：本方法不主动抛异常；字段合法性由结果模型保证。
+        副作用：更新 runtime 内存诊断字段，不直接访问硬件。
+        """
+
+        self.streamdock_n4pro_renderer_result = result
+        self.streamdock_n4pro_renderer_updated_at = rendered_at
+        self.streamdock_n4pro_renderer_last_error = None if result.ok else result.error
+
+    def mark_streamdock_n4pro_renderer_error(
+        self,
+        error: Exception,
+        *,
+        rendered_at: datetime,
+    ) -> None:
+        """Record a unified N4 Pro renderer failure without stopping daemon.
+
+        入参：`error` 是 frame 构建或硬件 sink 异常；`rendered_at` 是失败发生时间。
+        返回：无显式返回值。
+        错误处理：本方法不抛业务异常；错误文本会被截断。
+        副作用：更新 renderer 诊断字段；保留上一次成功结果以便排障对比。
+        """
+
+        self.streamdock_n4pro_renderer_updated_at = rendered_at
+        self.streamdock_n4pro_renderer_last_error = _short_error(error)
 
     def mark_codex_quota_poll_error(
         self,
@@ -368,6 +460,15 @@ class _DaemonRuntime:
                     self.streamdock_quota_touchscreen_result
                 ),
             },
+            "streamdock_n4pro_renderer": {
+                "last_result": _dump_optional_model(
+                    self.streamdock_n4pro_renderer_result
+                ),
+                "updated_at": _dump_datetime(
+                    self.streamdock_n4pro_renderer_updated_at
+                ),
+                "last_error": self.streamdock_n4pro_renderer_last_error,
+            },
         }
 
     def render_current(self) -> LayoutPlan:
@@ -491,15 +592,19 @@ def create_app(
     *,
     poller_config: DaemonPollerConfig | None = None,
     codex_app_state_event_reader: CodexAppStateEventReader = build_codex_app_state_events,
+    codex_app_active_sessions_reader: CodexAppActiveSessionsReader = read_codex_app_active_sessions,
     codex_quota_reader: CodexQuotaReader = read_codex_quota,
     quota_touchscreen_sink: QuotaTouchscreenSink = render_touchscreen_image_to_n4pro,
+    streamdock_n4pro_renderer_sink: StreamDockN4ProRendererSink = animate_key_images_on_n4pro,
 ) -> FastAPI:
     """Create the local daemon FastAPI app without binding sockets.
 
     入参：`poller_config` 控制是否启动 Codex App state 和 quota 后台 pollers；为空时不启用
     任何 poller，保持测试和嵌入调用无外部 I/O；`codex_app_state_event_reader` 和
-    `codex_quota_reader` 是可注入 reader，生产默认读取真实本机 Codex 状态；`quota_touchscreen_sink`
-    是真实硬件触屏下发函数，仅在配置启用时调用，测试可替换。
+    `codex_app_active_sessions_reader` 读取最近有效 Codex App 会话，生产默认只读扫描本机状态；
+    `codex_quota_reader` 是可注入 reader，生产默认读取真实本机 Codex quota；
+    `quota_touchscreen_sink` 是 quota-only 真实硬件触屏下发函数，仅在配置启用时调用；
+    `streamdock_n4pro_renderer_sink` 是统一背景+按钮真实硬件下发函数，测试可替换。
     返回：配置好路由且持有 in-memory runtime 的 `FastAPI` ASGI app。
     错误处理：对象构造失败会直接抛出；poller 单次失败会记录到 status，不让 app 启动失败。
     副作用：总是分配内存对象并注册路由；只有显式启用 poller 时，lifespan startup 才会只读访问
@@ -520,6 +625,9 @@ def create_app(
         codex_quota_updated_at=None,
         codex_quota_last_error=None,
         streamdock_quota_touchscreen_result=None,
+        streamdock_n4pro_renderer_result=None,
+        streamdock_n4pro_renderer_updated_at=None,
+        streamdock_n4pro_renderer_last_error=None,
     )
 
     @asynccontextmanager
@@ -538,8 +646,10 @@ def create_app(
                 runtime,
                 resolved_poller_config,
                 codex_app_state_event_reader,
+                codex_app_active_sessions_reader,
                 codex_quota_reader,
                 quota_touchscreen_sink,
+                streamdock_n4pro_renderer_sink,
             )
         if resolved_poller_config.codex_app_state_enabled:
             tasks.append(
@@ -548,6 +658,14 @@ def create_app(
                         runtime,
                         interval_seconds=resolved_poller_config.codex_app_state_interval_seconds,
                         event_reader=codex_app_state_event_reader,
+                        active_sessions_reader=codex_app_active_sessions_reader,
+                        scan_limit=resolved_poller_config.codex_app_state_scan_limit,
+                        active_window_seconds=(
+                            resolved_poller_config.codex_app_active_window_seconds
+                        ),
+                        active_session_limit=(
+                            resolved_poller_config.codex_app_active_session_limit
+                        ),
                     )
                 )
             )
@@ -559,9 +677,26 @@ def create_app(
                         interval_seconds=resolved_poller_config.codex_quota_interval_seconds,
                         timeout_seconds=resolved_poller_config.codex_quota_timeout_seconds,
                         quota_reader=codex_quota_reader,
-                        streamdock_touchscreen_enabled=resolved_poller_config.streamdock_quota_touchscreen_enabled,
+                        streamdock_touchscreen_enabled=(
+                            resolved_poller_config.streamdock_quota_touchscreen_enabled
+                            and not resolved_poller_config.streamdock_n4pro_renderer_enabled
+                        ),
                         streamdock_device=resolved_poller_config.streamdock_quota_device,
                         quota_touchscreen_sink=quota_touchscreen_sink,
+                    )
+                )
+            )
+        if resolved_poller_config.streamdock_n4pro_renderer_enabled:
+            tasks.append(
+                asyncio.create_task(
+                    _render_streamdock_n4pro_loop(
+                        runtime,
+                        interval_seconds=(
+                            resolved_poller_config.streamdock_n4pro_render_interval_seconds
+                        ),
+                        fps=resolved_poller_config.streamdock_n4pro_renderer_fps,
+                        frame_root=resolved_poller_config.streamdock_n4pro_frame_root,
+                        renderer_sink=streamdock_n4pro_renderer_sink,
                     )
                 )
             )
@@ -656,28 +791,48 @@ async def _run_enabled_pollers_once(
     runtime: _DaemonRuntime,
     config: DaemonPollerConfig,
     codex_app_state_event_reader: CodexAppStateEventReader,
+    codex_app_active_sessions_reader: CodexAppActiveSessionsReader,
     codex_quota_reader: CodexQuotaReader,
     quota_touchscreen_sink: QuotaTouchscreenSink,
+    streamdock_n4pro_renderer_sink: StreamDockN4ProRendererSink,
 ) -> None:
     """Run each enabled poller once during app startup.
 
-    入参：`runtime` 是 daemon 内存状态；`config` 是 poller 配置；两个 reader 和触屏 sink 是
-    可注入数据源/输出端。
+    入参：`runtime` 是 daemon 内存状态；`config` 是 poller 配置；Codex reader、quota reader、
+    触屏 sink 和统一 N4 Pro renderer sink 是可注入数据源/输出端。
     返回：无显式返回值。
     错误处理：单个 poller 的异常由 poll-once helper 记录，另一个 poller 仍会继续执行。
     副作用：可能只读访问 Codex 本地状态、启动短生命周期 app-server、更新 runtime 和 fake surface。
     """
 
     if config.codex_app_state_enabled:
-        await _poll_codex_app_state_once(runtime, codex_app_state_event_reader)
+        await _poll_codex_app_state_once(
+            runtime,
+            codex_app_state_event_reader,
+            active_sessions_reader=codex_app_active_sessions_reader,
+            scan_limit=config.codex_app_state_scan_limit,
+            active_window_seconds=config.codex_app_active_window_seconds,
+            active_session_limit=config.codex_app_active_session_limit,
+        )
     if config.codex_quota_enabled:
         await _poll_codex_quota_once(
             runtime,
             timeout_seconds=config.codex_quota_timeout_seconds,
             quota_reader=codex_quota_reader,
-            streamdock_touchscreen_enabled=config.streamdock_quota_touchscreen_enabled,
+            streamdock_touchscreen_enabled=(
+                config.streamdock_quota_touchscreen_enabled
+                and not config.streamdock_n4pro_renderer_enabled
+            ),
             streamdock_device=config.streamdock_quota_device,
             quota_touchscreen_sink=quota_touchscreen_sink,
+        )
+    if config.streamdock_n4pro_renderer_enabled:
+        await _render_streamdock_n4pro_once(
+            runtime,
+            duration_seconds=config.streamdock_n4pro_render_interval_seconds,
+            fps=config.streamdock_n4pro_renderer_fps,
+            frame_root=config.streamdock_n4pro_frame_root,
+            renderer_sink=streamdock_n4pro_renderer_sink,
         )
 
 
@@ -686,11 +841,16 @@ async def _poll_codex_app_state_loop(
     *,
     interval_seconds: float,
     event_reader: CodexAppStateEventReader,
+    active_sessions_reader: CodexAppActiveSessionsReader,
+    scan_limit: int,
+    active_window_seconds: int,
+    active_session_limit: int,
 ) -> None:
     """Periodically scan Codex App local state and apply generated events.
 
     入参：`runtime` 是 daemon 内存状态；`interval_seconds` 是两次扫描间隔；`event_reader`
-    是同步 reader，会通过 `asyncio.to_thread` 调用。
+    和 `active_sessions_reader` 是同步 reader，会通过 `asyncio.to_thread` 调用；其余参数
+    控制最近有效会话筛选。
     返回：不主动返回；任务被取消时结束。
     错误处理：单次扫描异常被记录到 runtime，不终止循环；取消异常正常传播给 shutdown。
     副作用：周期性只读访问 Codex 本地状态并更新 in-memory store。
@@ -698,7 +858,14 @@ async def _poll_codex_app_state_loop(
 
     while True:
         await asyncio.sleep(interval_seconds)
-        await _poll_codex_app_state_once(runtime, event_reader)
+        await _poll_codex_app_state_once(
+            runtime,
+            event_reader,
+            active_sessions_reader=active_sessions_reader,
+            scan_limit=scan_limit,
+            active_window_seconds=active_window_seconds,
+            active_session_limit=active_session_limit,
+        )
 
 
 async def _poll_codex_quota_loop(
@@ -734,13 +901,131 @@ async def _poll_codex_quota_loop(
         )
 
 
+async def _render_streamdock_n4pro_loop(
+    runtime: _DaemonRuntime,
+    *,
+    interval_seconds: float,
+    fps: int,
+    frame_root: Path,
+    renderer_sink: StreamDockN4ProRendererSink,
+) -> None:
+    """Periodically render current layout and quota together to N4 Pro.
+
+    入参：`runtime` 是 daemon 内存状态；`interval_seconds` 是每次硬件播放窗口时长；
+    `fps` 是按钮动画刷新率；`frame_root` 是 generated Codex key frames 根目录；
+    `renderer_sink` 是真实或测试替换的统一硬件 sink。
+    返回：不主动返回；任务被取消时结束。
+    错误处理：单次 frame 构建或硬件 sink 异常被记录到 runtime，不终止循环。
+    副作用：周期性 render 当前 layout，并在线程中调用真实硬件 sink。
+    """
+
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await _render_streamdock_n4pro_once(
+            runtime,
+            duration_seconds=interval_seconds,
+            fps=fps,
+            frame_root=frame_root,
+            renderer_sink=renderer_sink,
+        )
+
+
+async def _render_streamdock_n4pro_once(
+    runtime: _DaemonRuntime,
+    *,
+    duration_seconds: float,
+    fps: int,
+    frame_root: Path,
+    renderer_sink: StreamDockN4ProRendererSink,
+) -> None:
+    """Render one bounded N4 Pro hardware frame window from current runtime.
+
+    入参：`runtime` 是 daemon 内存状态；`duration_seconds` 是本次硬件播放时长；
+    `fps` 是按钮动画刷新率；`frame_root` 是 generated frame 根目录；`renderer_sink`
+    是统一背景+按键下发函数。
+    返回：无显式返回值。
+    错误处理：缺少 quota snapshot 时跳过不报错；其他构建或 sink 异常记录为 renderer error。
+    副作用：会 render 当前 layout 到 fake surface，并可能在线程中接管真实 N4 Pro。
+    """
+
+    rendered_at = datetime.now(UTC)
+    try:
+        if runtime.codex_quota_snapshot is None:
+            return
+        layout = runtime.render_current()
+        key_frame_paths = _key_frame_paths_from_layout(
+            layout,
+            frame_root=frame_root,
+        )
+        background = render_quota_touchscreen(runtime.codex_quota_snapshot)
+        result = await asyncio.to_thread(
+            renderer_sink,
+            background_image=background,
+            key_frame_paths=key_frame_paths,
+            duration_seconds=duration_seconds,
+            fps=fps,
+        )
+        runtime.update_streamdock_n4pro_renderer_result(
+            result,
+            rendered_at=datetime.now(UTC),
+        )
+    except Exception as exc:  # noqa: BLE001 - 硬件渲染失败应进入 status，不杀 daemon。
+        runtime.mark_streamdock_n4pro_renderer_error(exc, rendered_at=rendered_at)
+
+
+def _key_frame_paths_from_layout(
+    layout: LayoutPlan,
+    *,
+    frame_root: Path,
+) -> dict[int, tuple[Path, ...]]:
+    """从 renderer-neutral layout 提取 N4 Pro 物理按钮动画帧路径。
+
+    入参：`layout` 是当前 daemon layout；`frame_root` 是 generated Codex key frame 根目录。
+    返回：物理按钮编号到 PNG 帧路径元组的映射；只包含带 visual 的前 10 个 agent slot。
+    错误处理：帧目录缺失、按钮编号非法或变体缺帧时抛出异常，由调用方记录。
+    副作用：只读取文件系统元数据；不打开图片、不访问硬件。
+    """
+
+    key_variants = {
+        key.index + 1: key.visual.variant_id
+        for key in layout.keys[:10]
+        if key.visual is not None
+    }
+    return codex_key_frame_paths_for_key_variants(
+        frame_root=frame_root,
+        key_variants=key_variants,
+    )
+
+
+def _active_tool_from_reason(reason: str) -> str | None:
+    """从 Codex active session reason 中提取活跃工具名。
+
+    入参：`reason` 是 adapter 生成的诊断字符串，当前可能形如 `pending tool call: shell`。
+    返回：工具名；不是该格式或工具名为空时返回 None。
+    错误处理：本函数不抛业务异常。
+    副作用：无；只处理内存字符串。
+    """
+
+    prefix = "pending tool call: "
+    if not reason.startswith(prefix):
+        return None
+    tool_name = reason[len(prefix) :].strip()
+    return tool_name or None
+
+
 async def _poll_codex_app_state_once(
     runtime: _DaemonRuntime,
     event_reader: CodexAppStateEventReader,
+    *,
+    active_sessions_reader: CodexAppActiveSessionsReader,
+    scan_limit: int,
+    active_window_seconds: int,
+    active_session_limit: int,
 ) -> None:
     """Run one Codex App state poll and update runtime diagnostics.
 
-    入参：`runtime` 是 daemon 内存状态；`event_reader` 返回 normalized events。
+    入参：`runtime` 是 daemon 内存状态；`event_reader` 返回 pending-input normalized events；
+    `active_sessions_reader` 返回最近有效 Codex App 会话；其余参数控制扫描和筛选。
     返回：无显式返回值。
     错误处理：reader 或 reducer 异常会被捕获并记录到 `codex_app_state_last_error`。
     副作用：可能更新 agent state store 和 fake layout render。
@@ -750,6 +1035,13 @@ async def _poll_codex_app_state_once(
     try:
         events = await asyncio.to_thread(event_reader)
         runtime.apply_polled_events(events)
+        sessions = await asyncio.to_thread(
+            active_sessions_reader,
+            scan_limit=scan_limit,
+            active_window_seconds=active_window_seconds,
+            max_sessions=active_session_limit,
+        )
+        runtime.apply_codex_active_sessions(sessions, observed_at=polled_at)
         runtime.mark_codex_app_state_poll_success(polled_at)
     except Exception as exc:  # noqa: BLE001 - poller 必须保护 daemon 主循环。
         runtime.mark_codex_app_state_poll_error(exc, polled_at=polled_at)

@@ -1,10 +1,11 @@
 """Agent Deck daemon、控制命令和 Codex hook 的命令行入口。
 
 本模块只负责 CLI 参数解析、JSON/stdin 处理、本地 daemon HTTP 调用、Codex 检测/安装、
-Codex App 本地状态扫描命令分派，以及打包后的 console scripts 启动 uvicorn。它不探测
-硬件、不持久化 daemon 状态、不实现 broker 业务逻辑；默认命令不修改用户文件，只有用户
-显式运行 `codex-install --apply` 时才会写 Codex 配置。网络副作用仅限用户显式执行命令时
-访问配置的本地 daemon URL，并使用有界 httpx timeout。
+Codex App 本地状态扫描命令分派、真实 N4 Pro 预览命令，以及打包后的 console scripts
+启动 uvicorn。它不持久化 daemon 状态、不实现 broker 业务逻辑；默认命令不修改用户文件，
+只有用户显式运行 `codex-install --apply` 时才会写 Codex 配置。网络副作用限于用户显式执行
+命令时访问配置的本地 daemon URL，并使用有界 httpx timeout；真实硬件副作用仅在用户显式
+启用 N4 Pro preview/renderer 相关命令或 daemon 选项时发生。
 """
 
 from __future__ import annotations
@@ -37,6 +38,9 @@ from agent_deck.core.decisions import DecisionBehavior
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
 from agent_deck.hardware.streamdock_n4pro import animate_key_images_on_n4pro
 from agent_deck.rendering.asset_builder import build_codex_visual_assets
+from agent_deck.rendering.codex_key_frames import (
+    codex_key_frame_paths_for_variants,
+)
 from agent_deck.rendering.quota_touchscreen import render_quota_touchscreen
 from agent_deck.rendering.visuals import resolve_visual_icon_spec
 from agent_deck.server.app import DaemonPollerConfig, create_app
@@ -101,6 +105,31 @@ def daemon_callback(
             min=0.1,
         ),
     ] = 5.0,
+    codex_app_state_scan_limit: Annotated[
+        int,
+        typer.Option(
+            "--codex-app-state-scan-limit",
+            help="Maximum recent Codex App threads to scan per state poll.",
+            min=1,
+        ),
+    ] = 80,
+    codex_app_active_window_seconds: Annotated[
+        int,
+        typer.Option(
+            "--codex-app-active-window-seconds",
+            help="Only show unarchived Codex App threads updated within this window.",
+            min=1,
+        ),
+    ] = 3600,
+    codex_app_active_session_limit: Annotated[
+        int,
+        typer.Option(
+            "--codex-app-active-session-limit",
+            help="Maximum active Codex App sessions to keep in daemon state.",
+            min=1,
+            max=10,
+        ),
+    ] = 10,
     disable_codex_quota_poller: Annotated[
         bool,
         typer.Option(
@@ -138,23 +167,59 @@ def daemon_callback(
             help="StreamDock device profile for quota touchscreen rendering.",
         ),
     ] = "n4pro",
+    enable_streamdock_n4pro_renderer: Annotated[
+        bool,
+        typer.Option(
+            "--enable-streamdock-n4pro-renderer",
+            help="Enable unified N4 Pro rendering for quota background and animated Codex keys.",
+        ),
+    ] = False,
+    streamdock_n4pro_render_interval_seconds: Annotated[
+        float,
+        typer.Option(
+            "--streamdock-n4pro-render-interval-seconds",
+            help="Seconds per unified N4 Pro render window.",
+            min=0.5,
+        ),
+    ] = 2.0,
+    streamdock_n4pro_renderer_fps: Annotated[
+        int,
+        typer.Option(
+            "--streamdock-n4pro-renderer-fps",
+            help="Button animation FPS for the unified N4 Pro renderer.",
+            min=1,
+            max=20,
+        ),
+    ] = 5,
+    streamdock_n4pro_frame_root: Annotated[
+        Path,
+        typer.Option(
+            "--streamdock-n4pro-frame-root",
+            help="Generated Codex N4 Pro key frame directory.",
+        ),
+    ] = Path("assets/codex/generated/n4pro-key-112-fps10"),
 ) -> None:
     """Start the local daemon when no daemon subcommand is selected.
 
     入参：`ctx` 是 Typer/Click 当前命令上下文，用于判断是否已有子命令；`host`
     是 uvicorn 监听地址，默认 `127.0.0.1`；`port` 是监听 TCP 端口，范围 1-65535，
     默认 `8765`；`disable_codex_app_state_poller` 和
-    `disable_codex_quota_poller` 可关闭默认 Codex pollers；两个 interval 控制状态扫描和 quota
-    刷新周期；`codex_quota_timeout_seconds` 控制单次 quota app-server 读取超时；
+    `disable_codex_quota_poller` 可关闭默认 Codex pollers；状态 scan limit、active window
+    和 active session limit 控制 Codex App 最近有效会话筛选；两个 interval 控制状态扫描和
+    quota 刷新周期；`codex_quota_timeout_seconds` 控制单次 quota app-server 读取超时；
     `disable_streamdock_quota_touchscreen` 可关闭默认真实硬件触屏下发；`streamdock_quota_device`
-    是 quota 触屏目标设备 profile，当前默认 `n4pro`。
+    是 quota 触屏目标设备 profile，当前默认 `n4pro`；`enable_streamdock_n4pro_renderer`
+    启用统一 N4 Pro quota 背景+按钮动画 renderer，并自动替代 quota-only 硬件下发；
+    `streamdock_n4pro_render_interval_seconds`、`streamdock_n4pro_renderer_fps` 和
+    `streamdock_n4pro_frame_root` 控制统一 renderer 的播放窗口、帧率和 generated 帧目录。
     返回：无显式返回值；`uvicorn.run` 负责阻塞运行 ASGI app。
     错误处理：Typer 处理 CLI 参数错误，包括非法端口、poll interval 或 timeout 范围；
     `create_app` 或 `uvicorn.run` 抛出的异常会向上传播并使命令失败。
     副作用：当没有子命令时创建 FastAPI app 并启动 uvicorn；默认启用 Codex App 本地状态
     只读 poller、quota poller 和 StreamDock N4 Pro quota 触屏下发；quota poller 会周期性启动
-    短生命周期 Codex app-server，并在成功时可能接管 N4 Pro 触屏显示；不写用户配置、不安装
-    Codex hooks。
+    短生命周期 Codex app-server，并在成功时可能接管 N4 Pro 触屏显示；若启用统一 renderer，
+    则由统一 renderer 接管 N4 Pro 背景和按钮，旧 quota-only sink 不再下发；不写用户配置、
+    不安装 Codex hooks。
     """
 
     if ctx.invoked_subcommand is not None:
@@ -162,11 +227,23 @@ def daemon_callback(
     poller_config = DaemonPollerConfig(
         codex_app_state_enabled=not disable_codex_app_state_poller,
         codex_app_state_interval_seconds=codex_app_state_poll_interval_seconds,
+        codex_app_state_scan_limit=codex_app_state_scan_limit,
+        codex_app_active_window_seconds=codex_app_active_window_seconds,
+        codex_app_active_session_limit=codex_app_active_session_limit,
         codex_quota_enabled=not disable_codex_quota_poller,
         codex_quota_interval_seconds=codex_quota_poll_interval_seconds,
         codex_quota_timeout_seconds=codex_quota_timeout_seconds,
-        streamdock_quota_touchscreen_enabled=not disable_streamdock_quota_touchscreen,
+        streamdock_quota_touchscreen_enabled=(
+            not disable_streamdock_quota_touchscreen
+            and not enable_streamdock_n4pro_renderer
+        ),
         streamdock_quota_device=streamdock_quota_device,
+        streamdock_n4pro_renderer_enabled=enable_streamdock_n4pro_renderer,
+        streamdock_n4pro_render_interval_seconds=(
+            streamdock_n4pro_render_interval_seconds
+        ),
+        streamdock_n4pro_renderer_fps=streamdock_n4pro_renderer_fps,
+        streamdock_n4pro_frame_root=streamdock_n4pro_frame_root,
     )
     uvicorn.run(create_app(poller_config=poller_config), host=host, port=port)
 
@@ -665,42 +742,16 @@ def _codex_session_key_frame_paths(
     副作用：只读取文件系统元数据，不打开图片、不访问硬件。
     """
 
-    resolved_root = frame_root.expanduser().resolve()
-    if not resolved_root.is_dir():
-        raise FileNotFoundError(f"Codex key frame root not found: {resolved_root}")
-
-    mapping: dict[int, tuple[Path, ...]] = {}
-    for index, session in enumerate(sessions[:10], start=1):
-        spec = resolve_visual_icon_spec(session.status)
-        mapping[index] = _codex_variant_frame_paths(
-            frame_root=resolved_root,
-            variant_id=spec.variant_id,
-        )
-    return mapping
-
-
-def _codex_variant_frame_paths(*, frame_root: Path, variant_id: str) -> tuple[Path, ...]:
-    """读取某个 Codex 按键视觉变体的帧路径。
-
-    入参：`frame_root` 是已解析的生成资产根目录；`variant_id` 是 `visuals` 映射出的变体名。
-    返回：按文件名排序的 PNG 帧路径元组；offline 静态图返回单帧元组。
-    错误处理：缺少对应目录或 PNG 帧时抛 `FileNotFoundError`。
-    副作用：只读取文件系统元数据。
-    """
-
-    if variant_id == "offline":
-        offline_path = frame_root / "offline.png"
-        if not offline_path.is_file():
-            raise FileNotFoundError(f"Codex offline frame not found: {offline_path}")
-        return (offline_path,)
-
-    variant_dir = frame_root / variant_id
-    if not variant_dir.is_dir():
-        raise FileNotFoundError(f"Codex variant frame directory not found: {variant_dir}")
-    frames = tuple(sorted(variant_dir.glob("frame_*.png")))
-    if not frames:
-        raise FileNotFoundError(f"Codex variant has no PNG frames: {variant_dir}")
-    return frames
+    variants = (
+        resolve_visual_icon_spec(session.status).variant_id
+        for session in sessions[:10]
+    )
+    return codex_key_frame_paths_for_variants(
+        frame_root=frame_root,
+        variants=variants,
+        start_key=1,
+        max_keys=10,
+    )
 
 
 @ctl_app.command("codex-detect")

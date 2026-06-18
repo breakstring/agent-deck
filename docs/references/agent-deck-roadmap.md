@@ -97,8 +97,10 @@ flowchart LR
 7. Codex App local state scanner
    只读扫描 `~/.codex/state_*.sqlite` 和 thread rollout JSONL，检测 Plan Mode
    `request_user_input` 是否仍未出现 `function_call_output`，并映射为 `input.requested`。
-   该能力作为 Codex App 私有本地状态 fallback，不替代官方 hooks；daemon 默认以 5 秒间隔
-   自动轮询，可通过 CLI 关闭或调整间隔。
+   同一扫描链路也筛选“未归档 + 最近 1 小时 + 最多 10 个 + 排除明显测试 thread”的有效
+   Codex App 会话，把 waiting/running/idle 观测态幂等同步到 daemon state store。该能力作为
+   Codex App 私有本地状态 fallback，不替代官方 hooks；daemon 默认以 5 秒间隔自动轮询，
+   可通过 CLI 关闭或调整间隔、窗口、扫描上限和会话数量。
 
 8. state reducer
    把事件归约为 AgentState。
@@ -114,6 +116,11 @@ flowchart LR
 
 12. N4 Pro renderer
     根据 DeckMode 生成 slot icons、详情屏、决策界面、LED 聚合状态。
+    当前 daemon 已提供显式 `--enable-streamdock-n4pro-renderer` 模式：从 runtime layout
+    读取前 10 个 Codex agent slot 的 `VisualIconSpec.variant_id`，加载
+    `assets/codex/generated/n4pro-key-112-fps10/` 下的预渲染帧，并在同一次 N4 Pro 设备会话里
+    下发 quota 背景和按键动画。该模式启用时会替代旧的 quota-only 真实触屏下发，避免
+    多个 SDK `init()` 路径互相清屏。
 
 13. Codex 视觉资产生成器
     将 `assets/codex/codex.gif` 按目标设备 profile 预渲染成状态帧序列、每状态
@@ -125,7 +132,9 @@ flowchart LR
     通过 Codex app-server 读取 quota，默认 5 分钟刷新一次；成功后保存 runtime snapshot，
     渲染到底部 N4 Pro touch-bar viewport，并默认下发到 `streamdock_quota_device=n4pro`。
     渲染层显示剩余百分比，不改 adapter 的 `used_percent` 原始语义。未来没有触屏能力的设备
-    应通过 device profile 禁用该 panel 或切换到其他显示方式。
+    应通过 device profile 禁用该 panel 或切换到其他显示方式。若 daemon 启用统一 N4 Pro
+    renderer，则 quota poller 只更新 runtime snapshot 和 fake touch panel，不再单独调用
+    quota-only 真实硬件 sink。
 
 15. action executor
     实现 focus target、tmux、AppleScript 激活、递归熔断。
@@ -147,7 +156,9 @@ P1 验收清单：
 - Codex turn 状态能显示到 slot。
 - PermissionRequest 能在硬件上显示并返回 allow/deny。
 - Codex App Plan Mode `request_user_input` 未完成时能被只读扫描为 `waiting_user`。
+- Codex App 最近有效会话能被只读扫描同步到 daemon，并按 running/idle/waiting 状态显示到 slot。
 - Codex quota 能自动刷新到 daemon runtime，并显示到 N4 Pro 底部虚拟视窗。
+- 启用统一 N4 Pro renderer 后，Codex 会话状态按钮和底部 quota 背景能在同一次硬件写入链路中共存。
 - 超时默认策略按配置执行。
 - 拔插设备服务不崩溃。
 - `pytest` 通过。
