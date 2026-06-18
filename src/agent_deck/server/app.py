@@ -11,7 +11,8 @@ Codex local-state/quota polling or real StreamDock rendering is enabled.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import time
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -908,19 +909,21 @@ async def _render_streamdock_n4pro_loop(
     fps: int,
     frame_root: Path,
     renderer_sink: StreamDockN4ProRendererSink,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> None:
     """Periodically render current layout and quota together to N4 Pro.
 
     入参：`runtime` 是 daemon 内存状态；`interval_seconds` 是每次硬件播放窗口时长；
     `fps` 是按钮动画刷新率；`frame_root` 是 generated Codex key frames 根目录；
-    `renderer_sink` 是真实或测试替换的统一硬件 sink。
+    `renderer_sink` 是真实或测试替换的统一硬件 sink；`sleep`/`monotonic` 仅用于测试调度。
     返回：不主动返回；任务被取消时结束。
     错误处理：单次 frame 构建或硬件 sink 异常被记录到 runtime，不终止循环。
     副作用：周期性 render 当前 layout，并在线程中调用真实硬件 sink。
     """
 
     while True:
-        await asyncio.sleep(interval_seconds)
+        started_at = monotonic()
         await _render_streamdock_n4pro_once(
             runtime,
             duration_seconds=interval_seconds,
@@ -928,6 +931,8 @@ async def _render_streamdock_n4pro_loop(
             frame_root=frame_root,
             renderer_sink=renderer_sink,
         )
+        elapsed = monotonic() - started_at
+        await sleep(max(0.0, interval_seconds - elapsed))
 
 
 async def _render_streamdock_n4pro_once(

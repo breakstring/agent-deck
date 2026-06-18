@@ -30,7 +30,8 @@ Python 项目使用 `uv` 管理。
 
 默认硬件渲染节奏是 `render_interval_seconds = 3.0`、`fps = 10`，对应当前 30 帧的
 N4 Pro Codex 动画资产；这样每次下发按钮图标时能播放一个完整 working 动画周期，而不是
-只反复看到前几帧。
+只反复看到前几帧。daemon 的渲染循环会把硬件播放耗时计入这个周期，正常情况下不会在
+一次完整动画结束后再额外等待一个完整 interval。
 
 `agent-deck.toml` 还控制 Codex 权限审批 hook 的运行策略。默认：
 

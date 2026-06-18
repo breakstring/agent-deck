@@ -18,6 +18,7 @@ def _event(
     occurred_at: datetime,
     *,
     session_id: str = "session-1",
+    turn_id: str | None = None,
     source_event_type: str | None = None,
     title: str | None = "Codex",
     cwd: str | None = "/repo",
@@ -27,7 +28,7 @@ def _event(
     """Build a normalized event for reducer tests.
 
     入参：`normalized_type` 是要测试的规范事件类型；`occurred_at` 是带时区的事件时间；
-    其余关键字参数覆盖 session、原始事件类型、展示标题、工作目录、工具名和摘要。
+    其余关键字参数覆盖 session、turn、原始事件类型、展示标题、工作目录、工具名和摘要。
     返回：用于 `AgentStateStore.apply` 的 `NormalizedEvent`。
     错误处理：字段非法或时间无时区时由 `NormalizedEvent.build` 抛出 Pydantic 校验异常。
     副作用：仅创建内存模型，不访问网络、硬件或文件系统。
@@ -38,6 +39,7 @@ def _event(
         source_event_type=source_event_type or normalized_type.value,
         normalized_type=normalized_type,
         session_id=session_id,
+        turn_id=turn_id,
         occurred_at=occurred_at,
         title=title,
         cwd=cwd,
@@ -88,6 +90,75 @@ def test_turn_started_moves_agent_to_thinking() -> None:
     assert state.status_since == turn_at
     assert state.last_event_at == turn_at
     assert state.last_summary == "working"
+
+
+def test_turn_started_only_updates_matching_session() -> None:
+    """Verify one user prompt updates only the matching Codex session.
+
+    入参：无；测试内创建两个 Codex sessions，然后只对其中一个应用 `TURN_STARTED`。
+    返回：无返回值；断言通过代表状态归约按 `source + session_id` 隔离，而不是全局广播。
+    错误处理：若另一个 session 被误改为 thinking，由 pytest 报告。
+    副作用：仅修改测试内的 `AgentStateStore` 内存状态。
+    """
+
+    store = AgentStateStore()
+    started_at = datetime(2026, 6, 12, 8, 0, tzinfo=UTC)
+    store.apply(_event(EventType.SESSION_STARTED, started_at, session_id="session-a"))
+    store.apply(_event(EventType.SESSION_STARTED, started_at, session_id="session-b"))
+    turn_at = datetime(2026, 6, 12, 8, 1, tzinfo=UTC)
+
+    updated = store.apply(
+        _event(
+            EventType.TURN_STARTED,
+            turn_at,
+            session_id="session-a",
+            turn_id="turn-a1",
+        )
+    )
+
+    other = store.get("codex:session-b")
+    assert updated.status == AgentStatus.THINKING
+    assert updated.active_turn_id == "turn-a1"
+    assert other is not None
+    assert other.status == AgentStatus.IDLE
+    assert other.active_turn_id is None
+
+
+def test_stale_turn_event_cannot_overwrite_newer_turn_state() -> None:
+    """Verify old turn events do not overwrite a newer active turn.
+
+    入参：无；测试内先启动 `turn-new`，再模拟较晚到达的 `turn-old` tool event。
+    返回：无返回值；断言通过代表 stale turn 不会把当前会话错误改成 running_tool。
+    错误处理：若旧事件更新状态、active tool 或时间戳，由 pytest 报告。
+    副作用：仅修改测试内的 `AgentStateStore` 内存状态。
+    """
+
+    store = AgentStateStore()
+    new_turn_at = datetime(2026, 6, 12, 8, 2, tzinfo=UTC)
+    current = store.apply(
+        _event(
+            EventType.TURN_STARTED,
+            new_turn_at,
+            session_id="session-1",
+            turn_id="turn-new",
+        )
+    )
+    stale_at = new_turn_at + timedelta(seconds=3)
+
+    state = store.apply(
+        _event(
+            EventType.TOOL_STARTED,
+            stale_at,
+            session_id="session-1",
+            turn_id="turn-old",
+            tool_name="shell",
+        )
+    )
+
+    assert state == current
+    assert state.status == AgentStatus.THINKING
+    assert state.active_tool is None
+    assert state.active_turn_id == "turn-new"
 
 
 def test_tool_started_sets_running_tool_and_active_tool() -> None:

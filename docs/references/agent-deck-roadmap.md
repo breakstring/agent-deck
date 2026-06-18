@@ -126,6 +126,8 @@ flowchart LR
     多个 SDK `init()` 路径互相清屏；需要纯内存/fake 运行时可用 `--disable-hardware-renderer`。
     渲染间隔、FPS、设备 profile 和帧目录默认值放在 `agent-deck.toml`，CLI 只提供通用覆盖项。
     当前默认节奏为 3 秒一次、10fps，对齐 30 帧 N4 Pro key 动画资产的完整周期。
+    render loop 必须把单次硬件播放耗时抵扣进周期，不能“播完 3 秒再 sleep 3 秒”，否则
+    working 动画会在终点出现肉眼可见的停顿。
 
 13. Codex 视觉资产生成器
     将 `assets/codex/codex.gif` 按目标设备 profile 预渲染成状态帧序列、每状态

@@ -1502,6 +1502,44 @@ def test_codex_event_hook_maps_session_start_to_event(monkeypatch: Any) -> None:
     assert body["cwd"] == "/tmp/project"
 
 
+def test_codex_event_hook_maps_user_prompt_submit_to_turn_started(
+    monkeypatch: Any,
+) -> None:
+    """Verify Codex user prompts become session-scoped turn start events.
+
+    入参：`monkeypatch` 安装 fake HTTP client。
+    返回：无返回值；断言通过代表 `UserPromptSubmit` 被映射到同一 session 的 `turn.started`。
+    错误处理：退出码、POST body、session 或 turn 映射不符合契约时由 pytest 报告。
+    副作用：读取测试 stdin JSON；不访问真实 daemon 或 Codex。
+    """
+
+    _install_fake_client(monkeypatch)
+
+    result = runner.invoke(
+        cli.codex_hook_app,
+        ["event"],
+        input=json.dumps(
+            {
+                "hookEventName": "UserPromptSubmit",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "cwd": "/tmp/project",
+            }
+        ),
+    )
+
+    assert result.exit_code == 0
+    request = _FakeClient.requests[0]
+    body = request["kwargs"]["json"]
+    assert request["url"] == f"{cli.DEFAULT_DAEMON_URL}/events"
+    assert body["source"] == "codex"
+    assert body["session_id"] == "session-1"
+    assert body["turn_id"] == "turn-1"
+    assert body["source_event_type"] == "UserPromptSubmit"
+    assert body["normalized_type"] == "turn.started"
+    assert body["cwd"] == "/tmp/project"
+
+
 def _install_fake_client(monkeypatch: Any, fail: bool = False) -> None:
     """Install `_FakeClient` as the CLI's httpx.Client replacement.
 

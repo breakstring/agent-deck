@@ -284,6 +284,8 @@ Codex quota 来自短生命周期 `codex -s read-only -a untrusted app-server` �
 `--render-interval-seconds` 和 `--renderer-fps` 作为临时覆盖项。未来扩展到没有触屏或触屏尺寸
 不同的设备时，应通过设备能力 profile 决定是否显示 quota panel 以及使用哪种 renderer。
 当前 N4 Pro 默认渲染节奏是 3 秒一次、10fps，用来对齐 30 帧 key 动画资产并播放完整动画周期。
+渲染循环调度时必须把单次硬件播放耗时计入这个周期；如果播放本身已经用了 2.9 秒，则下一轮
+最多只等待约 0.1 秒，不能在完整动画之后再固定 sleep 一个完整 interval。
 
 由于 `notify` 和 `otel` 不能由项目级 `.codex/config.toml` 设置，安装器只能改用户级 `~/.codex/config.toml`，并必须先备份。
 
@@ -532,6 +534,12 @@ LED 显示全局聚合状态：
 观测不能因为用户在另一个会话输入、或 SQLite 轮询暂时看不到未完成调用，就把所有会话统一降级；
 归约时必须按 `source + session_id` 定位单个会话，并只在同一会话超过 grace window 后才允许
 `idle` 观测覆盖近期 `thinking` / `running_tool`。
+
+`UserPromptSubmit` 是 session-scoped turn start：hook adapter 必须把它映射为
+`turn.started`，并保留 `session_id` / `turn_id`。状态 store 记录当前 `active_turn_id`；
+后续带 `turn_id` 的 tool、approval、input、error、turn complete 事件如果不属于当前 active
+turn，应作为 stale event 忽略。缺失 `turn_id` 的旧 hook 仍按兼容路径处理，但不能用于跨 session
+广播状态。
 
 ## 决策 broker
 

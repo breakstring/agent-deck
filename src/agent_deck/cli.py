@@ -1289,6 +1289,7 @@ def _normalized_event_type_from_codex_hook(payload: dict[str, Any]) -> EventType
     )
     return {
         "SessionStart": EventType.SESSION_STARTED,
+        "UserPromptSubmit": EventType.TURN_STARTED,
         "PreToolUse": EventType.TOOL_STARTED,
         "PostToolUse": EventType.TOOL_COMPLETED,
         "PermissionRequest": EventType.APPROVAL_REQUESTED,

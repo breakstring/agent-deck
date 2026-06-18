@@ -17,6 +17,17 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
 
 _OBSERVED_IDLE_WORKING_GRACE = timedelta(seconds=30)
+_TURN_SCOPED_EVENT_TYPES = frozenset(
+    {
+        EventType.TURN_COMPLETED,
+        EventType.TOOL_STARTED,
+        EventType.TOOL_COMPLETED,
+        EventType.TOOL_FAILED,
+        EventType.APPROVAL_REQUESTED,
+        EventType.INPUT_REQUESTED,
+        EventType.ERROR,
+    }
+)
 
 
 class AgentStatus(StrEnum):
@@ -42,7 +53,7 @@ class AgentState(BaseModel):
     """Immutable projection of the latest known state for one agent.
 
     入参：字段覆盖 agent identity、展示上下文、当前状态、时间戳、最新摘要、活跃工具、
-    待处理决策数、布局槽位、焦点目标和静音标记；时间字段必须带 timezone。
+    active turn、待处理决策数、布局槽位、焦点目标和静音标记；时间字段必须带 timezone。
     返回：frozen Pydantic model，可通过 `model_copy(update=...)` 派生新版本。
     错误处理：非法枚举、负 pending count 或 naive datetime 由 Pydantic 报告。
     副作用：仅保存内存数据；实例化不访问网络、硬件或文件系统。
@@ -59,6 +70,7 @@ class AgentState(BaseModel):
     last_event_at: datetime
     last_summary: str | None = None
     active_tool: str | None = None
+    active_turn_id: str | None = None
     pending_decision_count: int = Field(default=0, ge=0)
     slot_id: str | None = None
     focus_target: str | None = None
@@ -114,9 +126,12 @@ class AgentStateStore:
 
         current = self._states.get(event.agent_key)
         state = current or self._new_state(event)
+        if _should_ignore_stale_turn_event(state, event):
+            return state
         active_tools = dict(self._active_tools.get(event.agent_key, {}))
         status = state.status
         active_tool = state.active_tool
+        active_turn_id = state.active_turn_id
         pending_count = state.pending_decision_count
         force_status_since = False
 
@@ -125,22 +140,30 @@ class AgentStateStore:
                 status = AgentStatus.IDLE
                 active_tools = {}
                 active_tool = None
+                active_turn_id = None
                 pending_count = 0
             case EventType.SESSION_ENDED:
                 status = AgentStatus.OFFLINE
                 active_tools = {}
                 active_tool = None
+                active_turn_id = None
                 pending_count = 0
                 force_status_since = True
             case EventType.TURN_STARTED:
                 status = AgentStatus.THINKING
+                active_tools = {}
+                active_tool = None
+                active_turn_id = event.turn_id
+                force_status_since = True
             case EventType.TURN_COMPLETED:
                 status, active_tool = _derive_non_terminal_state(
                     pending_count,
                     active_tools,
                     fallback_status=AgentStatus.COMPLETED_RECENTLY,
                 )
+                active_turn_id = None
             case EventType.TOOL_STARTED:
+                active_turn_id = _promote_turn_id(active_turn_id, event.turn_id)
                 tool_name = _tool_name(event)
                 active_tools = _add_tool(active_tools, tool_name)
                 status, active_tool = _derive_non_terminal_state(
@@ -150,6 +173,7 @@ class AgentStateStore:
                     preferred_tool=tool_name,
                 )
             case EventType.TOOL_COMPLETED:
+                active_turn_id = _promote_turn_id(active_turn_id, event.turn_id)
                 active_tools = _remove_tool(active_tools, _tool_name(event) or active_tool)
                 status, active_tool = _derive_non_terminal_state(
                     pending_count,
@@ -157,15 +181,18 @@ class AgentStateStore:
                     fallback_status=AgentStatus.THINKING,
                 )
             case EventType.TOOL_FAILED:
+                active_turn_id = _promote_turn_id(active_turn_id, event.turn_id)
                 active_tools = _remove_tool(active_tools, _tool_name(event) or active_tool)
                 active_tool = _first_tool(active_tools)
                 status = AgentStatus.ERROR
             case EventType.APPROVAL_REQUESTED:
+                active_turn_id = _promote_turn_id(active_turn_id, event.turn_id)
                 tool_name = _tool_name(event)
                 pending_count += 1
                 active_tool = tool_name or active_tool
                 status = AgentStatus.APPROVAL_NEEDED
             case EventType.INPUT_REQUESTED:
+                active_turn_id = _promote_turn_id(active_turn_id, event.turn_id)
                 status = AgentStatus.WAITING_USER
             case EventType.ERROR:
                 status = AgentStatus.ERROR
@@ -179,6 +206,7 @@ class AgentStateStore:
             event=event,
             status=status,
             active_tool=active_tool,
+            active_turn_id=active_turn_id,
             pending_decision_count=pending_count,
             force_status_since=force_status_since,
         )
@@ -365,14 +393,15 @@ class AgentStateStore:
         event: NormalizedEvent,
         status: AgentStatus,
         active_tool: str | None,
+        active_turn_id: str | None,
         pending_decision_count: int,
         force_status_since: bool = False,
     ) -> AgentState:
         """Derive a new frozen state after one reducer transition.
 
         入参：`state` 是旧状态；`event` 提供最新上下文；`status`、`active_tool` 和
-        `pending_decision_count` 是 reducer 计算后的 transient 字段；`force_status_since`
-        用于 session end 等必须刷新进入时间的事件。
+        `active_turn_id` 是当前可防 stale 的 Codex turn；`pending_decision_count` 是 reducer
+        计算后的 transient 字段；`force_status_since` 用于 session end 等必须刷新进入时间的事件。
         返回：更新后的 `AgentState`，不会修改旧实例。
         错误处理：Pydantic 校验异常会向调用方传播。
         副作用：无；只复制内存模型，不访问外部 I/O。
@@ -392,6 +421,7 @@ class AgentStateStore:
                 if event.summary is not None
                 else state.last_summary,
                 "active_tool": active_tool,
+                "active_turn_id": active_turn_id,
                 "pending_decision_count": pending_decision_count,
             }
         )
@@ -430,6 +460,42 @@ def _display_name(event: NormalizedEvent) -> str:
     """
 
     return event.title or event.agent_id or event.session_id
+
+
+def _should_ignore_stale_turn_event(
+    state: AgentState,
+    event: NormalizedEvent,
+) -> bool:
+    """判断一个带 turn id 的事件是否属于旧 turn，应该被当前 session 忽略。
+
+    入参：`state` 是当前 session 的已归约状态；`event` 是待应用的 normalized event。
+    返回：若事件是 turn-scoped、携带 turn id，且与当前 active turn 不一致，则返回 True。
+    错误处理：本函数不抛业务异常；缺失 turn id 的旧 hook 按兼容路径继续处理。
+    副作用：无；只读取内存模型，不访问外部 I/O。
+    """
+
+    if event.normalized_type == EventType.TURN_STARTED:
+        return False
+    if event.normalized_type not in _TURN_SCOPED_EVENT_TYPES:
+        return False
+    if state.active_turn_id is None or event.turn_id is None:
+        return False
+    return event.turn_id != state.active_turn_id
+
+
+def _promote_turn_id(
+    active_turn_id: str | None,
+    event_turn_id: str | None,
+) -> str | None:
+    """在兼容旧 hook 的同时补全当前 session 的 active turn id。
+
+    入参：`active_turn_id` 是状态中已有 turn id；`event_turn_id` 是本轮事件携带的 turn id。
+    返回：已有 turn id 优先；若此前未知且事件携带 turn id，则返回事件 turn id。
+    错误处理：本函数不抛业务异常。
+    副作用：无；只做内存值选择。
+    """
+
+    return active_turn_id or event_turn_id
 
 
 def _ensure_timezone_aware_datetime(value: datetime) -> None:

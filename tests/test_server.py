@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import agent_deck.server.app as server_app
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 from PIL import Image
@@ -374,8 +375,8 @@ def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
         status = client.get("/status").json()
 
     assert quota_touchscreen_calls == []
-    assert len(renderer_calls) == 1
-    call = renderer_calls[0]
+    assert renderer_calls
+    call = renderer_calls[-1]
     assert getattr(call["background_image"], "size") == (800, 480)
     assert call["key_frame_paths"] == {1: (frame_path.resolve(),)}
     assert call["duration_seconds"] == 0.5
@@ -391,6 +392,63 @@ def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
     }
     assert status["streamdock_n4pro_renderer"]["last_error"] is None
     assert status["codex_quota"]["streamdock_touchscreen"] is None
+
+
+async def test_streamdock_n4pro_loop_deducts_render_time_from_interval(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    """Verify N4 Pro render loop does not sleep a full interval after playback.
+
+    入参：`monkeypatch` 替换 renderer once、sleep 和 monotonic；`tmp_path` 提供无访问的
+    fake frame root。
+    返回：无返回值；断言通过代表 loop 先立即渲染，再只等待扣除播放耗时后的剩余周期。
+    错误处理：若 loop 先 sleep、或播放后仍 sleep 完整 interval，由 pytest 报告。
+    副作用：只运行被替换的 coroutine，不访问真实 daemon、quota、文件或硬件。
+    """
+
+    events: list[tuple[str, float]] = []
+    times = iter((10.0, 12.75))
+
+    async def fake_render_once(*args: object, **kwargs: object) -> None:
+        """记录一次 renderer loop 调用。
+
+        入参：忽略 positional args，读取 `duration_seconds`。
+        返回：无返回值。
+        错误处理：缺失参数会由测试失败暴露。
+        副作用：追加内存事件记录。
+        """
+
+        events.append(("render", float(kwargs["duration_seconds"])))
+
+    async def fake_sleep(delay: float) -> None:
+        """记录 loop sleep 并终止无限循环。
+
+        入参：`delay` 是 loop 计算出的剩余等待时间。
+        返回：不返回；总是抛 `CancelledError` 结束测试。
+        错误处理：无业务错误；取消异常由测试捕获。
+        副作用：追加内存事件记录。
+        """
+
+        events.append(("sleep", delay))
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(server_app, "_render_streamdock_n4pro_once", fake_render_once)
+
+    try:
+        await server_app._render_streamdock_n4pro_loop(
+            object(),
+            interval_seconds=3.0,
+            fps=10,
+            frame_root=tmp_path,
+            renderer_sink=lambda **_: StreamDockN4ProAnimationResult(ok=True),
+            sleep=fake_sleep,
+            monotonic=lambda: next(times),
+        )
+    except asyncio.CancelledError:
+        pass
+
+    assert events == [("render", 3.0), ("sleep", 0.25)]
 
 
 def test_decision_request_updates_pending_status_and_decision_layout() -> None:
