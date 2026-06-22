@@ -19,6 +19,12 @@ from agent_deck.hosts.models import (
     ExecutionHostKind,
     RuntimeKind,
 )
+from agent_deck.hosts.processes import (
+    ProcessInfo,
+    StaticProcessTable,
+    infer_direct_pty_host,
+    process_chain,
+)
 
 
 def test_agent_host_context_accepts_tmux_detached_target() -> None:
@@ -82,3 +88,55 @@ def test_agent_host_context_rejects_naive_observed_at() -> None:
             observed_at=datetime(2026, 6, 22, 8, 0),
             confidence=Confidence.LOW,
         )
+
+
+def test_process_chain_finds_otty_direct_pty_host() -> None:
+    """验证 Codex CLI 进程可通过父进程链归因到 Otty direct PTY。
+
+    入参：无；测试内构造 codex -> zsh -> login -> Otty 的静态进程表。
+    返回：无返回值；断言通过代表直接 PTY 宿主可被识别。
+    错误处理：链路顺序或 host 推断不符合预期时由 pytest 报告。
+    副作用：只读取测试内存进程表。
+    """
+
+    table = StaticProcessTable(
+        {
+            15010: ProcessInfo(
+                pid=15010,
+                ppid=11910,
+                command="codex",
+                args=("codex", "resume"),
+                tty="ttys003",
+            ),
+            11910: ProcessInfo(
+                pid=11910,
+                ppid=11904,
+                command="-zsh",
+                args=("-zsh",),
+                tty="ttys003",
+            ),
+            11904: ProcessInfo(
+                pid=11904,
+                ppid=16260,
+                command="/usr/bin/login",
+                args=("/usr/bin/login",),
+                tty="ttys003",
+            ),
+            16260: ProcessInfo(
+                pid=16260,
+                ppid=1,
+                command="/Applications/Otty.app/Contents/MacOS/Otty",
+                args=("/Applications/Otty.app/Contents/MacOS/Otty",),
+                tty=None,
+            ),
+        }
+    )
+
+    chain = process_chain(table, 15010)
+    host = infer_direct_pty_host(chain)
+
+    assert [item.pid for item in chain] == [15010, 11910, 11904, 16260]
+    assert host is not None
+    assert host.app_name == "Otty"
+    assert host.app_pid == 16260
+    assert host.confidence == Confidence.MEDIUM
