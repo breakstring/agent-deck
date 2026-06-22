@@ -67,6 +67,13 @@ N4PRO_TOUCH_BAR_VIEWPORT: Final[VirtualPanelViewport] = VirtualPanelViewport(
     right=800,
     bottom=476,
 )
+N4PRO_LOGICAL_PANEL_VIEWPORT: Final[VirtualPanelViewport] = N4PRO_TOUCH_BAR_VIEWPORT
+"""Agent Deck logical panel 在当前 N4 Pro background 上的默认投影区域。
+
+该常量是 `N4PRO_TOUCH_BAR_VIEWPORT` 的产品语义别名：quota、tokens、pets 和 message
+都应先被视为 logical panel content，再由 renderer 决定当前投影到这个底部 viewport。
+别名本身不改变坐标，也不触发任何硬件写入。
+"""
 
 
 def compose_n4pro_background(

@@ -267,7 +267,8 @@ Codex quota 来自短生命周期 `codex -s read-only -a untrusted app-server` �
 - 每次成功读取后，runtime 保存 `CodexQuotaSnapshot`，并用 `render_quota_touchscreen` 渲染
   N4 Pro 的 800x480 触屏背景图；内容只落在底部 `N4PRO_TOUCH_BAR_VIEWPORT`。
   这里的底部区域是 Agent Deck 的逻辑窗口 / touch bar viewport，不是 quota 专用屏；quota 只是
-  当前默认内容，后续可以切换为审批详情、host context、token 消耗、设置或 ambient 内容。
+  当前默认内容，后续可以切换为 `tokens`、`pets` 或 `message` 内容。`message` 用来承载审批详情、
+  host context、系统提示等需要用户看到的复杂文字信息。
 - daemon 默认执行真实硬件渲染；`agent-deck.toml` 的默认 device profile 是 `n4pro`，因此当前
   内部会使用统一 N4 Pro renderer 在同一次设备会话里写 quota 背景和 Codex 状态按钮动画。
   此时 quota-only 真实触屏 sink 自动关闭，避免两条硬件写入路径互相 `init()` 清屏。
@@ -430,6 +431,8 @@ N4 Pro 需要区分三组概念：
 设备会话里同时写背景和主按键图层；产品语义上它应被看作 logical panel / touch bar viewport，
 后续可由 device capability profile 决定映射到 background viewport、secondary screen slot
 或其他显示目标。
+第一批 logical panel 内容类型是 `quota`、`tokens`、`pets`、`message`；旋钮系统是默认输入方式，
+先映射成切换、滚动、确认等 intent，再由后续 input router 决定是否执行动作。
 
 ### overview
 

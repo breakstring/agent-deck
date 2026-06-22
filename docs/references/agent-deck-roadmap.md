@@ -140,8 +140,8 @@ flowchart LR
 14. Codex quota poller + N4 Pro touch panel
     通过 Codex app-server 读取 quota，默认 5 分钟刷新一次；成功后保存 runtime snapshot，
     渲染到底部 N4 Pro touch-bar viewport，并默认交给真实硬件 renderer 下发。这个 viewport
-    是 Agent Deck 的 logical panel，不是 quota 专用屏；未来应可显示审批详情、host context、
-    token 消耗、设置或 ambient 内容。
+    是 Agent Deck 的 logical panel，不是 quota 专用屏；第一批 panel kind 为 `quota`、
+    `tokens`、`pets`、`message`，其中 `message` 承载审批详情、host context 或系统提示等复杂文字。
     渲染层显示剩余百分比，不改 adapter 的 `used_percent` 原始语义。未来没有触屏能力的设备
     应通过 device profile 禁用该 panel 或切换到其他显示方式。若 daemon 禁用真实硬件
     renderer，则可回退到 quota-only 真实硬件 sink 或纯 fake surface。

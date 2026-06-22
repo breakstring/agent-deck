@@ -16,6 +16,7 @@ from agent_deck.adapters.codex_quota import CodexQuotaSnapshot
 from agent_deck.rendering.n4pro_panel import (
     N4PRO_BACKGROUND_COLOR,
     N4PRO_BACKGROUND_SIZE,
+    N4PRO_LOGICAL_PANEL_VIEWPORT,
     N4PRO_TOUCH_BAR_VIEWPORT,
     VirtualPanelViewport,
     compose_n4pro_background,
@@ -64,7 +65,7 @@ def render_quota_touchscreen(
 def render_quota_panel(
     snapshot: CodexQuotaSnapshot,
     *,
-    size: tuple[int, int] = N4PRO_TOUCH_BAR_VIEWPORT.size,
+    size: tuple[int, int] = N4PRO_LOGICAL_PANEL_VIEWPORT.size,
 ) -> Image.Image:
     """把 Codex quota 快照渲染为底部虚拟 panel 图像。
 

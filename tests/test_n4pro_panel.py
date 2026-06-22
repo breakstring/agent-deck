@@ -10,6 +10,7 @@ from PIL import Image
 
 from agent_deck.rendering.n4pro_panel import (
     N4PRO_BACKGROUND_SIZE,
+    N4PRO_LOGICAL_PANEL_VIEWPORT,
     N4PRO_TOUCH_BAR_VIEWPORT,
     VirtualPanelViewport,
     compose_n4pro_background,
@@ -27,6 +28,7 @@ def test_touch_bar_viewport_matches_calibrated_bottom_panel() -> None:
 
     assert N4PRO_BACKGROUND_SIZE == (800, 480)
     assert N4PRO_TOUCH_BAR_VIEWPORT == VirtualPanelViewport(0, 340, 800, 476)
+    assert N4PRO_LOGICAL_PANEL_VIEWPORT == N4PRO_TOUCH_BAR_VIEWPORT
     assert N4PRO_TOUCH_BAR_VIEWPORT.size == (800, 136)
 
 

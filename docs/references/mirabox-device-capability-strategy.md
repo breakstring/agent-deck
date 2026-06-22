@@ -20,6 +20,9 @@ Agent Deck 当前已经在 N4 Pro 上验证了按键、背景屏和 quota virtua
   event 处理的逻辑槽位。它适合承载 mode、page、focus、deny/snooze、details 等短动作。
 - touch display / touch panel：可渲染较大背景并读取 touch point / swipe 的区域。Agent Deck 应把
   这类区域抽象为逻辑窗口目标，而不是 quota 专用屏。
+- logical panel：Agent Deck 自己的逻辑窗口内容模型。第一批内容类型是 `quota`、`tokens`、
+  `pets`、`message`；它们可以按设备能力映射到底部 background viewport、secondary soft-key
+  slot、外部 companion UI 或未来其他 surface。
 - rotary control：旋钮旋转和旋钮按下。旋钮按下可映射成业务 intent，但不计入 SDK 逻辑 key 数。
 
 本策略把硬件拆成 capability profile，而不是按型号写死交互。原因有三点：
@@ -180,8 +183,8 @@ Agent Deck 当前已经在 N4 Pro 上验证了按键、背景屏和 quota virtua
 - 可渲染较大背景或面板。
 - 可显示多行文本、状态图、列表、quota、pending request 摘要。
 - 可选 touch point、swipe 或 soft key 事件。
-- 可作为 Agent Deck 的逻辑窗口显示目标：quota 只是当前内容之一，后续还可以显示审批详情、
-  host context、token 消耗、宠物或设置。
+- 可作为 Agent Deck 的 logical panel 显示目标：第一批内容包括 quota、tokens、pets、message。
+  `message` 用来承载需要用户看到的复杂文字信息，例如审批上下文、host context 或系统提示。
 
 典型设备：
 
@@ -207,6 +210,8 @@ Agent Deck 当前已经在 N4 Pro 上验证了按键、背景屏和 quota virtua
   当前 quota 画到 800x480 background 的底部 viewport，是为了与主按键图层共存并规避多次
   SDK `init()` 清屏；这不妨碍后续把同一逻辑窗口映射到 secondary screen soft-key slot 或
   touch display 的局部 viewport。
+- 旋钮系统是 logical panel 的默认输入方式：旋钮 1 可用于切换面板和确认，旋钮 2 可用于面板内
+  滚动；具体事件仍应先进入 intent，不直接执行动作。
 
 ### `keyboard_companion`
 
@@ -352,7 +357,7 @@ N4 Pro 应继续作为第一主线，因为它同时覆盖：
 
 - 10 个主 key：Agent / session slots。
 - 5 个 secondary soft-key slot：mode、page、focus、deny/snooze、details。
-- 逻辑面板 / touch bar viewport：quota、当前 Agent 详情、permission request 摘要、host context。
+- 逻辑面板 / touch bar viewport：quota、tokens、pets、message。
   当前实现把它合成到 800x480 background 的底部区域；后续 profile-driven renderer 可以按设备能力
   改映射到 secondary screen slot、touch display viewport 或外部 companion UI。
 - swipe：切页或切 mode。
@@ -472,6 +477,13 @@ SDK logical key count。下一轮代码重构应把它拆成上面的 `physical_
 - rotary control layout：keys + rotary navigation + desktop details。
 - key grid layout：status slots + open details。
 - ambient layout：LED/backlight only。
+
+logical panel 应作为独立于设备 surface 的内容模型进入 layout。第一批 `PanelKind` 固定为：
+
+- `quota`：当前 Codex quota 内容。
+- `tokens`：token 消耗情况。
+- `pets`：宠物或 ambient 角色呈现。
+- `message`：需要用户看到的复杂文字信息，例如审批详情、host context 或系统提示。
 
 ### 3. 把输入先归一成 intent
 
