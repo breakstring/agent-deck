@@ -145,7 +145,11 @@ flowchart LR
     renderer，则可回退到 quota-only 真实硬件 sink 或纯 fake surface。
 
 15. action executor
-    实现 focus target、tmux、AppleScript 激活、递归熔断。
+    实现 focus target、tmux、AppleScript 激活、递归熔断。focus target 必须区分
+    execution host 与 presentation client：tmux 是 Codex CLI 的会话/进程宿主，
+    不是 Terminal、iTerm2、Ghostty、Otty 这类终端 App 的同级枚举。若 Codex CLI
+    运行在 tmux pane 中，`focus_target` 应优先保存 tmux pane id/session/window/pane
+    等结构化目标；终端 App 只是 attach 或展示现有 tmux client 的手段。
 
 16. installer / doctor
     检查 Codex 配置、SDK、设备权限、端口占用、官方软件设备占用，提供 dry-run patch。
@@ -155,7 +159,8 @@ flowchart LR
     用户级 hooks 生成时应带 `_agent_deck=true` 私有标记，刷新或清理时优先按该标记识别
     Agent Deck entry，同时继续兼容旧版本 `agent-deck-codex-hook` command 字符串。
     Hook command 应捕获 Codex hook 运行时 `$PPID` 并作为 `agent_pid` 透传到 normalized
-    payload，作为后续区分 CLI/App、终端、tmux pane 或多实例宿主的基础线索。
+    payload，作为后续区分 CLI/App、direct PTY、tmux pane、attached/detached tmux
+    presentation client 或多实例宿主的基础线索。
 
     Codex hooks 后续优化 backlog：
 
@@ -170,7 +175,10 @@ flowchart LR
       working 动画被延迟事件或本地 scanner 弱信号打断时难以定位。
     - 基于 hook 透传的 `agent_pid` 做宿主存活检测：当会话超过 idle TTL 但 PID 仍存在时
       可降级为 idle；PID 不存在时再隐藏或进入 offline 历史态。后续需要同时考虑 Codex CLI
-      运行在普通终端、otty、tmux、以及 Codex App 多会话时 pid 与 session 的绑定关系。
+      运行在 direct PTY、tmux pane、otty/Ghostty/Terminal presentation client，以及 Codex
+      App 多会话时 pid 与 session 的绑定关系。tmux detached 时应输出可 reattach 的
+      execution target；tmux attached 时应同时记录现有 client 并避免把终端 App 当成
+      唯一事实来源。
     - PermissionRequest 的完整上下文采集保持显式 opt-in：默认 passthrough，只在用户启用
       handle 模式时传递经过脱敏的 request context 给 Agent Deck decision broker。
 
