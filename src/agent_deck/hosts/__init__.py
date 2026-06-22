@@ -16,11 +16,13 @@ from agent_deck.hosts.models import (
     PresentationClientKind,
     RuntimeKind,
 )
+from agent_deck.hosts.codex import CodexHostResolver
 
 __all__ = [
     "ActivationContext",
     "ActivationStrategy",
     "AgentHostContext",
+    "CodexHostResolver",
     "Confidence",
     "ExecutionHostContext",
     "ExecutionHostKind",

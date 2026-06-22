@@ -19,6 +19,7 @@ from agent_deck.hosts.models import (
     ExecutionHostKind,
     RuntimeKind,
 )
+from agent_deck.hosts.codex import CodexHostResolver
 from agent_deck.hosts.processes import (
     ProcessInfo,
     StaticProcessTable,
@@ -217,3 +218,90 @@ def test_tmux_snapshot_lists_attached_clients_for_session() -> None:
 
     assert len(clients) == 1
     assert clients[0].client_pid == 16260
+
+
+def test_codex_resolver_prefers_tmux_pane_over_terminal_app() -> None:
+    """验证 Codex CLI 在 tmux pane 中时 focus target 优先使用 tmux。
+
+    入参：无；测试内构造 Codex 进程链和 tmux snapshot。
+    返回：无返回值；断言通过代表 resolver 不把 Otty 当成唯一宿主事实。
+    错误处理：runtime、execution host 或 activation 策略错误时由 pytest 报告。
+    副作用：只读取测试 fake process table 和 fake tmux snapshot。
+    """
+
+    table = StaticProcessTable(
+        {
+            73879: ProcessInfo(
+                pid=73879,
+                ppid=90077,
+                command="codex",
+                args=("codex", "resume"),
+                tty="ttys006",
+            ),
+            90077: ProcessInfo(
+                pid=90077,
+                ppid=90072,
+                command="-zsh",
+                args=("-zsh",),
+                tty="ttys006",
+            ),
+            90072: ProcessInfo(
+                pid=90072,
+                ppid=16260,
+                command="/usr/bin/login",
+                args=("/usr/bin/login",),
+                tty="ttys006",
+            ),
+            16260: ProcessInfo(
+                pid=16260,
+                ppid=1,
+                command="/Applications/Otty.app/Contents/MacOS/Otty",
+                args=("/Applications/Otty.app/Contents/MacOS/Otty",),
+                tty=None,
+            ),
+        }
+    )
+    snapshot = TmuxSnapshot(
+        panes=(
+            TmuxPane(
+                pane_id="%7",
+                pane_tty="/dev/ttys006",
+                pane_pid=90077,
+                session_name="agent",
+                window_id="@1",
+                window_index=0,
+                pane_index=1,
+                current_path="/repo",
+            ),
+        ),
+        clients=(),
+    )
+
+    context = CodexHostResolver(
+        process_table=table, tmux_snapshot=snapshot
+    ).resolve_cli(agent_pid=73879, cwd="/repo")
+
+    assert context.runtime_kind == RuntimeKind.CODEX_CLI
+    assert context.execution_host.kind == ExecutionHostKind.TMUX_PANE
+    assert context.execution_host.tmux_pane_id == "%7"
+    assert context.activation.strategy == ActivationStrategy.TMUX_REATTACH_NEW_CLIENT
+    assert context.presentation_clients == ()
+
+
+def test_codex_resolver_marks_missing_pid_unknown() -> None:
+    """验证缺失 agent_pid 时 resolver 降级为 unknown。
+
+    入参：无；测试内构造空进程表。
+    返回：无返回值；断言通过代表检测失败不会伪造 focus target。
+    错误处理：降级字段不符合预期时由 pytest 报告。
+    副作用：只读取测试 fake process table。
+    """
+
+    context = CodexHostResolver(
+        process_table=StaticProcessTable({}), tmux_snapshot=TmuxSnapshot()
+    ).resolve_cli(agent_pid=999999)
+
+    assert context.runtime_kind == RuntimeKind.UNKNOWN
+    assert context.execution_host.kind == ExecutionHostKind.UNKNOWN
+    assert context.activation.strategy == ActivationStrategy.UNAVAILABLE
+    assert context.confidence == Confidence.LOW
