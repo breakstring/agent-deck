@@ -36,6 +36,7 @@ _MUTED: Final[tuple[int, int, int]] = (145, 160, 182)
 _TRACK: Final[tuple[int, int, int]] = (44, 54, 76)
 _PRIMARY: Final[tuple[int, int, int]] = (76, 205, 255)
 _SECONDARY: Final[tuple[int, int, int]] = (126, 236, 165)
+_RESET_CREDIT: Final[tuple[int, int, int]] = (248, 213, 113)
 
 
 def render_quota_touchscreen(
@@ -95,10 +96,18 @@ def render_quota_panel(
     label_font = _load_font(22, bold=True)
     value_font = _load_font(17, bold=False)
     percent_font = _load_font(17, bold=True)
+    reset_credit_font = _load_font(18, bold=True)
 
     title_y = top + max(18, (bar_height - 62) // 2)
     plan_label = snapshot.plan_short_label or snapshot.plan_display_name
     draw.text((content_left, title_y), plan_label, fill=_TEXT, font=title_font)
+    _draw_reset_credit_marker(
+        draw,
+        available_count=snapshot.reset_credits_available,
+        origin=(content_left + 2, title_y + 61),
+        icon_size=17,
+        font=reset_credit_font,
+    )
 
     right_x = left + plan_width + 46
     row_gap = max(48, (content_bottom - content_top - 38) // 2)
@@ -246,6 +255,78 @@ def _draw_reset_icon(
     draw.ellipse((left, top, right, bottom), outline=_MUTED, width=2)
     draw.line((cx, cy, cx, cy - radius + 3), fill=_MUTED, width=2)
     draw.line((cx, cy, cx + radius - 3, cy), fill=_MUTED, width=2)
+
+
+def _draw_reset_credit_marker(
+    draw: ImageDraw.ImageDraw,
+    *,
+    available_count: int | None,
+    origin: tuple[int, int],
+    icon_size: int,
+    font: ImageFont.ImageFont,
+) -> None:
+    """在订阅标签下方绘制可用 reset credit 标识。
+
+    入参：`draw` 是绘图对象；`available_count` 是可用 reset 数，None 或 0 表示不绘制；
+    `origin` 是图标左上角；`icon_size` 是钥匙图标尺寸；`font` 是数字字体。
+    返回：无返回值。
+    错误处理：Pillow 绘制失败时异常传播。
+    副作用：修改 `draw` 绑定的内存图像。
+    """
+
+    if available_count is None or available_count <= 0:
+        return
+    x, y = origin
+    _draw_key_icon(draw, (x, y + 3), icon_size)
+    draw.text(
+        (x + icon_size + 8, y + icon_size // 2),
+        str(available_count),
+        fill=_RESET_CREDIT,
+        font=font,
+        anchor="lm",
+    )
+
+
+def _draw_key_icon(
+    draw: ImageDraw.ImageDraw,
+    origin: tuple[int, int],
+    size: int,
+) -> None:
+    """绘制一个小钥匙图标。
+
+    入参：`draw` 是绘图对象；`origin` 是图标左上角；`size` 是图标尺寸。
+    返回：无返回值。
+    错误处理：Pillow 绘制失败时异常传播。
+    副作用：修改 `draw` 绑定的内存图像；不依赖系统 emoji 字体。
+    """
+
+    x, y = origin
+    bow_radius = max(4, size // 4)
+    bow_cx = x + bow_radius + 1
+    bow_cy = y + bow_radius + 1
+    shaft_y = bow_cy
+    shaft_start = bow_cx + bow_radius
+    shaft_end = x + size - 1
+    tooth_x = shaft_end - max(4, size // 4)
+    tooth_h = max(4, size // 4)
+
+    draw.ellipse(
+        (
+            bow_cx - bow_radius,
+            bow_cy - bow_radius,
+            bow_cx + bow_radius,
+            bow_cy + bow_radius,
+        ),
+        outline=_RESET_CREDIT,
+        width=2,
+    )
+    draw.line((shaft_start, shaft_y, shaft_end, shaft_y), fill=_RESET_CREDIT, width=3)
+    draw.line((tooth_x, shaft_y, tooth_x, shaft_y + tooth_h), fill=_RESET_CREDIT, width=3)
+    draw.line(
+        (shaft_end - 2, shaft_y, shaft_end - 2, shaft_y + tooth_h - 1),
+        fill=_RESET_CREDIT,
+        width=2,
+    )
 
 
 def _load_font(size: int, *, bold: bool) -> ImageFont.ImageFont:

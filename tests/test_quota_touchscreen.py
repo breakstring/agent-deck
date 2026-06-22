@@ -104,10 +104,72 @@ def test_render_quota_panel_draws_reset_icon() -> None:
     assert panel.getpixel((660, 35)) == (145, 160, 182)
 
 
-def _snapshot() -> CodexQuotaSnapshot:
-    """构造固定 quota snapshot。
+def test_render_quota_panel_draws_reset_credit_marker() -> None:
+    """有可用 reset credit 时，订阅标签下方应绘制小钥匙标识。
 
     入参：无。
+    返回：无返回值；断言通过表示 reset credit 数量被渲染到左侧订阅信息区域。
+    错误处理：图标缺失或位置漂移时由 pytest 断言报告。
+    副作用：无；只读取内存像素。
+    """
+
+    panel = render_quota_panel(_snapshot(reset_credits_available=1))
+
+    icon_bounds = _color_bounds(panel, (248, 213, 113), x_range=range(30, 58))
+    digit_bounds = _color_bounds(panel, (248, 213, 113), x_range=range(58, 85))
+
+    assert icon_bounds is not None
+    assert digit_bounds is not None
+    assert abs(_bounds_center_y(icon_bounds) - _bounds_center_y(digit_bounds)) <= 1
+
+
+def _color_bounds(
+    image: Image.Image,
+    color: tuple[int, int, int],
+    *,
+    x_range: range,
+    y_range: range = range(85, 120),
+) -> tuple[int, int, int, int] | None:
+    """返回指定颜色在局部区域内的像素包围盒。
+
+    入参：`image` 是待检查图像；`color` 是 RGB 颜色；`x_range`/`y_range` 是扫描范围。
+    返回：存在匹配像素时返回 `(left, top, right, bottom)`，否则返回 None。
+    错误处理：像素读取失败时由 Pillow 异常传播。
+    副作用：无；只读取内存像素。
+    """
+
+    points = [
+        (x, y)
+        for y in y_range
+        for x in x_range
+        if image.getpixel((x, y)) == color
+    ]
+    if not points:
+        return None
+    return (
+        min(x for x, _ in points),
+        min(y for _, y in points),
+        max(x for x, _ in points),
+        max(y for _, y in points),
+    )
+
+
+def _bounds_center_y(bounds: tuple[int, int, int, int]) -> float:
+    """计算像素包围盒的垂直中心。
+
+    入参：`bounds` 是 `(left, top, right, bottom)`。
+    返回：上下边界的算术中心。
+    错误处理：无。
+    副作用：无。
+    """
+
+    return (bounds[1] + bounds[3]) / 2
+
+
+def _snapshot(*, reset_credits_available: int | None = None) -> CodexQuotaSnapshot:
+    """构造固定 quota snapshot。
+
+    入参：`reset_credits_available` 是可选 reset credit 数量，用于验证左侧附加标识。
     返回：用于触屏渲染测试的 `CodexQuotaSnapshot`。
     错误处理：模型字段错误由 Pydantic 报告。
     副作用：无。
@@ -129,5 +191,6 @@ def _snapshot() -> CodexQuotaSnapshot:
             "resets_at": datetime(2026, 6, 24, 13, 47, 28, tzinfo=tz),
         },
         credits_balance="0",
+        reset_credits_available=reset_credits_available,
         raw={},
     )

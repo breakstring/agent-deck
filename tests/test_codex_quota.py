@@ -53,6 +53,9 @@ def test_parse_rate_limits_response_maps_prolite_to_prolite() -> None:
                     "rateLimitReachedType": None,
                 },
                 "rateLimitsByLimitId": {},
+                "rateLimitResetCredits": {
+                    "availableCount": 2,
+                },
             },
         },
         timezone=ZoneInfo("Asia/Shanghai"),
@@ -70,6 +73,7 @@ def test_parse_rate_limits_response_maps_prolite_to_prolite() -> None:
     assert snapshot.secondary.used_percent == 8
     assert snapshot.secondary.window_duration_mins == 10080
     assert snapshot.credits_balance == "0"
+    assert snapshot.reset_credits_available == 2
 
 
 def test_display_plan_name_falls_back_to_plan_type() -> None:

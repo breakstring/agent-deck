@@ -70,7 +70,8 @@ class CodexQuotaSnapshot(BaseModel):
     入参：`plan_type` 是 Codex app-server 返回的标准 plan type；`plan_short_label`
     是 N4 Pro 小屏主标签；`plan_display_name` 是 Agent Deck 完整展示名；`primary`
     是 5 小时窗口；`secondary` 是 weekly 窗口；`credits_balance` 是可选 credits 文本；
-    `raw` 保留原始 result 子集用于调试。
+    `reset_credits_available` 是账号当前可用的 earned reset 数量；`raw` 保留原始 result
+    子集用于调试。
     返回：Pydantic model，可被 renderer 和 CLI 复用。
     错误处理：字段类型非法时由 Pydantic 报告。
     副作用：无；仅保存解析结果。
@@ -84,6 +85,7 @@ class CodexQuotaSnapshot(BaseModel):
     primary: CodexQuotaWindow
     secondary: CodexQuotaWindow
     credits_balance: str | None = None
+    reset_credits_available: int | None = Field(default=None, ge=0)
     raw: dict[str, Any] = Field(default_factory=dict)
 
     def primary_reset_label(self) -> str:
@@ -135,6 +137,9 @@ def parse_rate_limits_response(
     credits_balance = None
     if isinstance(credits, dict):
         credits_balance = _optional_str(credits.get("balance"))
+    reset_credits_available = _parse_reset_credits_available(
+        result.get("rateLimitResetCredits")
+    )
 
     return CodexQuotaSnapshot(
         plan_type=plan_type,
@@ -143,6 +148,7 @@ def parse_rate_limits_response(
         primary=primary,
         secondary=secondary,
         credits_balance=credits_balance,
+        reset_credits_available=reset_credits_available,
         raw=result,
     )
 
@@ -254,6 +260,24 @@ def _optional_str(value: object) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _parse_reset_credits_available(payload: object) -> int | None:
+    """解析可用 Codex earned reset 数量。
+
+    入参：`payload` 是 app-server `rateLimitResetCredits` object，可能为空或缺失。
+    返回：非负整数或 None；None 表示服务端未返回该字段。
+    错误处理：字段存在但不是 object 或 `availableCount` 不能转成整数时抛异常。
+    副作用：无。
+    """
+
+    if payload is None:
+        return None
+    data = _require_mapping(payload, "result.rateLimitResetCredits")
+    value = data.get("availableCount")
+    if value is None:
+        return None
+    return max(0, int(value))
 
 
 def _send_json_rpc(process: subprocess.Popen[str], payload: dict[str, Any]) -> None:
