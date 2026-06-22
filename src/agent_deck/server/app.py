@@ -28,6 +28,10 @@ from agent_deck.adapters.codex_app_state import (
     read_codex_app_active_sessions,
 )
 from agent_deck.adapters.codex_quota import CodexQuotaSnapshot, read_codex_quota
+from agent_deck.adapters.codex_tokens import (
+    CodexTokenUsageSnapshot,
+    read_codex_token_usage,
+)
 from agent_deck.core.decisions import (
     DecisionBehavior,
     DecisionBroker,
@@ -48,11 +52,22 @@ from agent_deck.hardware.streamdock_touchscreen import (
 )
 from agent_deck.rendering.codex_key_frames import codex_key_frame_paths_for_key_variants
 from agent_deck.rendering.layout import LayoutPlan, build_layout_plan
+from agent_deck.rendering.logical_panel import (
+    PanelInputEvent,
+    PanelKind,
+    PanelSelection,
+    apply_panel_input,
+    tokens_panel_plan,
+)
+from agent_deck.rendering.logical_panel_touchscreen import (
+    render_logical_panel_touchscreen,
+)
 from agent_deck.rendering.quota_touchscreen import render_quota_touchscreen
 
 CodexAppStateEventReader = Callable[[], tuple[NormalizedEvent, ...]]
 CodexAppActiveSessionsReader = Callable[..., tuple[CodexAppActiveSession, ...]]
 CodexQuotaReader = Callable[..., CodexQuotaSnapshot]
+CodexTokenUsageReader = Callable[[], CodexTokenUsageSnapshot]
 QuotaTouchscreenSink = Callable[[Any], StreamDockTouchscreenRenderResult]
 StreamDockN4ProRendererSink = Callable[..., StreamDockN4ProAnimationResult]
 
@@ -87,6 +102,8 @@ class DaemonPollerConfig(BaseModel):
     codex_quota_enabled: bool = False
     codex_quota_interval_seconds: float = Field(default=300.0, gt=0)
     codex_quota_timeout_seconds: float = Field(default=10.0, gt=0)
+    codex_token_usage_enabled: bool = False
+    codex_token_usage_interval_seconds: float = Field(default=300.0, gt=0)
     streamdock_quota_touchscreen_enabled: bool = False
     streamdock_quota_device: str = "n4pro"
     streamdock_n4pro_renderer_enabled: bool = False
@@ -131,6 +148,20 @@ class DecisionResolveBody(BaseModel):
     message: str = ""
 
 
+class LogicalPanelInputBody(BaseModel):
+    """Validate one logical panel input event request.
+
+    入参：`event` 是已经从硬件层归一化后的 logical panel 输入事件。
+    返回：FastAPI/Pydantic 构造出的请求模型，供 handler 归约 panel selection。
+    错误处理：非法事件字符串由 FastAPI 映射为 422。
+    副作用：仅保存请求内存数据，不访问硬件、文件或网络。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    event: PanelInputEvent
+
+
 @dataclass
 class _DaemonRuntime:
     """Hold all process-local daemon state used by the HTTP handlers.
@@ -155,6 +186,10 @@ class _DaemonRuntime:
     codex_quota_snapshot: CodexQuotaSnapshot | None
     codex_quota_updated_at: datetime | None
     codex_quota_last_error: str | None
+    codex_token_usage_snapshot: CodexTokenUsageSnapshot | None
+    codex_token_usage_updated_at: datetime | None
+    codex_token_usage_last_error: str | None
+    logical_panel_selection: PanelSelection
     streamdock_quota_touchscreen_result: StreamDockTouchscreenRenderResult | None
     streamdock_n4pro_renderer_result: StreamDockN4ProAnimationResult | None
     streamdock_n4pro_renderer_updated_at: datetime | None
@@ -269,11 +304,105 @@ class _DaemonRuntime:
         self.codex_quota_snapshot = snapshot
         self.codex_quota_updated_at = updated_at
         self.codex_quota_last_error = None
-        image = render_quota_touchscreen(snapshot)
-        self.surface.render_touchscreen_image(
-            image,
-            source="codex_quota",
+        image = self.render_current_logical_panel_image()
+        return image
+
+    def update_codex_token_usage(
+        self,
+        snapshot: CodexTokenUsageSnapshot,
+        *,
+        updated_at: datetime,
+    ) -> Any | None:
+        """Store a token usage snapshot and render it when tokens panel is active.
+
+        入参：`snapshot` 是 token usage adapter 返回的最新快照；`updated_at` 是读取完成时间。
+        返回：若当前 active logical panel 可渲染，则返回刚渲染出的 800x480 背景图，否则返回 None。
+        错误处理：Pillow 渲染失败会向调用方传播，由 poller 捕获记录为 last_error。
+        副作用：更新 runtime token usage 快照；当 active panel 为 tokens 时渲染 fake touchscreen。
+        """
+
+        self.codex_token_usage_snapshot = snapshot
+        self.codex_token_usage_updated_at = updated_at
+        self.codex_token_usage_last_error = None
+        return self.render_current_logical_panel_image()
+
+    def mark_codex_token_usage_poll_error(
+        self,
+        error: Exception,
+        *,
+        polled_at: datetime,
+    ) -> None:
+        """Record a failed token usage poll without clearing the last good snapshot.
+
+        入参：`error` 是 token adapter 或 renderer 异常；`polled_at` 是失败发生时间。
+        返回：无显式返回值。
+        错误处理：本方法不抛业务异常；错误文本会被截断。
+        副作用：更新 token usage 诊断字段；保留旧 snapshot 以便 UI 继续展示。
+        """
+
+        self.codex_token_usage_updated_at = polled_at
+        self.codex_token_usage_last_error = _short_error(error)
+
+    def apply_logical_panel_input(
+        self,
+        body: LogicalPanelInputBody,
+    ) -> dict[str, Any]:
+        """Apply one logical panel input event and render the selected panel.
+
+        入参：`body` 是已校验的 panel input request。
+        返回：JSON-safe selection 和触屏图诊断。
+        错误处理：panel selection 或渲染异常按原语义传播，由 FastAPI 处理。
+        副作用：更新 logical panel selection，并在可渲染时记录 fake touchscreen 图像。
+        """
+
+        self.logical_panel_selection = apply_panel_input(
+            self.logical_panel_selection,
+            body.event,
         )
+        self.render_current_logical_panel_image()
+        return {
+            "selection": _dump_model(self.logical_panel_selection),
+            "touchscreen_image_source": self.surface.last_touchscreen_image_source,
+            "touchscreen_image_size": _image_size(self.surface.last_touchscreen_image),
+        }
+
+    def build_current_logical_panel_background(self) -> tuple[Any, str] | None:
+        """Build the current logical panel background image without recording it.
+
+        入参：无；读取当前 `logical_panel_selection` 和已缓存的 quota/token snapshot。
+        返回：`(image, source)`；当前 panel 缺少数据或暂不可渲染时返回 None。
+        错误处理：Pillow 渲染异常按原语义传播。
+        副作用：只创建内存图像，不修改 fake surface。
+        """
+
+        active_kind = self.logical_panel_selection.active_kind
+        if active_kind == PanelKind.QUOTA and self.codex_quota_snapshot is not None:
+            return render_quota_touchscreen(self.codex_quota_snapshot), "codex_quota"
+        if (
+            active_kind == PanelKind.TOKENS
+            and self.codex_token_usage_snapshot is not None
+        ):
+            plan = tokens_panel_plan(
+                self.codex_token_usage_snapshot,
+                period=self.logical_panel_selection.token_period,
+            )
+            return render_logical_panel_touchscreen(plan), "codex_tokens"
+        return None
+
+    def render_current_logical_panel_image(self) -> Any | None:
+        """Render and record the current logical panel image when possible.
+
+        入参：无。
+        返回：刚记录到 fake surface 的 image；缺少可渲染数据时返回 None。
+        错误处理：Pillow 渲染异常按原语义传播。
+        副作用：可能更新 fake surface 的 touchscreen image 和计数。
+        """
+
+        built = self.build_current_logical_panel_background()
+        if built is None:
+            return None
+        image, source = built
+        self.surface.render_touchscreen_image(image, source=source)
         return image
 
     def update_streamdock_quota_touchscreen_result(
@@ -461,6 +590,19 @@ class _DaemonRuntime:
                     self.streamdock_quota_touchscreen_result
                 ),
             },
+            "codex_tokens": {
+                "snapshot": _dump_optional_model(self.codex_token_usage_snapshot),
+                "updated_at": _dump_datetime(self.codex_token_usage_updated_at),
+                "last_error": self.codex_token_usage_last_error,
+            },
+            "logical_panel": {
+                "selection": _dump_model(self.logical_panel_selection),
+                "touchscreen_render_count": self.surface.touchscreen_render_count,
+                "touchscreen_image_size": _image_size(
+                    self.surface.last_touchscreen_image
+                ),
+                "touchscreen_image_source": self.surface.last_touchscreen_image_source,
+            },
             "streamdock_n4pro_renderer": {
                 "last_result": _dump_optional_model(
                     self.streamdock_n4pro_renderer_result
@@ -595,6 +737,7 @@ def create_app(
     codex_app_state_event_reader: CodexAppStateEventReader = build_codex_app_state_events,
     codex_app_active_sessions_reader: CodexAppActiveSessionsReader = read_codex_app_active_sessions,
     codex_quota_reader: CodexQuotaReader = read_codex_quota,
+    codex_token_usage_reader: CodexTokenUsageReader = read_codex_token_usage,
     quota_touchscreen_sink: QuotaTouchscreenSink = render_touchscreen_image_to_n4pro,
     streamdock_n4pro_renderer_sink: StreamDockN4ProRendererSink | None = None,
 ) -> FastAPI:
@@ -604,6 +747,7 @@ def create_app(
     任何 poller，保持测试和嵌入调用无外部 I/O；`codex_app_state_event_reader` 和
     `codex_app_active_sessions_reader` 读取最近有效 Codex App 会话，生产默认只读扫描本机状态；
     `codex_quota_reader` 是可注入 reader，生产默认读取真实本机 Codex quota；
+    `codex_token_usage_reader` 是可注入 reader，生产默认通过 ccusage 读取 Codex token usage；
     `quota_touchscreen_sink` 是 quota-only 真实硬件触屏下发函数，仅在配置启用时调用；
     `streamdock_n4pro_renderer_sink` 是统一背景+按钮真实硬件下发函数，测试可替换；为空时
     使用 daemon 专用 persistent sink，避免每轮渲染都 close/open N4 Pro。
@@ -629,6 +773,10 @@ def create_app(
         codex_quota_snapshot=None,
         codex_quota_updated_at=None,
         codex_quota_last_error=None,
+        codex_token_usage_snapshot=None,
+        codex_token_usage_updated_at=None,
+        codex_token_usage_last_error=None,
+        logical_panel_selection=PanelSelection(),
         streamdock_quota_touchscreen_result=None,
         streamdock_n4pro_renderer_result=None,
         streamdock_n4pro_renderer_updated_at=None,
@@ -653,6 +801,7 @@ def create_app(
                 codex_app_state_event_reader,
                 codex_app_active_sessions_reader,
                 codex_quota_reader,
+                codex_token_usage_reader,
                 quota_touchscreen_sink,
                 resolved_streamdock_n4pro_renderer_sink,
             )
@@ -688,6 +837,18 @@ def create_app(
                         ),
                         streamdock_device=resolved_poller_config.streamdock_quota_device,
                         quota_touchscreen_sink=quota_touchscreen_sink,
+                    )
+                )
+            )
+        if resolved_poller_config.codex_token_usage_enabled:
+            tasks.append(
+                asyncio.create_task(
+                    _poll_codex_token_usage_loop(
+                        runtime,
+                        interval_seconds=(
+                            resolved_poller_config.codex_token_usage_interval_seconds
+                        ),
+                        token_usage_reader=codex_token_usage_reader,
                     )
                 )
             )
@@ -748,6 +909,20 @@ def create_app(
 
         return runtime.status()
 
+    @app.post("/logical-panel/input")
+    async def post_logical_panel_input(
+        body: LogicalPanelInputBody,
+    ) -> dict[str, Any]:
+        """Apply one logical panel input event.
+
+        入参：`body` 是请求体，包含一个已归一化的 logical panel 输入事件。
+        返回：JSON-safe selection 和触屏图诊断。
+        错误处理：请求体校验失败返回 422；内部渲染异常由 FastAPI 处理。
+        副作用：修改 runtime logical panel selection，并在可渲染时更新 fake touchscreen。
+        """
+
+        return runtime.apply_logical_panel_input(body)
+
     @app.post("/decisions/request")
     async def request_decision(body: DecisionRequestBody) -> dict[str, Any]:
         """Create a pending approval decision.
@@ -805,13 +980,14 @@ async def _run_enabled_pollers_once(
     codex_app_state_event_reader: CodexAppStateEventReader,
     codex_app_active_sessions_reader: CodexAppActiveSessionsReader,
     codex_quota_reader: CodexQuotaReader,
+    codex_token_usage_reader: CodexTokenUsageReader,
     quota_touchscreen_sink: QuotaTouchscreenSink,
     streamdock_n4pro_renderer_sink: StreamDockN4ProRendererSink,
 ) -> None:
     """Run each enabled poller once during app startup.
 
     入参：`runtime` 是 daemon 内存状态；`config` 是 poller 配置；Codex reader、quota reader、
-    触屏 sink 和统一 N4 Pro renderer sink 是可注入数据源/输出端。
+    token usage reader、触屏 sink 和统一 N4 Pro renderer sink 是可注入数据源/输出端。
     返回：无显式返回值。
     错误处理：单个 poller 的异常由 poll-once helper 记录，另一个 poller 仍会继续执行。
     副作用：可能只读访问 Codex 本地状态、启动短生命周期 app-server、更新 runtime 和 fake surface。
@@ -837,6 +1013,11 @@ async def _run_enabled_pollers_once(
             ),
             streamdock_device=config.streamdock_quota_device,
             quota_touchscreen_sink=quota_touchscreen_sink,
+        )
+    if config.codex_token_usage_enabled:
+        await _poll_codex_token_usage_once(
+            runtime,
+            token_usage_reader=codex_token_usage_reader,
         )
     if config.streamdock_n4pro_renderer_enabled:
         await _render_streamdock_n4pro_once(
@@ -913,6 +1094,29 @@ async def _poll_codex_quota_loop(
         )
 
 
+async def _poll_codex_token_usage_loop(
+    runtime: _DaemonRuntime,
+    *,
+    interval_seconds: float,
+    token_usage_reader: CodexTokenUsageReader,
+) -> None:
+    """Periodically refresh Codex token usage and update the active panel.
+
+    入参：`runtime` 是 daemon 内存状态；`interval_seconds` 是两次刷新间隔；
+    `token_usage_reader` 是同步 reader，生产默认会通过 ccusage 读取 Codex token usage。
+    返回：不主动返回；任务被取消时结束。
+    错误处理：单次读取或渲染异常被记录到 runtime，不终止循环。
+    副作用：周期性执行 token usage reader，并在 tokens panel active 时渲染内存触屏图。
+    """
+
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await _poll_codex_token_usage_once(
+            runtime,
+            token_usage_reader=token_usage_reader,
+        )
+
+
 async def _render_streamdock_n4pro_loop(
     runtime: _DaemonRuntime,
     *,
@@ -960,20 +1164,21 @@ async def _render_streamdock_n4pro_once(
     `fps` 是按钮动画刷新率；`frame_root` 是 generated frame 根目录；`renderer_sink`
     是统一背景+按键下发函数。
     返回：无显式返回值。
-    错误处理：缺少 quota snapshot 时跳过不报错；其他构建或 sink 异常记录为 renderer error。
+    错误处理：缺少当前 logical panel 所需 snapshot 时跳过不报错；其他构建或 sink 异常记录为 renderer error。
     副作用：会 render 当前 layout 到 fake surface，并可能在线程中接管真实 N4 Pro。
     """
 
     rendered_at = datetime.now(UTC)
     try:
-        if runtime.codex_quota_snapshot is None:
+        panel_background = runtime.build_current_logical_panel_background()
+        if panel_background is None:
             return
+        background, _source = panel_background
         layout = runtime.render_current()
         key_frame_paths = _key_frame_paths_from_layout(
             layout,
             frame_root=frame_root,
         )
-        background = render_quota_touchscreen(runtime.codex_quota_snapshot)
         result = await asyncio.to_thread(
             renderer_sink,
             background_image=background,
@@ -1098,6 +1303,27 @@ async def _poll_codex_quota_once(
             runtime.update_streamdock_quota_touchscreen_result(result)
     except Exception as exc:  # noqa: BLE001 - poller 必须保护 daemon 主循环。
         runtime.mark_codex_quota_poll_error(exc, polled_at=polled_at)
+
+
+async def _poll_codex_token_usage_once(
+    runtime: _DaemonRuntime,
+    *,
+    token_usage_reader: CodexTokenUsageReader,
+) -> None:
+    """Run one Codex token usage poll and update runtime diagnostics.
+
+    入参：`runtime` 是 daemon 内存状态；`token_usage_reader` 返回 `CodexTokenUsageSnapshot`。
+    返回：无显式返回值。
+    错误处理：reader 或触屏渲染异常会被捕获并记录到 `codex_token_usage_last_error`。
+    副作用：可能执行 ccusage，并在成功时更新 token usage snapshot 和 active logical panel 图。
+    """
+
+    polled_at = datetime.now(UTC)
+    try:
+        snapshot = await asyncio.to_thread(token_usage_reader)
+        runtime.update_codex_token_usage(snapshot, updated_at=polled_at)
+    except Exception as exc:  # noqa: BLE001 - poller 必须保护 daemon 主循环。
+        runtime.mark_codex_token_usage_poll_error(exc, polled_at=polled_at)
 
 
 async def _send_quota_touchscreen_to_streamdock(

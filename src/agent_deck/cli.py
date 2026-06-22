@@ -146,11 +146,26 @@ def daemon_callback(
             help="Disable daemon polling of Codex app-server quota.",
         ),
     ] = False,
+    disable_codex_token_usage_poller: Annotated[
+        bool,
+        typer.Option(
+            "--disable-codex-token-usage-poller",
+            help="Disable daemon polling of Codex token usage via ccusage.",
+        ),
+    ] = False,
     codex_quota_poll_interval_seconds: Annotated[
         float,
         typer.Option(
             "--codex-quota-poll-interval-seconds",
             help="Seconds between Codex quota polls; default is five minutes.",
+            min=1.0,
+        ),
+    ] = 300.0,
+    codex_token_usage_poll_interval_seconds: Annotated[
+        float,
+        typer.Option(
+            "--codex-token-usage-poll-interval-seconds",
+            help="Seconds between Codex token usage polls; default is five minutes.",
             min=1.0,
         ),
     ] = 300.0,
@@ -216,6 +231,8 @@ def daemon_callback(
     `disable_codex_quota_poller` 可关闭默认 Codex pollers；状态 scan limit、active window
     和 active session limit 控制 Codex App 最近有效会话筛选；两个 interval 控制状态扫描和
     quota 刷新周期；`codex_quota_timeout_seconds` 控制单次 quota app-server 读取超时；
+    `disable_codex_token_usage_poller` 可关闭基于 ccusage 的 Codex token usage 读取；
+    `codex_token_usage_poll_interval_seconds` 控制 token usage 刷新周期；
     `disable_streamdock_quota_touchscreen` 可关闭旧 quota-only 真实硬件触屏下发；
     `config_path` 指向 daemon 默认配置；`disable_hardware_renderer` 可关闭默认真实硬件渲染；
     `device_profile`、`render_interval_seconds` 和 `renderer_fps` 是面向临时调试的通用覆盖项，
@@ -259,6 +276,8 @@ def daemon_callback(
         codex_quota_enabled=not disable_codex_quota_poller,
         codex_quota_interval_seconds=codex_quota_poll_interval_seconds,
         codex_quota_timeout_seconds=codex_quota_timeout_seconds,
+        codex_token_usage_enabled=not disable_codex_token_usage_poller,
+        codex_token_usage_interval_seconds=codex_token_usage_poll_interval_seconds,
         streamdock_quota_touchscreen_enabled=(
             not disable_streamdock_quota_touchscreen
             and not hardware_renderer.enabled

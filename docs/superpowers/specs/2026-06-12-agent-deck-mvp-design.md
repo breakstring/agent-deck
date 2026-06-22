@@ -264,28 +264,37 @@ Codex quota 来自短生命周期 `codex -s read-only -a untrusted app-server` �
 中的独立快照：
 
 - `agent-deckd` 默认启用 quota poller，启动时先读取一次，之后默认每 300 秒刷新一次。
-- 每次成功读取后，runtime 保存 `CodexQuotaSnapshot`，并用 `render_quota_touchscreen` 渲染
+- 每次 quota 成功读取后，runtime 保存 `CodexQuotaSnapshot`，并用 `render_quota_touchscreen` 渲染
   N4 Pro 的 800x480 触屏背景图；内容只落在底部 `N4PRO_TOUCH_BAR_VIEWPORT`。
   这里的底部区域是 Agent Deck 的逻辑窗口 / touch bar viewport，不是 quota 专用屏；quota 只是
   当前默认内容，后续可以切换为 `tokens`、`pets` 或 `message` 内容。`message` 用来承载审批详情、
   host context、系统提示等需要用户看到的复杂文字信息。
+- `agent-deckd` 默认启用 token usage poller，启动时先读取一次，之后默认每 300 秒通过
+  `ccusage codex daily --compact --json` 读取 Codex token usage；runtime 保存
+  `CodexTokenUsageSnapshot`，并在 active logical panel 为 `tokens` 时用
+  `render_logical_panel_touchscreen` 渲染到底部 viewport。
+- `/logical-panel/input` 接收已经归一化的 panel input event，例如 `touch.tap`；当前实现用
+  touch tap 循环切换 `quota -> tokens -> pets -> message`，后续真实硬件输入 router 应把
+  N4 Pro touch point / soft-key / tap 事件转换成同一组 `PanelInputEvent`。
 - daemon 默认执行真实硬件渲染；`agent-deck.toml` 的默认 device profile 是 `n4pro`，因此当前
   内部会使用统一 N4 Pro renderer 在同一次设备会话里写 quota 背景和 Codex 状态按钮动画。
   此时 quota-only 真实触屏 sink 自动关闭，避免两条硬件写入路径互相 `init()` 清屏。
 - 没有触屏能力、不希望接管硬件，或需要排查旧 quota-only 下发链路时，可用
   `--disable-hardware-renderer` 和 `--disable-streamdock-quota-touchscreen` 组合关闭真实硬件写入。
-- `/status` 暴露最新 quota snapshot、更新时间、最近错误、触屏图渲染计数和真实
-  StreamDock 下发结果；统一 renderer 还会暴露最近一次背景+按钮下发结果，便于判断是
-  quota 读取失败、图片渲染失败、帧目录缺失还是设备被占用。
+- `/status` 暴露最新 quota snapshot、token usage snapshot、logical panel selection、更新时间、
+  最近错误、触屏图渲染计数和真实 StreamDock 下发结果；统一 renderer 还会暴露最近一次
+  背景+按钮下发结果，便于判断是 quota/token 读取失败、图片渲染失败、帧目录缺失还是设备被占用。
 - quota 渲染层展示剩余百分比，即 `100 - used_percent`；adapter 仍保留 app-server
   返回的原始 `used_percent` 语义。
 
 命令行可用 `--disable-codex-quota-poller` 关闭 quota 刷新，用
-`--codex-quota-poll-interval-seconds` 调整刷新间隔，用 `--codex-quota-timeout-seconds`
-控制单次 app-server 读取超时。真实硬件渲染的 `device_profile`、`render_interval_seconds`、
-`fps` 和 `frame_root` 默认值写在 `agent-deck.toml`；CLI 提供 `--device-profile`、
-`--render-interval-seconds` 和 `--renderer-fps` 作为临时覆盖项。未来扩展到没有触屏或触屏尺寸
-不同的设备时，应通过设备能力 profile 决定是否显示 quota panel 以及使用哪种 renderer。
+`--codex-quota-poll-interval-seconds` 调整 quota 刷新间隔，用 `--codex-quota-timeout-seconds`
+控制单次 app-server 读取超时；可用 `--disable-codex-token-usage-poller` 关闭 token usage 读取，
+用 `--codex-token-usage-poll-interval-seconds` 调整 token usage 刷新间隔。真实硬件渲染的
+`device_profile`、`render_interval_seconds`、`fps` 和 `frame_root` 默认值写在
+`agent-deck.toml`；CLI 提供 `--device-profile`、`--render-interval-seconds` 和
+`--renderer-fps` 作为临时覆盖项。未来扩展到没有触屏或触屏尺寸不同的设备时，应通过设备能力
+profile 决定是否显示 logical panel 以及使用哪种 renderer。
 当前 N4 Pro 默认渲染节奏是 3 秒一次、10fps，用来对齐 30 帧 key 动画资产并播放完整动画周期。
 渲染循环调度时必须把单次硬件播放耗时计入这个周期；如果播放本身已经用了 2.9 秒，则下一轮
 最多只等待约 0.1 秒，不能在完整动画之后再固定 sleep 一个完整 interval。

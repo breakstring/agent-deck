@@ -495,6 +495,8 @@ def test_daemon_callback_calls_uvicorn_run(monkeypatch: Any) -> None:
     assert poller_config.codex_quota_enabled is True
     assert poller_config.codex_quota_interval_seconds == 300.0
     assert poller_config.codex_quota_timeout_seconds == 10.0
+    assert poller_config.codex_token_usage_enabled is True
+    assert poller_config.codex_token_usage_interval_seconds == 300.0
     assert poller_config.streamdock_quota_touchscreen_enabled is False
     assert poller_config.streamdock_quota_device == "n4pro"
     assert poller_config.streamdock_n4pro_renderer_enabled is True
@@ -525,6 +527,7 @@ def test_daemon_callback_can_disable_codex_pollers(monkeypatch: Any) -> None:
         [
             "--disable-codex-app-state-poller",
             "--disable-codex-quota-poller",
+            "--disable-codex-token-usage-poller",
             "--disable-streamdock-quota-touchscreen",
             "--disable-hardware-renderer",
         ],
@@ -534,6 +537,7 @@ def test_daemon_callback_can_disable_codex_pollers(monkeypatch: Any) -> None:
     poller_config = create_app_calls[0]["poller_config"]
     assert poller_config.codex_app_state_enabled is False
     assert poller_config.codex_quota_enabled is False
+    assert poller_config.codex_token_usage_enabled is False
     assert poller_config.streamdock_quota_touchscreen_enabled is False
     assert poller_config.streamdock_n4pro_renderer_enabled is False
 

@@ -20,6 +20,11 @@ from PIL import Image
 
 from agent_deck.adapters.codex_app_state import CodexAppActiveSession
 from agent_deck.adapters.codex_quota import CodexQuotaSnapshot
+from agent_deck.adapters.codex_tokens import (
+    CodexTokenPeriod,
+    CodexTokenUsageSnapshot,
+    CodexTokenUsageStats,
+)
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
 from agent_deck.core.state import AgentStatus
 from agent_deck.hardware.streamdock_n4pro import StreamDockN4ProAnimationResult
@@ -264,6 +269,56 @@ def test_codex_quota_poller_sends_touchscreen_to_streamdock_sink() -> None:
         "path": "n4pro-path",
         "sdk_result": "0",
     }
+
+
+def test_codex_token_poller_updates_status_and_tokens_panel_frame() -> None:
+    """Verify daemon token poller refreshes snapshot and touch tap shows tokens.
+
+    入参：无；测试内注入 fake token reader，并用 logical panel input 模拟 touch bar 点击。
+    返回：无返回值；断言通过代表 token usage 能进入 daemon runtime 并渲染 tokens 面板。
+    错误处理：reader 未调用、status 未暴露或 panel 未切换/渲染时由 pytest 报告。
+    副作用：只在内存中生成 Pillow 图像，不执行 ccusage 或访问真实 N4 Pro。
+    """
+
+    calls = 0
+
+    def fake_token_reader() -> CodexTokenUsageSnapshot:
+        """返回固定 token usage snapshot 并记录调用次数。
+
+        入参：无。
+        返回：固定 `CodexTokenUsageSnapshot`。
+        错误处理：模型字段非法时由 Pydantic 报告。
+        副作用：递增测试内 `calls`。
+        """
+
+        nonlocal calls
+        calls += 1
+        return _token_snapshot()
+
+    app = create_app(
+        poller_config=DaemonPollerConfig(codex_token_usage_enabled=True),
+        codex_token_usage_reader=fake_token_reader,
+    )
+    with TestClient(app) as client:
+        initial = client.get("/status").json()
+        switch_response = client.post(
+            "/logical-panel/input",
+            json={"event": "touch.tap"},
+        )
+        status = client.get("/status").json()
+
+    assert calls == 1
+    assert initial["codex_tokens"]["snapshot"]["periods"]["today"]["total_tokens"] == (
+        118_008_949
+    )
+    assert initial["codex_tokens"]["last_error"] is None
+    assert initial["codex_tokens"]["updated_at"] is not None
+    assert switch_response.status_code == 200
+    assert switch_response.json()["selection"]["active_kind"] == "tokens"
+    assert status["logical_panel"]["selection"]["active_kind"] == "tokens"
+    assert status["logical_panel"]["selection"]["token_period"] == "today"
+    assert status["logical_panel"]["touchscreen_image_source"] == "codex_tokens"
+    assert status["logical_panel"]["touchscreen_image_size"] == [800, 480]
 
 
 def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
@@ -868,5 +923,29 @@ def _quota_snapshot() -> CodexQuotaSnapshot:
             "resets_at": datetime(2026, 6, 24, 13, 47, 28, tzinfo=tz),
         },
         credits_balance="0",
+        raw={},
+    )
+
+
+def _token_snapshot() -> CodexTokenUsageSnapshot:
+    """构造固定 token usage snapshot 供 daemon poller 测试使用。
+
+    入参：无。
+    返回：包含 today/week/month/all 四个周期的 `CodexTokenUsageSnapshot`。
+    错误处理：字段非法时由 Pydantic 抛出并交给 pytest。
+    副作用：无；只创建内存模型。
+    """
+
+    stats = CodexTokenUsageStats(
+        input_tokens=6_465_793,
+        output_tokens=436_596,
+        reasoning_output_tokens=110_065,
+        cache_read_tokens=111_106_560,
+        total_tokens=118_008_949,
+        cost_usd=100.98012500000002,
+    )
+    return CodexTokenUsageSnapshot(
+        periods={period: stats for period in CodexTokenPeriod},
+        updated_at=datetime(2026, 6, 22, 12, 0, tzinfo=UTC),
         raw={},
     )
