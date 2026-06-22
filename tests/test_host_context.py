@@ -25,6 +25,13 @@ from agent_deck.hosts.processes import (
     infer_direct_pty_host,
     process_chain,
 )
+from agent_deck.hosts.tmux import (
+    TmuxClient,
+    TmuxPane,
+    TmuxSnapshot,
+    clients_for_session,
+    find_pane_for_tty,
+)
 
 
 def test_agent_host_context_accepts_tmux_detached_target() -> None:
@@ -140,3 +147,73 @@ def test_process_chain_finds_otty_direct_pty_host() -> None:
     assert host.app_name == "Otty"
     assert host.app_pid == 16260
     assert host.confidence == Confidence.MEDIUM
+
+
+def test_tmux_snapshot_detects_detached_pane_by_tty() -> None:
+    """验证 tmux pane 可通过 pane_tty 绑定 Codex CLI TTY，并识别 detached。
+
+    入参：无；测试内构造没有 client 的 tmux snapshot。
+    返回：无返回值；断言通过代表 detached pane 可被匹配。
+    错误处理：pane 匹配失败时由 pytest 报告。
+    副作用：只读取测试内存 snapshot。
+    """
+
+    snapshot = TmuxSnapshot(
+        panes=(
+            TmuxPane(
+                pane_id="%7",
+                pane_tty="/dev/ttys006",
+                pane_pid=90077,
+                session_name="agent",
+                window_id="@1",
+                window_index=0,
+                pane_index=1,
+                current_path="/Users/kenn/Projects/agent-deck",
+            ),
+        ),
+        clients=(),
+    )
+
+    pane = find_pane_for_tty(snapshot, "ttys006")
+
+    assert pane is not None
+    assert pane.pane_id == "%7"
+    assert clients_for_session(snapshot, "agent") == ()
+
+
+def test_tmux_snapshot_lists_attached_clients_for_session() -> None:
+    """验证 attached tmux session 能列出 presentation clients。
+
+    入参：无；测试内构造一个 pane 和一个 client。
+    返回：无返回值；断言通过代表 client 可按 session 归组。
+    错误处理：client 过滤错误时由 pytest 报告。
+    副作用：只读取测试内存 snapshot。
+    """
+
+    snapshot = TmuxSnapshot(
+        panes=(
+            TmuxPane(
+                pane_id="%7",
+                pane_tty="/dev/ttys006",
+                pane_pid=90077,
+                session_name="agent",
+                window_id="@1",
+                window_index=0,
+                pane_index=1,
+                current_path="/Users/kenn/Projects/agent-deck",
+            ),
+        ),
+        clients=(
+            TmuxClient(
+                client_tty="/dev/ttys010",
+                client_pid=16260,
+                session_name="agent",
+                client_activity=1782111632,
+            ),
+        ),
+    )
+
+    clients = clients_for_session(snapshot, "agent")
+
+    assert len(clients) == 1
+    assert clients[0].client_pid == 16260
