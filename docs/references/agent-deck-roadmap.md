@@ -144,7 +144,8 @@ flowchart LR
     `tokens`、`pets`、`message`，其中 `message` 承载审批详情、host context 或系统提示等复杂文字。
     touch bar tap/click 用于切换 logical panel；daemon 默认启用 token usage poller，tokens 面板通过
     `ccusage codex daily --compact --json` 读取 Codex token usage，聚合 today/week/month/all。
-    `/logical-panel/input` 先提供归一化输入入口，旋钮 4 每次旋转事件切换一个统计周期。
+    `/logical-panel/input` 提供归一化 panel 事件入口，`/hardware/input` 提供低层 `HardwareInput`
+    入口并把 N4 Pro touch point / knob4 rotate 映射到 panel event；旋钮 4 每次旋转事件切换一个统计周期。
     渲染层显示剩余百分比，不改 quota adapter 的 `used_percent` 原始语义。未来没有触屏能力的
     设备应通过 device profile 禁用该 panel 或切换到其他显示方式。若 daemon 禁用真实硬件
     renderer，则可回退到 quota-only 真实硬件 sink 或纯 fake surface。

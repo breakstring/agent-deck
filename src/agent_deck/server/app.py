@@ -41,7 +41,7 @@ from agent_deck.core.decisions import (
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
 from agent_deck.core.modes import DeckSelection
 from agent_deck.core.state import AgentState, AgentStateStore
-from agent_deck.hardware.fake import FakeHardwareSurface
+from agent_deck.hardware.fake import FakeHardwareSurface, HardwareInput
 from agent_deck.hardware.streamdock_n4pro import (
     StreamDockN4ProAnimationResult,
     StreamDockN4ProPersistentAnimator,
@@ -50,6 +50,7 @@ from agent_deck.hardware.streamdock_touchscreen import (
     StreamDockTouchscreenRenderResult,
     render_touchscreen_image_to_n4pro,
 )
+from agent_deck.input.logical_panel import panel_event_from_hardware_input
 from agent_deck.rendering.codex_key_frames import codex_key_frame_paths_for_key_variants
 from agent_deck.rendering.layout import LayoutPlan, build_layout_plan
 from agent_deck.rendering.logical_panel import (
@@ -364,6 +365,29 @@ class _DaemonRuntime:
             "selection": _dump_model(self.logical_panel_selection),
             "touchscreen_image_source": self.surface.last_touchscreen_image_source,
             "touchscreen_image_size": _image_size(self.surface.last_touchscreen_image),
+        }
+
+    def apply_hardware_input(self, event: HardwareInput) -> dict[str, Any]:
+        """Apply one low-level hardware input event through input routers.
+
+        入参：`event` 是已归一化的低层硬件输入，可能来自 fake surface 或真实 SDK listener。
+        返回：JSON-safe dict，说明是否被 logical panel 处理以及当前 selection。
+        错误处理：panel 渲染异常按原语义传播；无法映射的输入返回 handled=false。
+        副作用：当输入映射到 logical panel event 时更新 selection 并可能渲染 fake touchscreen。
+        """
+
+        panel_event = panel_event_from_hardware_input(event)
+        if panel_event is None:
+            return {
+                "handled": False,
+                "panel_event": None,
+                "selection": _dump_model(self.logical_panel_selection),
+            }
+        result = self.apply_logical_panel_input(LogicalPanelInputBody(event=panel_event))
+        return {
+            "handled": True,
+            "panel_event": panel_event.value,
+            **result,
         }
 
     def build_current_logical_panel_background(self) -> tuple[Any, str] | None:
@@ -922,6 +946,18 @@ def create_app(
         """
 
         return runtime.apply_logical_panel_input(body)
+
+    @app.post("/hardware/input")
+    async def post_hardware_input(event: HardwareInput) -> dict[str, Any]:
+        """Apply one low-level hardware input event.
+
+        入参：`event` 是请求体中的 `HardwareInput` JSON，由 FastAPI 校验。
+        返回：JSON-safe dict，说明输入是否被 logical panel router 处理。
+        错误处理：请求体校验失败返回 422；内部渲染异常由 FastAPI 处理。
+        副作用：可能更新 runtime logical panel selection，并在可渲染时更新 fake touchscreen。
+        """
+
+        return runtime.apply_hardware_input(event)
 
     @app.post("/decisions/request")
     async def request_decision(body: DecisionRequestBody) -> dict[str, Any]:

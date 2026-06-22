@@ -274,8 +274,10 @@ Codex quota 来自短生命周期 `codex -s read-only -a untrusted app-server` �
   `CodexTokenUsageSnapshot`，并在 active logical panel 为 `tokens` 时用
   `render_logical_panel_touchscreen` 渲染到底部 viewport。
 - `/logical-panel/input` 接收已经归一化的 panel input event，例如 `touch.tap`；当前实现用
-  touch tap 循环切换 `quota -> tokens -> pets -> message`，后续真实硬件输入 router 应把
-  N4 Pro touch point / soft-key / tap 事件转换成同一组 `PanelInputEvent`。
+  touch tap 循环切换 `quota -> tokens -> pets -> message`。
+- `/hardware/input` 接收低层 `HardwareInput`，并通过 input router 映射到 logical panel event。
+  N4 Pro touch point 落在底部 logical panel viewport 内时映射为 `touch.tap`；第 4 旋钮左右旋转
+  映射为 `knob_4.rotate_left/right`，用于 tokens 面板切换 today/week/month/all。
 - daemon 默认执行真实硬件渲染；`agent-deck.toml` 的默认 device profile 是 `n4pro`，因此当前
   内部会使用统一 N4 Pro renderer 在同一次设备会话里写 quota 背景和 Codex 状态按钮动画。
   此时 quota-only 真实触屏 sink 自动关闭，避免两条硬件写入路径互相 `init()` 清屏。

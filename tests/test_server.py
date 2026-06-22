@@ -27,6 +27,7 @@ from agent_deck.adapters.codex_tokens import (
 )
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
 from agent_deck.core.state import AgentStatus
+from agent_deck.hardware.fake import HardwareInput
 from agent_deck.hardware.streamdock_n4pro import StreamDockN4ProAnimationResult
 from agent_deck.hardware.streamdock_touchscreen import StreamDockTouchscreenRenderResult
 from agent_deck.server.app import DaemonPollerConfig, create_app
@@ -319,6 +320,48 @@ def test_codex_token_poller_updates_status_and_tokens_panel_frame() -> None:
     assert status["logical_panel"]["selection"]["token_period"] == "today"
     assert status["logical_panel"]["touchscreen_image_source"] == "codex_tokens"
     assert status["logical_panel"]["touchscreen_image_size"] == [800, 480]
+
+
+def test_hardware_input_endpoint_routes_touch_and_knob_to_logical_panel() -> None:
+    """Verify low-level hardware input drives logical panel selection.
+
+    入参：无；测试内先注入 token snapshot，再 POST touch/knob hardware input。
+    返回：无返回值；断言通过代表 fake/真实监听器可复用同一低层输入入口。
+    错误处理：HTTP 状态、panel 切换或 token 周期变化错误时由 pytest 报告。
+    副作用：只修改测试 app 的内存 runtime，不访问真实硬件。
+    """
+
+    app = create_app(
+        poller_config=DaemonPollerConfig(codex_token_usage_enabled=True),
+        codex_token_usage_reader=_token_snapshot,
+    )
+    with TestClient(app) as client:
+        touch_response = client.post(
+            "/hardware/input",
+            json=_hardware_input(
+                kind="touch",
+                index=0,
+                value={"x": 120, "y": 380},
+            ),
+        )
+        knob_response = client.post(
+            "/hardware/input",
+            json=_hardware_input(
+                kind="knob",
+                index=4,
+                value={"action": "rotate", "direction": "right"},
+            ),
+        )
+        status = client.get("/status").json()
+
+    assert touch_response.status_code == 200
+    assert touch_response.json()["handled"] is True
+    assert touch_response.json()["panel_event"] == "touch.tap"
+    assert knob_response.status_code == 200
+    assert knob_response.json()["handled"] is True
+    assert knob_response.json()["panel_event"] == "knob_4.rotate_right"
+    assert status["logical_panel"]["selection"]["active_kind"] == "tokens"
+    assert status["logical_panel"]["selection"]["token_period"] == "week"
 
 
 def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
@@ -836,6 +879,28 @@ def _event(
         occurred_at=occurred_at,
         received_at=occurred_at + timedelta(milliseconds=1),
     )
+
+
+def _hardware_input(
+    *,
+    kind: str,
+    index: int,
+    value: object,
+) -> dict[str, object]:
+    """构造可提交给 `/hardware/input` 的 JSON-safe hardware input。
+
+    入参：`kind`、`index` 和 `value` 描述低层硬件输入。
+    返回：`HardwareInput.model_dump(mode="json")` 的 dict。
+    错误处理：字段非法由 `HardwareInput` 校验并交给 pytest。
+    副作用：只创建内存模型。
+    """
+
+    return {
+        "kind": kind,
+        "index": index,
+        "value": value,
+        "occurred_at": datetime(2026, 6, 22, 12, 0, tzinfo=UTC).isoformat(),
+    }
 
 
 def _request_decision(
