@@ -257,6 +257,11 @@ P4.5 关键设计点：
 - 支持 WebSocket SDK transport。
 - 将设备能力 profile 独立配置。
 
+策略参考：
+
+- `docs/references/mirabox-device-capability-strategy.md`：按 capability profile 设计
+  Mirabox / Stream Dock 设备支持，不按单一型号写死 Agent Deck 功能。
+
 可拆任务：
 
 1. `HardwareSurface` 接口稳定化。
