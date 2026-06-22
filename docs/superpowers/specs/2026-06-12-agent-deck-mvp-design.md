@@ -266,6 +266,8 @@ Codex quota 来自短生命周期 `codex -s read-only -a untrusted app-server` �
 - `agent-deckd` 默认启用 quota poller，启动时先读取一次，之后默认每 300 秒刷新一次。
 - 每次成功读取后，runtime 保存 `CodexQuotaSnapshot`，并用 `render_quota_touchscreen` 渲染
   N4 Pro 的 800x480 触屏背景图；内容只落在底部 `N4PRO_TOUCH_BAR_VIEWPORT`。
+  这里的底部区域是 Agent Deck 的逻辑窗口 / touch bar viewport，不是 quota 专用屏；quota 只是
+  当前默认内容，后续可以切换为审批详情、host context、token 消耗、设置或 ambient 内容。
 - daemon 默认执行真实硬件渲染；`agent-deck.toml` 的默认 device profile 是 `n4pro`，因此当前
   内部会使用统一 N4 Pro renderer 在同一次设备会话里写 quota 背景和 Codex 状态按钮动画。
   此时 quota-only 真实触屏 sink 自动关闭，避免两条硬件写入路径互相 `init()` 清屏。
@@ -417,15 +419,27 @@ AgentState + PendingDecision + SelectedAgent + DeckMode
 
 第一版使用逻辑区域，不依赖硬件物理编号含义。下面是各 DeckMode 的初始投影方式。
 
+N4 Pro 需要区分三组概念：
+
+- 10 个物理主 LCD key：用户肉眼看到的主按钮。
+- 15 个 SDK 逻辑 key slot：10 个主 key 加 5 个 secondary screen / soft-key slot；这不是
+  15 个物理主按钮。
+- 4 个旋钮：旋转和按下都应作为 rotary intent 处理，不计入逻辑 key slot。
+
+当前 quota/详情区域被合成到 800x480 background 的底部 viewport，是为了在同一次 N4 Pro
+设备会话里同时写背景和主按键图层；产品语义上它应被看作 logical panel / touch bar viewport，
+后续可由 device capability profile 决定映射到 background viewport、secondary screen slot
+或其他显示目标。
+
 ### overview
 
 默认模式。展示所有 Agent/session slots 和少量全局动作。
 
 按键区：
 
-- `keys 1-10`：Agent/session slots。
-- `keys 11-14`：上下文动作区。
-- `key 15`：全局模式/返回/当前详情。
+- `keys 1-10`：10 个物理主 LCD key，对应 Agent/session slots。
+- `keys 11-14`：SDK secondary soft-key slot，对应上下文动作区。
+- `key 15`：SDK secondary soft-key slot，对应全局模式/返回/当前详情。
 
 触屏：
 

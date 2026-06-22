@@ -11,6 +11,17 @@ Agent Deck 当前已经在 N4 Pro 上验证了按键、背景屏和 quota virtua
 不同 Mirabox 硬件适合承载哪些 Agent Deck 能力，以及哪些能力必须受显示面积、输入方式和
 安全上下文约束。
 
+术语说明：
+
+- 物理主按键：用户肉眼可见、可独立按下的 LCD key。N4 Pro 官方资料描述为 10 个。
+- SDK 逻辑 key：Python SDK 中 `ButtonKey.KEY_*` 的逻辑编号。它可能包含物理主按键，也可能包含
+  secondary screen / soft-key 区域，不等同于物理按钮数量。
+- secondary screen / soft-key slot：下方触控/显示区域内可被 SDK 当作 key image 或 button-like
+  event 处理的逻辑槽位。它适合承载 mode、page、focus、deny/snooze、details 等短动作。
+- touch display / touch panel：可渲染较大背景并读取 touch point / swipe 的区域。Agent Deck 应把
+  这类区域抽象为逻辑窗口目标，而不是 quota 专用屏。
+- rotary control：旋钮旋转和旋钮按下。旋钮按下可映射成业务 intent，但不计入 SDK 逻辑 key 数。
+
 本策略把硬件拆成 capability profile，而不是按型号写死交互。原因有三点：
 
 1. Mirabox 产品线覆盖按键矩阵、触控条、触摸点、旋钮、RGB LED、键盘背光等不同能力。
@@ -49,8 +60,10 @@ Agent Deck 当前已经在 N4 Pro 上验证了按键、背景屏和 quota virtua
 - `vendor/streamdock-python-sdk/src/StreamDock/InputTypes.py` 定义统一事件类型：
   `BUTTON`、`KNOB_ROTATE`、`KNOB_PRESS`、`SWIPE`、`TOUCH_POINT`。
 - `vendor/streamdock-python-sdk/src/StreamDock/Devices/StreamDockN4Pro.py`：
-  `KEY_COUNT = 15`，支持 15 个逻辑 key、4 个旋钮、旋钮按下、左右 swipe、touch point 解码、
-  800x480 background、key image 和 frame background。
+  `KEY_COUNT = 15` 是 SDK 逻辑 key 数，不是 15 个物理主按钮。映射里 `KEY_1` 到 `KEY_10`
+  对应 10 个主按键；`KEY_11` 到 `KEY_15` 对应 secondary screen / soft-key slot。4 个旋钮、
+  旋钮按下、左右 swipe、touch point 解码、800x480 background、key image 和 frame background
+  是独立能力。
 - `vendor/streamdock-python-sdk/src/StreamDock/Devices/StreamDockN4.py`：
   当前 SDK 只建模 14 个 key 和 800x480 background，未在 `decode_input_event()` 中暴露 N4 旋钮或 swipe。
 - `vendor/streamdock-python-sdk/src/StreamDock/Devices/StreamDockN3.py`：
@@ -69,6 +82,11 @@ Agent Deck 当前已经在 N4 Pro 上验证了按键、背景屏和 quota virtua
   `src/agent_deck/hardware/streamdock_touchscreen.py` 已记录 N4 Pro 实测约束：
   同一次设备会话内用 `set_frame_background` 写背景，再写按键图；不要把触屏背景和按键拆成
   两个独立 open/init/close sink。
+- N4 Pro SDK 同时暴露三类图像格式：主按键 `112x112`，secondary screen `176x112`，
+  touchscreen/background `800x480`。当前 Agent Deck 的 quota virtual panel 走 800x480
+  background 的底部 viewport，这是一种已验证的 composite 写法；后续 profile 层应继续把
+  “逻辑窗口”与“具体下发 surface”分开，以便选择 secondary screen slot、touch display viewport
+  或其他设备 surface。
 
 ## 设备能力 profile
 
@@ -105,7 +123,7 @@ Agent Deck 当前已经在 N4 Pro 上验证了按键、背景屏和 quota virtua
 能力：
 
 - `key_grid` 全部能力。
-- 一条窄状态栏或 secondary screen key，可显示全局状态或局部摘要。
+- 一条窄状态栏或 secondary screen / soft-key slot，可显示全局状态、局部摘要或短动作。
 
 典型设备：
 
@@ -118,6 +136,7 @@ Agent Deck 当前已经在 N4 Pro 上验证了按键、背景屏和 quota virtua
 - 全局状态：活跃 Agent 数、待审批数、quota 警告、daemon 健康状态。
 - 当前选中 Agent 的短摘要：模型、workspace、host confidence、最近状态。
 - 页码、过滤器、模式标签。
+- `mode`、`page`、`focus`、`deny/snooze`、`details` 这类可用短标签表达的动作。
 
 不适合：
 
@@ -161,6 +180,8 @@ Agent Deck 当前已经在 N4 Pro 上验证了按键、背景屏和 quota virtua
 - 可渲染较大背景或面板。
 - 可显示多行文本、状态图、列表、quota、pending request 摘要。
 - 可选 touch point、swipe 或 soft key 事件。
+- 可作为 Agent Deck 的逻辑窗口显示目标：quota 只是当前内容之一，后续还可以显示审批详情、
+  host context、token 消耗、宠物或设置。
 
 典型设备：
 
@@ -182,6 +203,10 @@ Agent Deck 当前已经在 N4 Pro 上验证了按键、背景屏和 quota virtua
 - “能写 background”不等于“能读取触点”。M3/XL 等设备在 SDK 中有 background surface，
   但未必有 touch point callback。
 - N4 Pro 的 background 写入应继续使用已验证的 `set_frame_background` 路径。
+- N4 Pro 下方区域应在产品语义上叫 logical panel / touch bar viewport，而不是 quota panel。
+  当前 quota 画到 800x480 background 的底部 viewport，是为了与主按键图层共存并规避多次
+  SDK `init()` 清屏；这不妨碍后续把同一逻辑窗口映射到 secondary screen soft-key slot 或
+  touch display 的局部 viewport。
 
 ### `keyboard_companion`
 
@@ -315,7 +340,8 @@ Agent Deck 当前已经在 N4 Pro 上验证了按键、背景屏和 quota virtua
 
 N4 Pro 应继续作为第一主线，因为它同时覆盖：
 
-- 15 个 SDK 逻辑 key。
+- 10 个物理主 LCD key。
+- 15 个 SDK 逻辑 key slot：10 个主 key + 5 个 secondary screen / soft-key slot。
 - 800x480 背景层。
 - touch point。
 - swipe。
@@ -325,8 +351,10 @@ N4 Pro 应继续作为第一主线，因为它同时覆盖：
 推荐默认布局：
 
 - 10 个主 key：Agent / session slots。
-- 5 个 secondary key：mode、page、focus、deny/snooze、details。
-- 触屏背景：quota、当前 Agent 详情、permission request 摘要、host context。
+- 5 个 secondary soft-key slot：mode、page、focus、deny/snooze、details。
+- 逻辑面板 / touch bar viewport：quota、当前 Agent 详情、permission request 摘要、host context。
+  当前实现把它合成到 800x480 background 的底部区域；后续 profile-driven renderer 可以按设备能力
+  改映射到 secondary screen slot、touch display viewport 或外部 companion UI。
 - swipe：切页或切 mode。
 - 旋钮：选择 Agent、滚动详情、切换 filter、调节面板视图。
 - LED：pending/error/quota/disconnected aggregate status。
@@ -405,11 +433,15 @@ Agent Deck 的边界建议：
 ```text
 device_id
 display_name
-key_count
-key_image_size
-key_image_format
+physical_key_count
+logical_key_count
+main_key_count
+main_key_image_size
+main_key_image_format
 has_secondary_keys
 secondary_key_count
+secondary_key_image_size
+secondary_key_image_format
 background_size
 background_format
 has_touch_points
@@ -427,6 +459,10 @@ safe_action_levels
 ```
 
 `safe_action_levels` 不应只由设备决定，还要叠加全局配置和目标 Agent adapter 的安全能力。
+
+现有 `src/agent_deck/hardware/capabilities.py` 的第一版字段仍使用 `key_count`，它应被理解为
+SDK logical key count。下一轮代码重构应把它拆成上面的 `physical_key_count`、`logical_key_count`
+和 `secondary_key_count`，避免把 N4 Pro 的 10 个物理主按键误读成 15 个物理按钮。
 
 ### 2. 让 `LayoutPlan` 按能力降级
 
@@ -487,4 +523,3 @@ ApproveRequestCandidate
 4. 把审批 approve 从 key-only 设备默认能力中移除，只保留 deny/snooze/open details。
 5. 做 N4 raw input capture，再决定 N4 是 rich profile 还是降级 profile。
 6. 官方 scene/profile 集成继续放在 P4.5，不进入核心运行时依赖。
-

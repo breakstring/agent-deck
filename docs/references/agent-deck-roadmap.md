@@ -139,7 +139,9 @@ flowchart LR
 
 14. Codex quota poller + N4 Pro touch panel
     通过 Codex app-server 读取 quota，默认 5 分钟刷新一次；成功后保存 runtime snapshot，
-    渲染到底部 N4 Pro touch-bar viewport，并默认交给真实硬件 renderer 下发。
+    渲染到底部 N4 Pro touch-bar viewport，并默认交给真实硬件 renderer 下发。这个 viewport
+    是 Agent Deck 的 logical panel，不是 quota 专用屏；未来应可显示审批详情、host context、
+    token 消耗、设置或 ambient 内容。
     渲染层显示剩余百分比，不改 adapter 的 `used_percent` 原始语义。未来没有触屏能力的设备
     应通过 device profile 禁用该 panel 或切换到其他显示方式。若 daemon 禁用真实硬件
     renderer，则可回退到 quota-only 真实硬件 sink 或纯 fake surface。
@@ -299,6 +301,9 @@ P4 关键设计点：
 
 - 旧 293/293s 刷新图像时不能同时响应按键，renderer 必须降低刷新频率。
 - 不同设备的 key image size、rotation、touchscreen 支持不同，必须由 profile 提供。
+- N4 Pro 的 `KEY_COUNT = 15` 是 SDK logical key slot 数，不是 15 个物理主按钮。profile
+  应拆出 physical main keys、logical key slots、secondary soft-key slots、touch display
+  和 rotary controls，避免把下方 logical panel、secondary screen slot 与旋钮按下混成同一类。
 - 官方图标包规格支持 128x128 GIF/WEBP 动态图标，并建议 10-20fps、5 秒以内；
   Python SDK 直连路径仍按设备 profile 主动下发静态帧，所以 renderer 需要把官方建议转换为
   每个设备的实际刷新策略。
