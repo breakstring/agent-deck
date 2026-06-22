@@ -156,6 +156,8 @@ flowchart LR
     Codex 安装器保留 user-level 默认模式，并提供 `--managed-system` 高级模式：写系统
     `/etc/codex/requirements.toml` managed hooks、设置 `[hooks].managed_dir`、安装稳定
     wrapper、清理用户级重复 Agent Deck hooks；正式写入前提供 `--validate-only` 只读检查。
+    `agent-deckctl codex-hosts --json` 提供只读宿主探针，用于输出 Codex CLI/App、
+    direct PTY、tmux pane、attached/detached client 和激活策略置信度。
     用户级 hooks 生成时应带 `_agent_deck=true` 私有标记，刷新或清理时优先按该标记识别
     Agent Deck entry，同时继续兼容旧版本 `agent-deck-codex-hook` command 字符串。
     Hook command 应捕获 Codex hook 运行时 `$PPID` 并作为 `agent_pid` 透传到 normalized

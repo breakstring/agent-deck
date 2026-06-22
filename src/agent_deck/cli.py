@@ -44,6 +44,8 @@ from agent_deck.adapters.codex_quota import read_codex_quota
 from agent_deck.core.decisions import DecisionBehavior
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
 from agent_deck.hardware.streamdock_n4pro import animate_key_images_on_n4pro
+from agent_deck.hosts.codex import CodexHostResolver
+from agent_deck.hosts.models import AgentHostContext
 from agent_deck.rendering.asset_builder import build_codex_visual_assets
 from agent_deck.rendering.codex_key_frames import (
     codex_key_frame_paths_for_variants,
@@ -623,6 +625,120 @@ def codex_app_state(
             "report": report.model_dump(mode="json"),
         }
     )
+
+
+@ctl_app.command("codex-hosts")
+def codex_hosts(
+    agent_pid: Annotated[
+        int | None,
+        typer.Option(
+            "--agent-pid",
+            help="Optional Codex CLI pid to inspect.",
+        ),
+    ] = None,
+    include_codex_app: Annotated[
+        bool,
+        typer.Option(
+            "--include-codex-app/--no-include-codex-app",
+            help="Include Codex App local state sessions.",
+        ),
+    ] = True,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print machine-readable JSON.",
+        ),
+    ] = False,
+    codex_home: Annotated[
+        Path | None,
+        typer.Option(
+            "--codex-home",
+            help="Optional CODEX_HOME override for Codex App local state scanning.",
+        ),
+    ] = None,
+    state_db_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--state-db-path",
+            help="Optional explicit Codex App state_*.sqlite path.",
+        ),
+    ] = None,
+    scan_limit: Annotated[
+        int,
+        typer.Option(
+            "--scan-limit",
+            help="Maximum recent Codex App threads to scan before filtering.",
+            min=1,
+        ),
+    ] = 80,
+    active_window_seconds: Annotated[
+        int,
+        typer.Option(
+            "--active-window-seconds",
+            help="Only include Codex App threads updated within this window.",
+            min=1,
+        ),
+    ] = 3600,
+    active_session_limit: Annotated[
+        int,
+        typer.Option(
+            "--active-session-limit",
+            help="Maximum Codex App active sessions to include.",
+            min=1,
+            max=10,
+        ),
+    ] = 10,
+) -> None:
+    """Print read-only Codex CLI/App host context.
+
+    入参：`agent_pid` 可指定一个 Codex CLI pid；`include_codex_app` 控制是否扫描 Codex App
+    本地状态；`json_output` 控制 JSON 或人类可读输出；`codex_home`、`state_db_path`、
+    `scan_limit`、`active_window_seconds` 和 `active_session_limit` 只影响 Codex App 只读扫描。
+    返回：无显式返回值；stdout 输出 session host contexts。
+    错误处理：CLI pid 解析内部降级为 unknown；Codex App 扫描失败时 JSON 包含
+    `codex_app_error` 并继续输出已有 sessions。
+    副作用：只读读取进程表、tmux 状态和 Codex App 本地状态；不写配置、不 attach tmux、
+    不启动终端、不执行 focus。
+    """
+
+    resolver = _build_codex_host_resolver()
+    sessions: list[AgentHostContext] = []
+    codex_app_error: str | None = None
+
+    if agent_pid is not None:
+        sessions.append(resolver.resolve_cli(agent_pid=agent_pid))
+
+    if include_codex_app:
+        try:
+            report = scan_codex_app_state(
+                codex_home=codex_home,
+                state_db_path=state_db_path,
+                limit=scan_limit,
+            )
+            active_sessions = select_active_codex_app_sessions(
+                report,
+                active_window_seconds=active_window_seconds,
+                max_sessions=active_session_limit,
+            )
+            sessions.extend(resolver.resolve_app_sessions(active_sessions))
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            codex_app_error = str(exc)
+
+    payload: dict[str, Any] = {
+        "sessions": [session.model_dump(mode="json") for session in sessions],
+    }
+    if codex_app_error is not None:
+        payload["codex_app_error"] = codex_app_error
+
+    if json_output:
+        _echo_json(payload)
+        return
+
+    for session in sessions:
+        typer.echo(_format_host_context_line(session))
+    if codex_app_error is not None:
+        typer.echo(f"Codex App scan error: {codex_app_error}", err=True)
 
 
 @ctl_app.command("codex-sessions-preview")
@@ -1239,6 +1355,43 @@ def _read_json_object_from_text_or_stdin(raw: str | None) -> dict[str, Any]:
         typer.echo("payload JSON must be an object", err=True)
         raise typer.Exit(2)
     return payload
+
+
+def _build_codex_host_resolver() -> CodexHostResolver:
+    """构建默认 Codex host resolver。
+
+    入参：无。
+    返回：使用生产只读进程表和 tmux reader 的 `CodexHostResolver`。
+    错误处理：构造阶段不读取外部状态，读取错误会在 resolver 方法内降级。
+    副作用：无；不立即访问进程、tmux 或 Codex App 状态。
+    """
+
+    return CodexHostResolver()
+
+
+def _format_host_context_line(session: AgentHostContext) -> str:
+    """把 host context 格式化为单行人类可读输出。
+
+    入参：`session` 是 resolver 输出的 host context。
+    返回：包含 runtime、execution host、activation strategy 和 confidence 的字符串。
+    错误处理：不主动抛业务异常。
+    副作用：无；只读取内存模型。
+    """
+
+    execution = session.execution_host.kind.value
+    if session.execution_host.tmux_pane_id:
+        execution = f"{execution}:{session.execution_host.tmux_pane_id}"
+    elif session.execution_host.host_app_name:
+        execution = f"{execution}:{session.execution_host.host_app_name}"
+    identifier = session.thread_id or (
+        str(session.agent_pid) if session.agent_pid is not None else "unknown"
+    )
+    return (
+        f"{session.runtime_kind.value} {identifier} "
+        f"execution={execution} "
+        f"activation={session.activation.strategy.value} "
+        f"confidence={session.confidence.value}"
+    )
 
 
 def _payload_with_agent_pid(

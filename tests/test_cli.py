@@ -168,6 +168,75 @@ def test_version_preserves_existing_output() -> None:
     assert result.output.strip() == __version__
 
 
+def test_codex_hosts_prints_resolver_json(monkeypatch: Any) -> None:
+    """Verify `codex-hosts --agent-pid --json` prints host context JSON.
+
+    入参：`monkeypatch` 替换 CLI 内的 host resolver factory。
+    返回：无返回值；断言通过代表 CLI 输出结构化 JSON。
+    错误处理：退出码或 JSON 字段不符合预期时由 pytest 报告。
+    副作用：只运行 Typer in-process，不读取真实进程、tmux 或 Codex App 状态。
+    """
+
+    class FakeResolver:
+        """测试用 resolver，返回固定 Codex CLI host context。
+
+        入参：无。
+        返回：提供 `resolve_cli` 的 fake 对象。
+        错误处理：不主动抛异常。
+        副作用：无。
+        """
+
+        def resolve_cli(
+            self, *, agent_pid: int, cwd: str | None = None
+        ) -> Any:
+            """Return one fixed host context for the requested pid.
+
+            入参：`agent_pid` 是 CLI 传入的 pid；`cwd` 本测试不使用。
+            返回：`AgentHostContext`。
+            错误处理：不主动抛异常。
+            副作用：无。
+            """
+
+            from datetime import UTC, datetime
+
+            from agent_deck.hosts.models import (
+                ActivationContext,
+                ActivationStrategy,
+                AgentHostContext,
+                Confidence,
+                ExecutionHostContext,
+                ExecutionHostKind,
+                RuntimeKind,
+            )
+
+            return AgentHostContext(
+                runtime_kind=RuntimeKind.CODEX_CLI,
+                execution_host=ExecutionHostContext(
+                    kind=ExecutionHostKind.DIRECT_PTY,
+                    host_app_name="Otty",
+                ),
+                activation=ActivationContext(
+                    strategy=ActivationStrategy.APP_ACTIVATE_ONLY,
+                    confidence=Confidence.MEDIUM,
+                ),
+                agent_pid=agent_pid,
+                observed_at=datetime(2026, 6, 22, 8, 0, tzinfo=UTC),
+                confidence=Confidence.MEDIUM,
+            )
+
+    monkeypatch.setattr(cli, "_build_codex_host_resolver", lambda: FakeResolver())
+
+    result = runner.invoke(
+        cli.ctl_app,
+        ["codex-hosts", "--agent-pid", "15010", "--no-include-codex-app", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["sessions"][0]["runtime_kind"] == "codex_cli"
+    assert payload["sessions"][0]["agent_pid"] == 15010
+
+
 def test_status_prints_formatted_json(monkeypatch: Any) -> None:
     """Verify `status` GETs daemon status and formats JSON output.
 
