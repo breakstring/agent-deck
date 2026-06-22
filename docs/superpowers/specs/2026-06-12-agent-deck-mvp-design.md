@@ -431,8 +431,10 @@ N4 Pro 需要区分三组概念：
 设备会话里同时写背景和主按键图层；产品语义上它应被看作 logical panel / touch bar viewport，
 后续可由 device capability profile 决定映射到 background viewport、secondary screen slot
 或其他显示目标。
-第一批 logical panel 内容类型是 `quota`、`tokens`、`pets`、`message`；旋钮系统是默认输入方式，
-先映射成切换、滚动、确认等 intent，再由后续 input router 决定是否执行动作。
+第一批 logical panel 内容类型是 `quota`、`tokens`、`pets`、`message`。N4 Pro 上跨面板切换
+优先使用 touch bar 自身的 tap/click，旋钮系统保留给面板内操作：旋钮 1 确认，旋钮 2 滚动，
+tokens 面板中旋钮 4 切换 today/week/month/all 统计周期。所有硬件事件都先映射成 intent，
+再由后续 input router 决定是否执行动作。
 
 ### overview
 

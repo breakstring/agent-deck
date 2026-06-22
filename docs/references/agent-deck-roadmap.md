@@ -142,8 +142,10 @@ flowchart LR
     渲染到底部 N4 Pro touch-bar viewport，并默认交给真实硬件 renderer 下发。这个 viewport
     是 Agent Deck 的 logical panel，不是 quota 专用屏；第一批 panel kind 为 `quota`、
     `tokens`、`pets`、`message`，其中 `message` 承载审批详情、host context 或系统提示等复杂文字。
-    渲染层显示剩余百分比，不改 adapter 的 `used_percent` 原始语义。未来没有触屏能力的设备
-    应通过 device profile 禁用该 panel 或切换到其他显示方式。若 daemon 禁用真实硬件
+    touch bar tap/click 用于切换 logical panel；tokens 面板通过 `ccusage codex daily --compact --json`
+    读取 Codex token usage，聚合 today/week/month/all，旋钮 4 每次旋转事件切换一个统计周期。
+    渲染层显示剩余百分比，不改 quota adapter 的 `used_percent` 原始语义。未来没有触屏能力的
+    设备应通过 device profile 禁用该 panel 或切换到其他显示方式。若 daemon 禁用真实硬件
     renderer，则可回退到 quota-only 真实硬件 sink 或纯 fake surface。
 
 15. action executor

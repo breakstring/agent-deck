@@ -13,6 +13,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from agent_deck.adapters.codex_quota import CodexQuotaSnapshot
+from agent_deck.adapters.codex_tokens import CodexTokenPeriod, CodexTokenUsageSnapshot
 
 
 class PanelKind(StrEnum):
@@ -28,6 +29,15 @@ class PanelKind(StrEnum):
     TOKENS = "tokens"
     PETS = "pets"
     MESSAGE = "message"
+
+
+PANEL_KIND_ORDER: tuple[PanelKind, ...] = (
+    PanelKind.QUOTA,
+    PanelKind.TOKENS,
+    PanelKind.PETS,
+    PanelKind.MESSAGE,
+)
+"""touch bar 点击切换 logical panel 时使用的稳定顺序。"""
 
 
 class PanelInputRole(StrEnum):
@@ -57,6 +67,9 @@ class PanelInputEvent(StrEnum):
     KNOB_1_PRESS = "knob_1.press"
     KNOB_2_ROTATE_LEFT = "knob_2.rotate_left"
     KNOB_2_ROTATE_RIGHT = "knob_2.rotate_right"
+    KNOB_4_ROTATE_LEFT = "knob_4.rotate_left"
+    KNOB_4_ROTATE_RIGHT = "knob_4.rotate_right"
+    TOUCH_TAP = "touch.tap"
 
 
 class PanelInputIntent(StrEnum):
@@ -73,6 +86,77 @@ class PanelInputIntent(StrEnum):
     CONFIRM = "confirm"
     SCROLL_UP = "scroll_up"
     SCROLL_DOWN = "scroll_down"
+    PREVIOUS_TOKEN_PERIOD = "previous_token_period"
+    NEXT_TOKEN_PERIOD = "next_token_period"
+
+
+TOKEN_PERIOD_ORDER: tuple[CodexTokenPeriod, ...] = (
+    CodexTokenPeriod.TODAY,
+    CodexTokenPeriod.WEEK,
+    CodexTokenPeriod.MONTH,
+    CodexTokenPeriod.ALL,
+)
+"""tokens 面板内第四旋钮切换统计周期时使用的稳定顺序。"""
+
+
+class PanelSelection(BaseModel):
+    """描述 logical panel 当前的展示选择状态。
+
+    入参：`active_kind` 是当前展示的 panel 类型；`token_period` 是 tokens 面板当前统计周期。
+    返回：frozen Pydantic model，可由 input router 和 renderer 只读传递。
+    错误处理：非法枚举值由 Pydantic 拒绝。
+    副作用：无；只保存内存状态，不监听真实输入、不写硬件。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    active_kind: PanelKind = PanelKind.QUOTA
+    token_period: CodexTokenPeriod = CodexTokenPeriod.TODAY
+
+
+class PanelMetric(BaseModel):
+    """描述 logical panel 上需要突出或普通展示的一项指标。
+
+    入参：`label` 是短标签；`value` 是已经格式化好的显示值；`emphasis` 是渲染提示，
+    当前允许 `primary`、`secondary`、`normal`。
+    返回：frozen Pydantic model。
+    错误处理：空标签、空值或非法 emphasis 由校验拒绝。
+    副作用：仅保存内存数据。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    label: str
+    value: str
+    emphasis: str = "normal"
+
+    @field_validator("label", "value")
+    @classmethod
+    def _validate_non_empty(cls, value: str) -> str:
+        """校验指标标签和值非空。
+
+        入参：`value` 是待校验字符串。
+        返回：去除首尾空白后的字符串。
+        错误处理：空字符串由 ValueError 拒绝。
+        副作用：无。
+        """
+
+        return _non_empty(value, field_name="metric field")
+
+    @field_validator("emphasis")
+    @classmethod
+    def _validate_emphasis(cls, value: str) -> str:
+        """校验指标强调等级。
+
+        入参：`value` 是强调等级字符串。
+        返回：原始等级。
+        错误处理：不在允许集合中时抛出 ValueError。
+        副作用：无。
+        """
+
+        if value not in {"primary", "secondary", "normal"}:
+            raise ValueError("metric emphasis must be primary, secondary, or normal")
+        return value
 
 
 class PanelControlHint(BaseModel):
@@ -119,6 +203,7 @@ class LogicalPanelPlan(BaseModel):
     kind: PanelKind
     title: str
     lines: tuple[str, ...]
+    metrics: tuple[PanelMetric, ...] = ()
     controls: tuple[PanelControlHint, ...] = ()
     primary_input_role: PanelInputRole = PanelInputRole.ROTARY_NAVIGATION
 
@@ -191,29 +276,33 @@ def quota_panel_plan(snapshot: CodexQuotaSnapshot) -> LogicalPanelPlan:
 
 
 def tokens_panel_plan(
+    snapshot: CodexTokenUsageSnapshot,
     *,
-    used_tokens: int,
-    context_window: int,
-    title: str = "Tokens",
+    period: CodexTokenPeriod = CodexTokenPeriod.TODAY,
 ) -> LogicalPanelPlan:
     """创建 token 消耗 logical panel 计划。
 
-    入参：`used_tokens` 是当前已用 token；`context_window` 是上下文窗口大小；`title` 是面板标题。
-    返回：`kind=PanelKind.TOKENS` 的 `LogicalPanelPlan`。
-    错误处理：token 数为负或上下文窗口非正时抛出 ValueError。
-    副作用：无；只创建内存模型。
+    入参：`snapshot` 是 ccusage 适配器输出的四周期 token usage；`period` 是当前展示周期。
+    返回：`kind=PanelKind.TOKENS` 的 `LogicalPanelPlan`，重点指标为金额和总 token。
+    错误处理：缺少周期时抛 KeyError。
+    副作用：无；只创建内存模型，不执行 ccusage。
     """
 
-    if used_tokens < 0:
-        raise ValueError("used_tokens must not be negative")
-    if context_window <= 0:
-        raise ValueError("context_window must be positive")
-    percent = round(min(100, used_tokens * 100 / context_window))
+    stats = snapshot.periods[period]
     return LogicalPanelPlan(
         kind=PanelKind.TOKENS,
-        title=title,
-        lines=(f"{used_tokens} / {context_window} tokens", f"{percent}% used"),
-        controls=_default_rotary_controls(),
+        title=f"Tokens · {period.value}",
+        metrics=(
+            PanelMetric(label="Cost", value=stats.cost_label, emphasis="primary"),
+            PanelMetric(label="Total", value=stats.total_tokens_label, emphasis="primary"),
+        ),
+        lines=(
+            f"Input {stats.input_tokens_label}",
+            f"Output {stats.output_tokens_label}",
+            f"Reasoning {stats.reasoning_output_tokens_label}",
+            f"Cache read {stats.cache_read_tokens_label}",
+        ),
+        controls=_token_panel_controls(),
     )
 
 
@@ -260,25 +349,70 @@ def message_panel_plan(
     )
 
 
+def apply_panel_input(
+    selection: PanelSelection,
+    event: PanelInputEvent,
+) -> PanelSelection:
+    """把 logical panel 输入事件归约成新的选择状态。
+
+    入参：`selection` 是当前选择状态；`event` 是已经由硬件层归一化的 panel 输入事件。
+    返回：新的 `PanelSelection`；无状态变化时返回原状态值。
+    错误处理：非法事件由枚举/Pydantic 调用方约束处理；未知业务事件按无状态变化处理。
+    副作用：无；不会执行 action、不会触发硬件输出。
+    """
+
+    if event == PanelInputEvent.TOUCH_TAP:
+        return selection.model_copy(
+            update={
+                "active_kind": _next_cyclic_value(
+                    PANEL_KIND_ORDER,
+                    selection.active_kind,
+                    step=1,
+                )
+            }
+        )
+
+    if selection.active_kind != PanelKind.TOKENS:
+        return selection
+
+    if event == PanelInputEvent.KNOB_4_ROTATE_RIGHT:
+        return selection.model_copy(
+            update={
+                "token_period": _next_cyclic_value(
+                    TOKEN_PERIOD_ORDER,
+                    selection.token_period,
+                    step=1,
+                )
+            }
+        )
+    if event == PanelInputEvent.KNOB_4_ROTATE_LEFT:
+        return selection.model_copy(
+            update={
+                "token_period": _next_cyclic_value(
+                    TOKEN_PERIOD_ORDER,
+                    selection.token_period,
+                    step=-1,
+                )
+            }
+        )
+
+    return selection
+
+
 def _default_rotary_controls() -> tuple[PanelControlHint, ...]:
     """返回 logical panel 默认旋钮输入提示。
 
     入参：无。
-    返回：旋钮 1 左右切换面板、旋钮 1 按下确认、旋钮 2 上下滚动的控制提示。
+    返回：touch tap 切换面板、旋钮 1 按下确认、旋钮 2 上下滚动的控制提示。
     错误处理：无业务异常。
     副作用：无；每次返回新的不可变元组，内部元素为 frozen model。
     """
 
     return (
         PanelControlHint(
-            event=PanelInputEvent.KNOB_1_ROTATE_LEFT,
-            intent=PanelInputIntent.PREVIOUS_PANEL,
-            label="Previous panel",
-        ),
-        PanelControlHint(
-            event=PanelInputEvent.KNOB_1_ROTATE_RIGHT,
+            event=PanelInputEvent.TOUCH_TAP,
             intent=PanelInputIntent.NEXT_PANEL,
-            label="Next panel",
+            label="Tap panel",
         ),
         PanelControlHint(
             event=PanelInputEvent.KNOB_1_PRESS,
@@ -298,6 +432,30 @@ def _default_rotary_controls() -> tuple[PanelControlHint, ...]:
     )
 
 
+def _token_panel_controls() -> tuple[PanelControlHint, ...]:
+    """返回 tokens 面板默认输入提示。
+
+    入参：无。
+    返回：touch tap 切换 logical panel，旋钮 4 左右切换 token 统计周期，旋钮 1 按下确认。
+    错误处理：无业务异常。
+    副作用：无。
+    """
+
+    return (
+        *_default_rotary_controls(),
+        PanelControlHint(
+            event=PanelInputEvent.KNOB_4_ROTATE_LEFT,
+            intent=PanelInputIntent.PREVIOUS_TOKEN_PERIOD,
+            label="Previous token period",
+        ),
+        PanelControlHint(
+            event=PanelInputEvent.KNOB_4_ROTATE_RIGHT,
+            intent=PanelInputIntent.NEXT_TOKEN_PERIOD,
+            label="Next token period",
+        ),
+    )
+
+
 def _remaining_percent(used_percent: int) -> int:
     """把已用百分比转换成剩余百分比。
 
@@ -309,6 +467,25 @@ def _remaining_percent(used_percent: int) -> int:
 
     used = max(0, min(100, used_percent))
     return 100 - used
+
+
+def _next_cyclic_value[T](values: tuple[T, ...], current: T, *, step: int) -> T:
+    """按固定顺序环形移动到下一个值。
+
+    入参：`values` 是非空顺序表；`current` 是当前值；`step` 是正负移动步数。
+    返回：环形移动后的值。
+    错误处理：空顺序表或当前值不在顺序表内时抛出 ValueError。
+    副作用：无。
+    """
+
+    if not values:
+        raise ValueError("cyclic values must not be empty")
+    try:
+        current_index = values.index(current)
+    except ValueError as exc:
+        raise ValueError("current value must exist in cyclic values") from exc
+    next_index = (current_index + step) % len(values)
+    return values[next_index]
 
 
 def _non_empty(value: str, *, field_name: str) -> str:

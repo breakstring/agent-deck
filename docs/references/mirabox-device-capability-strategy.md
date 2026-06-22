@@ -210,8 +210,9 @@ Agent Deck 当前已经在 N4 Pro 上验证了按键、背景屏和 quota virtua
   当前 quota 画到 800x480 background 的底部 viewport，是为了与主按键图层共存并规避多次
   SDK `init()` 清屏；这不妨碍后续把同一逻辑窗口映射到 secondary screen soft-key slot 或
   touch display 的局部 viewport。
-- 旋钮系统是 logical panel 的默认输入方式：旋钮 1 可用于切换面板和确认，旋钮 2 可用于面板内
-  滚动；具体事件仍应先进入 intent，不直接执行动作。
+- N4 Pro 上 logical panel 的跨面板切换默认由 touch bar 自身的 tap/click 事件承载，避免占用下方
+  旋钮。旋钮 1 可用于确认，旋钮 2 可用于面板内滚动，tokens 面板中旋钮 4 可用于切换统计周期；
+  具体事件仍应先进入 intent，不直接执行动作。
 
 ### `keyboard_companion`
 
@@ -481,7 +482,8 @@ SDK logical key count。下一轮代码重构应把它拆成上面的 `physical_
 logical panel 应作为独立于设备 surface 的内容模型进入 layout。第一批 `PanelKind` 固定为：
 
 - `quota`：当前 Codex quota 内容。
-- `tokens`：token 消耗情况。
+- `tokens`：Codex token 消耗情况；当前通过 `ccusage codex daily --compact --json` 读取结构化
+  数据，聚合成 today/week/month/all，并以分钟级 TTL cache 避免频繁执行外部命令。
 - `pets`：宠物或 ambient 角色呈现。
 - `message`：需要用户看到的复杂文字信息，例如审批详情、host context 或系统提示。
 
