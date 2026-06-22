@@ -316,3 +316,22 @@ uv run agent-deckctl codex-hosts --json
 5. 新增 `agent-deckctl codex-hosts --json`。
 6. 将 host context 接入 `AgentState.focus_target` 或新增 `host_context` 字段。
 7. 后续再实现 `focus_agent` 的 tmux reattach / select 动作。
+
+## 已验证事实
+
+2026-06-22 的第一轮实现已验证：
+
+- `uv run pytest tests/test_host_context.py tests/test_cli.py::test_codex_hosts_prints_resolver_json -q`
+  通过，覆盖 host context 模型、direct PTY 推断、tmux pane/client 匹配、Codex resolver
+  和 `codex-hosts` CLI JSON 输出。
+- `uv run pytest -q` 通过：`180 passed, 1 warning`。warning 来自 FastAPI/TestClient 依赖中的
+  Starlette deprecation，不是本次 host detection 代码触发。
+- `uv run agent-deckctl codex-hosts --json` 需要在当前受限执行环境中提升只读权限访问 uv cache；
+  提升后成功输出 Codex App active sessions，所有 Codex App thread 的 activation 均为
+  `app_activate_only`，符合“只激活 App，不精确打开 thread”的边界。
+- targeted CLI smoke 使用当前机器上的 `codex resume` pid `15010` 执行
+  `uv run agent-deckctl codex-hosts --agent-pid 15010 --no-include-codex-app --json`，
+  成功识别为 `runtime_kind=codex_cli`、`execution_host.kind=direct_pty`、`host_app_name=Otty`、
+  `tty=ttys003`、`activation.strategy=app_activate_only`。
+- 当前机器的 `tmux list-panes` 可读出两个非 Codex pane，`tmux list-clients` 为空；因此本轮只验证了
+  tmux snapshot 命令可读和测试 fixture 的 detached/attached 逻辑，未做真实 Codex-in-tmux smoke。

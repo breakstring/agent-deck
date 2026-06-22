@@ -163,14 +163,20 @@ class SubprocessTmuxReader:
                 ["tmux", "list-clients", "-F", _CLIENT_FORMAT],
                 timeout_seconds=self._timeout_seconds,
             )
+            return TmuxSnapshot(
+                panes=tuple(
+                    _parse_pane_line(line)
+                    for line in panes_output.splitlines()
+                    if line
+                ),
+                clients=tuple(
+                    _parse_client_line(line)
+                    for line in clients_output.splitlines()
+                    if line
+                ),
+            )
         except (OSError, subprocess.SubprocessError, ValueError):
             return TmuxSnapshot()
-        return TmuxSnapshot(
-            panes=tuple(_parse_pane_line(line) for line in panes_output.splitlines() if line),
-            clients=tuple(
-                _parse_client_line(line) for line in clients_output.splitlines() if line
-            ),
-        )
 
 
 def find_pane_for_tty(snapshot: TmuxSnapshot, tty: str | None) -> TmuxPane | None:
