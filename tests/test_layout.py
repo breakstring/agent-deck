@@ -148,6 +148,65 @@ def test_no_agents_keeps_full_key_plan_and_empty_touchscreen() -> None:
     assert plan.led_color == "off"
 
 
+def test_overview_hides_offline_agents_from_main_button_slots() -> None:
+    """Verify offline agents do not occupy overview agent key slots.
+
+    入参：无；测试内构造一个 offline agent 和一个 idle agent。
+    返回：无返回值；断言通过代表主按钮区只显示可操作 agent，offline 不占槽。
+    错误处理：若 offline agent 仍出现在 key slot 或被选为触屏 agent，由 pytest 报告。
+    副作用：仅创建内存模型和布局计划。
+    """
+
+    offline = _state(
+        "codex:offline",
+        "Offline Codex",
+        AgentStatus.OFFLINE,
+        last_event_offset=40,
+    )
+    idle = _state(
+        "codex:idle",
+        "Idle Codex",
+        AgentStatus.IDLE,
+        last_event_offset=10,
+    )
+
+    plan = build_layout_plan(
+        [offline, idle],
+        [],
+        DeckSelection(
+            mode=DeckMode.OVERVIEW,
+            selected_agent_key=offline.agent_key,
+        ),
+    )
+
+    assert plan.keys[0].agent_key == idle.agent_key
+    assert all(key.agent_key != offline.agent_key for key in plan.keys)
+    assert plan.touchscreen.selected_agent_key == idle.agent_key
+
+
+def test_overview_treats_offline_only_as_no_visible_agents() -> None:
+    """Verify offline-only snapshots leave the main overview empty.
+
+    入参：无；测试内只提供 offline agent。
+    返回：无返回值；断言通过代表 stale/offline 会话不会留下灰色主按钮。
+    错误处理：若 offline agent 出现在按钮、触屏或 action row，由 pytest 报告。
+    副作用：仅创建内存模型和布局计划。
+    """
+
+    offline = _state("codex:offline", "Offline Codex", AgentStatus.OFFLINE)
+
+    plan = build_layout_plan(
+        [offline],
+        [],
+        DeckSelection(mode=DeckMode.OVERVIEW),
+    )
+
+    assert all(key.agent_key is None for key in plan.keys)
+    assert plan.touchscreen.title == "Agent Deck"
+    assert plan.touchscreen.lines == ("No agents online",)
+    assert plan.led_color == "off"
+
+
 def test_pending_decision_overrides_mode_and_binds_approval_keys() -> None:
     """Verify pending decisions force decision mode and approval actions.
 

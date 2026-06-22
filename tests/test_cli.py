@@ -1502,6 +1502,33 @@ def test_codex_event_hook_maps_session_start_to_event(monkeypatch: Any) -> None:
     assert body["cwd"] == "/tmp/project"
 
 
+def test_codex_event_hook_records_agent_pid_in_payload(monkeypatch: Any) -> None:
+    """Verify lifecycle hooks can attach the Codex parent process id.
+
+    入参：`monkeypatch` 安装 fake HTTP client。
+    返回：无返回值；断言通过代表 `--agent-pid` 被记录到 normalized event payload。
+    错误处理：退出码、POST body 或 payload 字段不符合契约时由 pytest 报告。
+    副作用：读取测试 stdin JSON；不访问真实 daemon 或 Codex。
+    """
+
+    _install_fake_client(monkeypatch)
+
+    result = runner.invoke(
+        cli.codex_hook_app,
+        ["event", "--agent-pid", "4242"],
+        input=json.dumps(
+            {
+                "hookEventName": "SessionStart",
+                "session_id": "session-1",
+            }
+        ),
+    )
+
+    assert result.exit_code == 0
+    body = _FakeClient.requests[0]["kwargs"]["json"]
+    assert body["payload"]["agent_pid"] == "4242"
+
+
 def test_codex_event_hook_maps_user_prompt_submit_to_turn_started(
     monkeypatch: Any,
 ) -> None:

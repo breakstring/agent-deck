@@ -40,6 +40,7 @@ _LIFECYCLE_HOOK_EVENTS: Final[tuple[str, ...]] = (
 )
 _AGENT_DECK_NOTIFY_DIRNAME: Final[str] = "agent-deck"
 _AGENT_DECK_NOTIFY_FANOUT_NAME: Final[str] = "notify-fanout.py"
+_AGENT_DECK_HOOK_MARKER: Final[str] = "_agent_deck"
 _AGENT_DECK_MANAGED_BLOCK_BEGIN: Final[str] = "# BEGIN_AGENT_DECK_MANAGED_HOOKS"
 _AGENT_DECK_MANAGED_BLOCK_END: Final[str] = "# END_AGENT_DECK_MANAGED_HOOKS"
 
@@ -1121,7 +1122,7 @@ def _replace_agent_deck_hooks_json(
 
 
 def _remove_agent_deck_hook_entries(entries: list[Any]) -> list[Any]:
-    """从单个事件的 hook entries 中移除 Agent Deck 自身 command。
+    """从单个事件的 hook entries 中移除 Agent Deck 自身 entry 或 command。
 
     入参：`entries` 是某个 Codex hook event 下的 entry 数组。
     返回：删除 Agent Deck command 后仍有内容的 entries。
@@ -1133,6 +1134,8 @@ def _remove_agent_deck_hook_entries(entries: list[Any]) -> list[Any]:
     for entry in entries:
         if not isinstance(entry, dict):
             kept_entries.append(entry)
+            continue
+        if entry.get(_AGENT_DECK_HOOK_MARKER) is True:
             continue
         hooks = entry.get("hooks")
         if not isinstance(hooks, list):
@@ -1207,18 +1210,22 @@ def build_codex_integration_guide(
             permission_timeout_seconds=permission_timeout_seconds,
             configuration=configuration,
         )
-    event_command = shlex.join(
-        [*_agent_deck_hook_base_command(), "event", "--daemon-url", daemon_url]
+    event_command = _with_shell_agent_pid_arg(
+        shlex.join(
+            [*_agent_deck_hook_base_command(), "event", "--daemon-url", daemon_url]
+        )
     )
-    permission_command = shlex.join(
-        [
-            *_agent_deck_hook_base_command(),
-            "permission-request",
-            "--daemon-url",
-            daemon_url,
-            "--timeout-seconds",
-            str(permission_timeout_seconds),
-        ]
+    permission_command = _with_shell_agent_pid_arg(
+        shlex.join(
+            [
+                *_agent_deck_hook_base_command(),
+                "permission-request",
+                "--daemon-url",
+                daemon_url,
+                "--timeout-seconds",
+                str(permission_timeout_seconds),
+            ]
+        )
     )
     smoke_permission_command = shlex.join(
         [
@@ -1290,16 +1297,20 @@ def _build_managed_system_integration_guide(
     """
 
     wrapper_path = Path(configuration.managed_hooks_dir) / "agent-deck-codex-hook"
-    event_command = shlex.join([str(wrapper_path), "event", "--daemon-url", daemon_url])
-    permission_command = shlex.join(
-        [
-            str(wrapper_path),
-            "permission-request",
-            "--daemon-url",
-            daemon_url,
-            "--timeout-seconds",
-            str(permission_timeout_seconds),
-        ]
+    event_command = _with_shell_agent_pid_arg(
+        shlex.join([str(wrapper_path), "event", "--daemon-url", daemon_url])
+    )
+    permission_command = _with_shell_agent_pid_arg(
+        shlex.join(
+            [
+                str(wrapper_path),
+                "permission-request",
+                "--daemon-url",
+                daemon_url,
+                "--timeout-seconds",
+                str(permission_timeout_seconds),
+            ]
+        )
     )
     smoke_permission_command = shlex.join(
         [
@@ -1742,10 +1753,10 @@ def _recommended_merge_edits(
 
 
 def _contains_agent_deck_hook_command(value: Any) -> bool:
-    """递归检查配置对象中是否包含 Agent Deck hook helper。
+    """递归检查配置对象中是否包含 Agent Deck hook 标记或 helper。
 
     入参：`value` 是 TOML/JSON 解析出的任意对象。
-    返回：任意字符串值包含 `agent-deck-codex-hook` 时为 True。
+    返回：任意 dict 带 `_agent_deck=true` 或字符串包含 `agent-deck-codex-hook` 时为 True。
     错误处理：无；未知对象类型按 False 处理。
     副作用：无；只递归读取内存对象。
     """
@@ -1755,6 +1766,8 @@ def _contains_agent_deck_hook_command(value: Any) -> bool:
     if isinstance(value, list | tuple):
         return any(_contains_agent_deck_hook_command(item) for item in value)
     if isinstance(value, dict):
+        if value.get(_AGENT_DECK_HOOK_MARKER) is True:
+            return True
         return any(_contains_agent_deck_hook_command(item) for item in value.values())
     return False
 
@@ -2222,6 +2235,18 @@ exec {command} "$@"
 """
 
 
+def _with_shell_agent_pid_arg(command: str) -> str:
+    """给 Codex hook command 追加由 shell 展开的父进程 pid 参数。
+
+    入参：`command` 是已经由 `shlex.join` 生成的安全命令前缀。
+    返回：追加 `--agent-pid "$PPID"` 的命令字符串，供 Codex command hook 在运行时展开。
+    错误处理：本 helper 不解析 shell；调用方负责只用于 Codex hook command 字符串。
+    副作用：无；只格式化字符串。
+    """
+
+    return f'{command} --agent-pid "$PPID"'
+
+
 def _daemon_command_for_url(daemon_url: str) -> str:
     """把 daemon URL 转成建议启动命令。
 
@@ -2309,6 +2334,7 @@ def _build_hooks_json(
     hooks: dict[str, Any] = {
         event_name: [
             {
+                _AGENT_DECK_HOOK_MARKER: True,
                 "matcher": "*",
                 "hooks": [
                     {
@@ -2323,6 +2349,7 @@ def _build_hooks_json(
     }
     hooks["PermissionRequest"] = [
         {
+            _AGENT_DECK_HOOK_MARKER: True,
             "matcher": "*",
             "hooks": [
                 {

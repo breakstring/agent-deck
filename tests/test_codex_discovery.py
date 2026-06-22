@@ -80,10 +80,14 @@ def test_enable_integration_builds_manual_hook_and_notify_guide(
     assert "http://127.0.0.1:9999" in guide.notify_toml
     assert "PermissionRequest" in guide.hooks_json["hooks"]
     assert "SessionStart" in guide.hooks_json["hooks"]
+    assert guide.hooks_json["hooks"]["SessionStart"][0]["_agent_deck"] is True
+    assert guide.hooks_json["hooks"]["PermissionRequest"][0]["_agent_deck"] is True
     permission_hook = guide.hooks_json["hooks"]["PermissionRequest"][0]["hooks"][0]
     session_hook = guide.hooks_json["hooks"]["SessionStart"][0]["hooks"][0]
     assert "permission-request" in permission_hook["command"]
     assert "event" in session_hook["command"]
+    assert '--agent-pid "$PPID"' in permission_hook["command"]
+    assert '--agent-pid "$PPID"' in session_hook["command"]
     assert any(
         "--daemon-url http://127.0.0.1:9999" in command
         for command in guide.verification_commands
@@ -575,6 +579,70 @@ def test_install_codex_integration_apply_refreshes_existing_agent_deck_hooks(
     assert "uv --directory" in hooks_text or "agent-deck-codex-hook event" in hooks_text
     hooks_data = json.loads(hooks_text)
     assert "PermissionRequest" in hooks_data["hooks"]
+    assert any(
+        entry.get("_agent_deck") is True
+        for entry in hooks_data["hooks"]["SessionStart"]
+    )
+
+
+def test_install_codex_integration_refresh_removes_agent_deck_marked_entries(
+    tmp_path: Path,
+) -> None:
+    """验证刷新用户级 hooks 时可用 `_agent_deck` 标记识别旧 entries。
+
+    入参：`tmp_path` 是 fake `CODEX_HOME`，其中 hooks.json 带旧版本私有标记但不含当前
+    command 名称。
+    返回：无返回值；断言通过代表 installer 会移除旧 Agent Deck entry 并保留第三方 entry。
+    错误处理：若旧 entry 残留、第三方 entry 丢失或未写入当前标记，由 pytest 报告。
+    副作用：只写 pytest 临时目录下的 fake Codex 配置。
+    """
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        'notify = ["agent-deck-codex-hook", "notify"]\n',
+        encoding="utf-8",
+    )
+    hooks_path = codex_home / "hooks.json"
+    hooks_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "_agent_deck": True,
+                            "matcher": "*",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "old-wrapper event",
+                                }
+                            ],
+                        },
+                        {
+                            "_otty": True,
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "otty-hook idle",
+                                }
+                            ],
+                        },
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = install_codex_integration(codex_home=codex_home, apply=True)
+
+    assert result.applied is True
+    hooks_data = json.loads(hooks_path.read_text(encoding="utf-8"))
+    session_entries = hooks_data["hooks"]["SessionStart"]
+    assert any(entry.get("_otty") is True for entry in session_entries)
+    assert all("old-wrapper event" not in json.dumps(entry) for entry in session_entries)
+    assert any(entry.get("_agent_deck") is True for entry in session_entries)
 
 
 def test_install_codex_integration_apply_refuses_unparseable_config(

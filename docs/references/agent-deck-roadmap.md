@@ -152,6 +152,27 @@ flowchart LR
     Codex 安装器保留 user-level 默认模式，并提供 `--managed-system` 高级模式：写系统
     `/etc/codex/requirements.toml` managed hooks、设置 `[hooks].managed_dir`、安装稳定
     wrapper、清理用户级重复 Agent Deck hooks；正式写入前提供 `--validate-only` 只读检查。
+    用户级 hooks 生成时应带 `_agent_deck=true` 私有标记，刷新或清理时优先按该标记识别
+    Agent Deck entry，同时继续兼容旧版本 `agent-deck-codex-hook` command 字符串。
+    Hook command 应捕获 Codex hook 运行时 `$PPID` 并作为 `agent_pid` 透传到 normalized
+    payload，作为后续区分 CLI/App、终端、tmux pane 或多实例宿主的基础线索。
+
+    Codex hooks 后续优化 backlog：
+
+    - 评估 `full` / `light` 两种 hook profile：`full` 保留 `PreToolUse` / `PostToolUse`
+      以区分 thinking 与 running tool；`light` 类似 otty，只保留 idle / processing /
+      awaiting 的低侵入状态。
+    - 评估 lifecycle hook 的快速返回路径：先完整读取 stdin，再通过本地 relay 或常驻
+      IPC 客户端异步投递事件，避免每个高频 hook 都启动完整 Python/uv 进程。
+    - 优先让 managed wrapper 使用当前虚拟环境里的 console script 或已安装可执行文件，
+      仅在源码开发模式下回退到 `uv --directory ... run`，降低 hook 启动成本。
+    - 为 hook latency、daemon event receive latency 和状态覆盖原因增加诊断日志，避免
+      working 动画被延迟事件或本地 scanner 弱信号打断时难以定位。
+    - 基于 hook 透传的 `agent_pid` 做宿主存活检测：当会话超过 idle TTL 但 PID 仍存在时
+      可降级为 idle；PID 不存在时再隐藏或进入 offline 历史态。后续需要同时考虑 Codex CLI
+      运行在普通终端、otty、tmux、以及 Codex App 多会话时 pid 与 session 的绑定关系。
+    - PermissionRequest 的完整上下文采集保持显式 opt-in：默认 passthrough，只在用户启用
+      handle 模式时传递经过脱敏的 request context 给 Agent Deck decision broker。
 
 17. 手动验收脚本
     提供模拟事件和真实 Codex 验证步骤。

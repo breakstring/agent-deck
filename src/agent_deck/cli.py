@@ -1005,11 +1005,19 @@ def event(
             help="Base URL for the local Agent Deck daemon.",
         ),
     ] = DEFAULT_DAEMON_URL,
+    agent_pid: Annotated[
+        str | None,
+        typer.Option(
+            "--agent-pid",
+            help="Optional Codex parent process id captured by the hook command.",
+        ),
+    ] = None,
 ) -> None:
     """Forward a generic Codex lifecycle hook payload as a normalized event.
 
     入参：`daemon_url` 是 daemon base URL；stdin 必须是非空 JSON object，`hookEventName`
-    或同义字段会映射到 Agent Deck normalized event type。
+    或同义字段会映射到 Agent Deck normalized event type；`agent_pid` 可由 hook command
+    传入 `$PPID`，作为宿主识别线索保存在 payload 中。
     返回：无显式返回值；成功时不要求输出固定内容。
     错误处理：stdin 为空、非法 JSON 或非 object 时以 exit 2 退出；daemon 不可达、HTTP
     非 2xx 或 JSON 解码失败时写 stderr 但 exit 0，避免阻断 Codex 普通 lifecycle hooks。
@@ -1017,6 +1025,7 @@ def event(
     """
 
     payload = _read_json_object_from_stdin()
+    payload = _payload_with_agent_pid(payload, agent_pid)
     normalized_type = _normalized_event_type_from_codex_hook(payload)
     event = _event_from_hook_payload(
         payload,
@@ -1056,12 +1065,20 @@ def permission_request(
             help="Agent Deck TOML config path; defaults to AGENT_DECK_CONFIG, cwd, or user config.",
         ),
     ] = None,
+    agent_pid: Annotated[
+        str | None,
+        typer.Option(
+            "--agent-pid",
+            help="Optional Codex parent process id captured by the hook command.",
+        ),
+    ] = None,
 ) -> None:
     """Handle a Codex permission request according to Agent Deck config.
 
     入参：`daemon_url` 是 daemon base URL；`timeout_seconds` 是旧安装命令可能传入的等待秒数，
     配置文件存在时以 `codex.permission_request.timeout_seconds` 为准；`config_path` 是可选
-    Agent Deck TOML 配置路径；stdin 必须是非空 JSON object。
+    Agent Deck TOML 配置路径；`agent_pid` 可由 hook command 传入 `$PPID` 作为宿主识别
+    线索；stdin 必须是非空 JSON object。
     返回：无显式返回值；`passthrough` 模式 stdout 为空，Codex 会继续原生审批；`handle`
     和 `deny` 模式会输出 Codex hook JSON decision payload。
     错误处理：stdin 为空、非法 JSON 或非 object 时以 exit 2 退出；daemon 不可达、HTTP
@@ -1072,6 +1089,7 @@ def permission_request(
     """
 
     payload = _read_json_object_from_stdin()
+    payload = _payload_with_agent_pid(payload, agent_pid)
     try:
         local_config = load_agent_deck_config(
             resolve_agent_deck_config_path(config_path)
@@ -1221,6 +1239,25 @@ def _read_json_object_from_text_or_stdin(raw: str | None) -> dict[str, Any]:
         typer.echo("payload JSON must be an object", err=True)
         raise typer.Exit(2)
     return payload
+
+
+def _payload_with_agent_pid(
+    payload: dict[str, Any], agent_pid: str | None
+) -> dict[str, Any]:
+    """Return a hook payload augmented with optional host process metadata.
+
+    入参：`payload` 是已解析的 hook JSON object；`agent_pid` 是 hook command 捕获到的
+    Codex 父进程 pid，可为空。
+    返回：若 `agent_pid` 非空，返回包含 `agent_pid` 字段的浅拷贝；否则返回原 payload。
+    错误处理：本 helper 不校验 pid 格式，避免不同宿主实现的 pid 表达被过早拒绝。
+    副作用：不修改调用方传入的 dict，不访问网络、硬件或文件。
+    """
+
+    if agent_pid is None or not agent_pid.strip():
+        return payload
+    enriched = dict(payload)
+    enriched["agent_pid"] = agent_pid.strip()
+    return enriched
 
 
 def _event_from_hook_payload(

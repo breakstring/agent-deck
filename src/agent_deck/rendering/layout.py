@@ -110,7 +110,8 @@ def build_layout_plan(
         if pending_decision is not None
         else selection.selected_agent_key
     )
-    sorted_states = _sort_states_for_slots(states, effective_selected_agent_key)
+    visible_states = _visible_main_button_states(states)
+    sorted_states = _sort_states_for_slots(visible_states, effective_selected_agent_key)
     selected_agent = _select_agent(sorted_states, effective_selected_agent_key)
     keys = _build_base_keys(sorted_states)
 
@@ -127,6 +128,20 @@ def build_layout_plan(
         touchscreen=touchscreen,
         led_color=_aggregate_led_color(states),
     )
+
+
+def _visible_main_button_states(
+    states: list[AgentState] | tuple[AgentState, ...],
+) -> list[AgentState]:
+    """Filter agent snapshots down to sessions worth showing on main buttons.
+
+    入参：`states` 是 state store 的完整快照，可能包含 TTL 投影出的 offline 会话。
+    返回：不包含 `AgentStatus.OFFLINE` 的新列表；调用方仍可在其他诊断视图使用原始 states。
+    错误处理：非法状态通常已由 `AgentState` 校验；未知对象按 Python 属性访问错误传播。
+    副作用：无；只读取内存状态，不修改输入集合。
+    """
+
+    return [state for state in states if state.status != AgentStatus.OFFLINE]
 
 
 def _sort_states_for_slots(
