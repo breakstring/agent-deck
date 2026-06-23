@@ -46,6 +46,8 @@ class FakeN4ProUnifiedDevice:
         self.key_result = key_result
         self.calls: list[tuple[str, object | None]] = []
         self.paths_seen: list[Path] = []
+        self.key_callback: object | None = None
+        self.touch_bar_callback: object | None = None
 
     def open(self) -> bool:
         """记录 open 调用并模拟成功。
@@ -132,6 +134,30 @@ class FakeN4ProUnifiedDevice:
         """
 
         return self.path
+
+    def set_key_callback(self, callback: object) -> None:
+        """记录 key/knob 输入回调。
+
+        入参：`callback` 是 SDK key callback。
+        返回：无返回值。
+        错误处理：无。
+        副作用：保存 callback 并追加调用记录。
+        """
+
+        self.key_callback = callback
+        self.calls.append(("set_key_callback", None))
+
+    def set_touch_bar_callback(self, callback: object) -> None:
+        """记录 touch bar 输入回调。
+
+        入参：`callback` 是 SDK touch bar callback。
+        返回：无返回值。
+        错误处理：无。
+        副作用：保存 callback 并追加调用记录。
+        """
+
+        self.touch_bar_callback = callback
+        self.calls.append(("set_touch_bar_callback", None))
 
 
 class FakeOtherUnifiedDevice(FakeN4ProUnifiedDevice):
@@ -354,6 +380,57 @@ def test_persistent_animator_reuses_open_device_between_calls(
     animator.close()
 
     assert device.calls[-1] == ("close", False)
+
+
+def test_persistent_animator_registers_input_callbacks_on_open(
+    tmp_path: Path,
+) -> None:
+    """验证 persistent animator 在同一设备会话里注册输入回调。
+
+    入参：`tmp_path` 提供临时帧和背景目录。
+    返回：无返回值；断言通过表示 key/knob 与 touch bar 回调都绑定到同一 input callback。
+    错误处理：未注册、重复打开或回调对象不一致时由 pytest 报告。
+    副作用：只操作 fake device 和 pytest 临时文件，不访问真实 N4 Pro。
+    """
+
+    frame = tmp_path / "frame.png"
+    Image.new("RGB", (112, 112), (10, 20, 30)).save(frame)
+    device = FakeN4ProUnifiedDevice(background_result=0, key_result=0)
+    callbacks: list[object] = []
+
+    def input_callback(_device: object, event: object) -> None:
+        """记录 fake SDK 回调事件。
+
+        入参：`_device` 是 fake device；`event` 是 fake SDK event。
+        返回：无。
+        错误处理：无。
+        副作用：追加测试内存列表。
+        """
+
+        callbacks.append(event)
+
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=FakeUnifiedManager([device]),
+        temp_dir=tmp_path,
+        input_callback=input_callback,
+        sleep=lambda _: None,
+    )
+
+    result = animator(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={1: (frame,)},
+        duration_seconds=0.1,
+        fps=10,
+    )
+
+    assert result.ok is True
+    assert device.key_callback is input_callback
+    assert device.touch_bar_callback is input_callback
+
+    device.key_callback(device, "knob-event")
+    device.touch_bar_callback(device, "touch-event")
+
+    assert callbacks == ["knob-event", "touch-event"]
 
 
 def test_render_images_to_n4pro_rejects_invalid_key() -> None:

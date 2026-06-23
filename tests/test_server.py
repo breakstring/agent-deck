@@ -493,6 +493,138 @@ def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
     assert status["codex_quota"]["streamdock_touchscreen"] is None
 
 
+def test_streamdock_n4pro_renderer_starts_with_placeholder_without_panel_data(
+    tmp_path: Path,
+) -> None:
+    """Verify N4 Pro renderer starts even before quota/token snapshots exist.
+
+    入参：`tmp_path` 提供 fake frame root。
+    返回：无返回值；断言通过代表真实 renderer 不依赖当前 panel 数据已加载。
+    错误处理：renderer 未被调用或背景缺失时由 pytest 报告。
+    副作用：只调用 fake renderer，不访问真实 N4 Pro。
+    """
+
+    renderer_calls: list[dict[str, object]] = []
+
+    def fake_n4pro_renderer(**kwargs: object) -> StreamDockN4ProAnimationResult:
+        """记录 renderer 调用并返回成功结果。
+
+        入参：`kwargs` 包含背景图、按键帧、播放时长和 fps。
+        返回：固定成功结果。
+        错误处理：无。
+        副作用：追加调用记录。
+        """
+
+        renderer_calls.append(kwargs)
+        return StreamDockN4ProAnimationResult(ok=True)
+
+    app = create_app(
+        poller_config=DaemonPollerConfig(
+            streamdock_n4pro_renderer_enabled=True,
+            streamdock_n4pro_frame_root=tmp_path,
+            streamdock_n4pro_render_interval_seconds=0.5,
+        ),
+        streamdock_n4pro_renderer_sink=fake_n4pro_renderer,
+    )
+    with TestClient(app) as client:
+        status = client.get("/status").json()
+
+    assert renderer_calls
+    call = renderer_calls[-1]
+    assert getattr(call["background_image"], "size") == (800, 480)
+    assert call["key_frame_paths"] == {}
+    assert status["streamdock_n4pro_renderer"]["last_error"] is None
+    assert status["streamdock_n4pro_renderer"]["last_result"]["ok"] is True
+
+
+def test_default_n4pro_renderer_input_callback_routes_sdk_events(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    """Verify default N4 Pro renderer callback drives logical panel input.
+
+    入参：`monkeypatch` 替换 persistent animator；`tmp_path` 提供 fake frame root。
+    返回：无返回值；断言通过代表真实 SDK callback 可进入 daemon runtime。
+    错误处理：callback 未注入、event 未映射或 selection 未更新时由 pytest 报告。
+    副作用：只运行 fake renderer，不访问真实 N4 Pro。
+    """
+
+    captured: dict[str, object] = {}
+
+    class FakePersistentAnimator:
+        """捕获 daemon 默认构造的 persistent animator。
+
+        入参：`input_callback` 是 daemon 注入的 SDK event callback。
+        返回：callable fake renderer。
+        错误处理：无。
+        副作用：保存 callback 到测试 dict。
+        """
+
+        def __init__(self, *, input_callback: object | None = None) -> None:
+            """保存 input callback。
+
+            入参：`input_callback` 是 daemon 传入的 callback。
+            返回：无。
+            错误处理：无。
+            副作用：写入测试 dict。
+            """
+
+            captured["input_callback"] = input_callback
+
+        def __call__(self, **_: object) -> StreamDockN4ProAnimationResult:
+            """模拟一次统一 renderer 成功。
+
+            入参：忽略 renderer 参数。
+            返回：固定成功结果。
+            错误处理：无。
+            副作用：无。
+            """
+
+            return StreamDockN4ProAnimationResult(ok=True)
+
+        def close(self) -> None:
+            """模拟 renderer close。
+
+            入参：无。
+            返回：无。
+            错误处理：无。
+            副作用：无。
+            """
+
+    monkeypatch.setattr(
+        server_app,
+        "StreamDockN4ProPersistentAnimator",
+        FakePersistentAnimator,
+    )
+    app = create_app(
+        poller_config=DaemonPollerConfig(
+            codex_token_usage_enabled=True,
+            streamdock_n4pro_renderer_enabled=True,
+            streamdock_n4pro_frame_root=tmp_path,
+        ),
+        codex_token_usage_reader=_token_snapshot,
+    )
+    with TestClient(app) as client:
+        input_callback = captured["input_callback"]
+        assert callable(input_callback)
+        input_callback(
+            object(),
+            _sdk_event(event_type="knob_press", knob_id="knob_4", state=1),
+        )
+        input_callback(
+            object(),
+            _sdk_event(
+                event_type="knob_rotate",
+                knob_id="knob_4",
+                direction="right",
+            ),
+        )
+        status = client.get("/status").json()
+
+    assert status["logical_panel"]["selection"]["active_kind"] == "tokens"
+    assert status["logical_panel"]["selection"]["token_period"] == "week"
+
+
 async def test_streamdock_n4pro_loop_deducts_render_time_from_interval(
     monkeypatch: object,
     tmp_path: Path,
@@ -901,6 +1033,63 @@ def _hardware_input(
         "value": value,
         "occurred_at": datetime(2026, 6, 22, 12, 0, tzinfo=UTC).isoformat(),
     }
+
+
+def _sdk_event(
+    *,
+    event_type: str,
+    knob_id: str | None = None,
+    direction: str | None = None,
+    state: int | None = None,
+    x: int | None = None,
+    y: int | None = None,
+) -> object:
+    """构造 SDK-like InputEvent 测试替身。
+
+    入参：`event_type` 是 SDK event type；`knob_id`、`direction`、`state`、`x`、`y`
+    是可选属性。
+    返回：带 `.value` enum-like 属性的对象。
+    错误处理：无。
+    副作用：只创建内存对象。
+    """
+
+    class ValueObject:
+        """带 `.value` 的 SDK enum-like 测试替身。
+
+        入参：`value` 是字符串值。
+        返回：测试对象。
+        错误处理：无。
+        副作用：无。
+        """
+
+        def __init__(self, value: str) -> None:
+            """保存字符串值。
+
+            入参：`value` 是字符串值。
+            返回：无。
+            错误处理：无。
+            副作用：无。
+            """
+
+            self.value = value
+
+    class Event:
+        """最小 SDK InputEvent 替身。
+
+        入参：无。
+        返回：测试对象。
+        错误处理：无。
+        副作用：无。
+        """
+
+    event = Event()
+    event.event_type = ValueObject(event_type)
+    event.knob_id = ValueObject(knob_id) if knob_id is not None else None
+    event.direction = ValueObject(direction) if direction is not None else None
+    event.state = state
+    event.x = x
+    event.y = y
+    return event
 
 
 def _request_decision(

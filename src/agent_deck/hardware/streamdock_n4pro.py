@@ -23,6 +23,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agent_deck.hardware.streamdock_probe import _prepend_sdk_path_from_env
 
+StreamDockInputCallback = Callable[[object, object], None]
+
 
 class StreamDockN4ProDeviceLike(Protocol):
     """统一 N4 Pro writer 所需的官方 SDK device 最小协议。
@@ -179,12 +181,14 @@ class StreamDockN4ProPersistentAnimator:
         *,
         manager: StreamDockN4ProManagerLike | None = None,
         temp_dir: Path | None = None,
+        input_callback: StreamDockInputCallback | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         """初始化 persistent animator，但不立即访问硬件。
 
         入参：`manager` 是可选设备管理器；`temp_dir` 是临时背景文件目录；
+        `input_callback` 是可选 SDK input 回调，会在首次 open/init 后注册到 key 和 touch bar；
         `sleep`/`monotonic` 用于帧节奏和诊断。
         返回：无显式返回值。
         错误处理：构造阶段不访问 SDK，不抛硬件错误。
@@ -193,6 +197,7 @@ class StreamDockN4ProPersistentAnimator:
 
         self._manager = manager
         self._temp_dir = temp_dir
+        self._input_callback = input_callback
         self._sleep = sleep
         self._monotonic = monotonic
         self._device: StreamDockN4ProDeviceLike | None = None
@@ -375,9 +380,30 @@ class StreamDockN4ProPersistentAnimator:
                 error="open failed: SDK returned false",
             )
         device.init()
+        self._register_input_callback(device)
         self._device = device
         timing["open_init"] = _elapsed_seconds(started_at, self._monotonic())
         return device
+
+    def _register_input_callback(self, device: StreamDockN4ProDeviceLike) -> None:
+        """把可选 input callback 注册到 N4 Pro SDK 回调入口。
+
+        入参：`device` 是已 open/init 的 N4 Pro SDK device。
+        返回：无返回值。
+        错误处理：若设备没有某类 callback setter 则跳过；setter 自身异常会传播并关闭会话。
+        副作用：修改 SDK device 的 key/touch callback，用于同一设备会话内接收真实输入。
+        """
+
+        if self._input_callback is None:
+            return
+        key_setter = getattr(device, "set_key_callback", None)
+        if callable(key_setter):
+            key_setter(self._input_callback)
+        touch_setter = getattr(device, "set_touch_bar_callback", None)
+        if not callable(touch_setter):
+            touch_setter = getattr(device, "set_touchscreen_callback", None)
+        if callable(touch_setter):
+            touch_setter(self._input_callback)
 
 
 def render_images_to_n4pro(

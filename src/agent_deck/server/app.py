@@ -50,10 +50,14 @@ from agent_deck.hardware.streamdock_touchscreen import (
     StreamDockTouchscreenRenderResult,
     render_touchscreen_image_to_n4pro,
 )
-from agent_deck.input.logical_panel import panel_event_from_hardware_input
+from agent_deck.input.logical_panel import (
+    panel_event_from_hardware_input,
+    panel_event_from_streamdock_input_event,
+)
 from agent_deck.rendering.codex_key_frames import codex_key_frame_paths_for_key_variants
 from agent_deck.rendering.layout import LayoutPlan, build_layout_plan
 from agent_deck.rendering.logical_panel import (
+    LogicalPanelPlan,
     PanelInputEvent,
     PanelKind,
     PanelSelection,
@@ -390,11 +394,35 @@ class _DaemonRuntime:
             **result,
         }
 
+    def apply_streamdock_input_event(self, event: object) -> dict[str, Any]:
+        """Apply one SDK-like StreamDock input event through input routers.
+
+        入参：`event` 是官方 SDK `InputEvent` 或具备同名属性的对象。
+        返回：JSON-safe dict，说明是否被 logical panel 处理以及当前 selection。
+        错误处理：panel 渲染异常按原语义传播；无法映射的输入返回 handled=false。
+        副作用：当输入映射到 logical panel event 时更新 selection 并可能渲染 fake touchscreen。
+        """
+
+        panel_event = panel_event_from_streamdock_input_event(event)
+        if panel_event is None:
+            return {
+                "handled": False,
+                "panel_event": None,
+                "selection": _dump_model(self.logical_panel_selection),
+            }
+        result = self.apply_logical_panel_input(LogicalPanelInputBody(event=panel_event))
+        return {
+            "handled": True,
+            "panel_event": panel_event.value,
+            **result,
+        }
+
     def build_current_logical_panel_background(self) -> tuple[Any, str] | None:
         """Build the current logical panel background image without recording it.
 
         入参：无；读取当前 `logical_panel_selection` 和已缓存的 quota/token snapshot。
-        返回：`(image, source)`；当前 panel 缺少数据或暂不可渲染时返回 None。
+        返回：`(image, source)`；当前 panel 缺少真实数据时返回占位面板，保证真实 renderer
+        能启动并注册硬件输入回调。
         错误处理：Pillow 渲染异常按原语义传播。
         副作用：只创建内存图像，不修改 fake surface。
         """
@@ -411,7 +439,11 @@ class _DaemonRuntime:
                 period=self.logical_panel_selection.token_period,
             )
             return render_logical_panel_touchscreen(plan), "codex_tokens"
-        return None
+        plan = _logical_panel_placeholder_plan(
+            active_kind,
+            token_period=self.logical_panel_selection.token_period,
+        )
+        return render_logical_panel_touchscreen(plan), f"{active_kind.value}:placeholder"
 
     def render_current_logical_panel_image(self) -> Any | None:
         """Render and record the current logical panel image when possible.
@@ -782,9 +814,6 @@ def create_app(
     """
 
     resolved_poller_config = poller_config or DaemonPollerConfig()
-    resolved_streamdock_n4pro_renderer_sink: StreamDockN4ProRendererSink = (
-        streamdock_n4pro_renderer_sink or StreamDockN4ProPersistentAnimator()
-    )
     runtime = _DaemonRuntime(
         store=AgentStateStore(),
         broker=DecisionBroker(),
@@ -805,6 +834,14 @@ def create_app(
         streamdock_n4pro_renderer_result=None,
         streamdock_n4pro_renderer_updated_at=None,
         streamdock_n4pro_renderer_last_error=None,
+    )
+    resolved_streamdock_n4pro_renderer_sink: StreamDockN4ProRendererSink = (
+        streamdock_n4pro_renderer_sink
+        or StreamDockN4ProPersistentAnimator(
+            input_callback=lambda _device, event: runtime.apply_streamdock_input_event(
+                event
+            )
+        )
     )
 
     @asynccontextmanager
@@ -1228,6 +1265,44 @@ async def _render_streamdock_n4pro_once(
         )
     except Exception as exc:  # noqa: BLE001 - 硬件渲染失败应进入 status，不杀 daemon。
         runtime.mark_streamdock_n4pro_renderer_error(exc, rendered_at=rendered_at)
+
+
+def _logical_panel_placeholder_plan(
+    kind: PanelKind,
+    *,
+    token_period: Any,
+) -> LogicalPanelPlan:
+    """为缺少数据的 logical panel 创建可渲染占位计划。
+
+    入参：`kind` 是当前面板类型；`token_period` 是 tokens 面板当前周期，会用于标题。
+    返回：`LogicalPanelPlan`，可被真实 renderer 用来启动硬件会话和输入回调。
+    错误处理：未知 kind 走通用占位文案。
+    副作用：无；只创建内存模型。
+    """
+
+    if kind == PanelKind.QUOTA:
+        return LogicalPanelPlan(
+            kind=kind,
+            title="Quota",
+            lines=("Waiting for quota data",),
+        )
+    if kind == PanelKind.TOKENS:
+        return LogicalPanelPlan(
+            kind=kind,
+            title=f"Tokens · {getattr(token_period, 'value', token_period)}",
+            lines=("Waiting for token data",),
+        )
+    if kind == PanelKind.PETS:
+        return LogicalPanelPlan(
+            kind=kind,
+            title="Pets",
+            lines=("Pet panel is not ready",),
+        )
+    return LogicalPanelPlan(
+        kind=kind,
+        title="Message",
+        lines=("No message",),
+    )
 
 
 def _key_frame_paths_from_layout(

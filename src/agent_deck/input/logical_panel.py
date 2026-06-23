@@ -62,6 +62,13 @@ def panel_event_from_streamdock_input_event(event: object) -> PanelInputEvent | 
             return PanelInputEvent.TOUCH_TAP
         return None
 
+    if event_type == "knob_press":
+        knob_id = _enum_or_string(getattr(event, "knob_id", None))
+        state = _int_value(getattr(event, "state", None))
+        if knob_id == "knob_4" and state == 1:
+            return PanelInputEvent.TOUCH_TAP
+        return None
+
     if event_type == "knob_rotate":
         knob_id = _enum_or_string(getattr(event, "knob_id", None))
         if knob_id != "knob_4":

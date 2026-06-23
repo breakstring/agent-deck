@@ -105,8 +105,16 @@ def test_streamdock_input_event_shape_maps_to_panel_events() -> None:
         knob_id=_ValueObject("knob_4"),
         direction=_ValueObject("right"),
     )
+    knob_press = SimpleNamespace(
+        event_type=_ValueObject("knob_press"),
+        knob_id=_ValueObject("knob_4"),
+        state=1,
+    )
 
     assert panel_event_from_streamdock_input_event(touch) == (
+        PanelInputEvent.TOUCH_TAP
+    )
+    assert panel_event_from_streamdock_input_event(knob_press) == (
         PanelInputEvent.TOUCH_TAP
     )
     assert panel_event_from_streamdock_input_event(knob_right) == (
