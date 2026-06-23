@@ -160,6 +160,10 @@ flowchart LR
 
 16. installer / doctor
     检查 Codex 配置、SDK、设备权限、端口占用、官方软件设备占用，提供 dry-run patch。
+    当前 `agent-deckctl doctor` 已提供只读本机诊断：输出 Agent Deck 版本、
+    `AGENT_DECK_STREAMDOCK_SDK_PATH` 状态、安全 StreamDock SDK probe 结果、N4 Pro
+    open/read 结果，以及常见硬件占用进程线索；该命令不调用 SDK `init()`、不渲染、不写文件、
+    不停止任何进程。Codex 配置完整检查、端口占用检查和安装器 dry-run patch 仍属于后续扩展。
     Codex 安装器保留 user-level 默认模式，并提供 `--managed-system` 高级模式：写系统
     `/etc/codex/requirements.toml` managed hooks、设置 `[hooks].managed_dir`、安装稳定
     wrapper、清理用户级重复 Agent Deck hooks；正式写入前提供 `--validate-only` 只读检查。

@@ -11,7 +11,9 @@ Codex App 本地状态扫描命令分派、真实 N4 Pro 预览命令，以及�
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -43,6 +45,7 @@ from agent_deck.adapters.codex_discovery import (
 from agent_deck.adapters.codex_quota import read_codex_quota
 from agent_deck.core.decisions import DecisionBehavior
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
+from agent_deck.hardware.streamdock_probe import probe_streamdock_devices
 from agent_deck.hardware.streamdock_n4pro import animate_key_images_on_n4pro
 from agent_deck.hosts.codex import CodexHostResolver
 from agent_deck.hosts.models import AgentHostContext
@@ -56,6 +59,19 @@ from agent_deck.server.app import DaemonPollerConfig, create_app
 
 DEFAULT_DAEMON_URL = "http://127.0.0.1:8765"
 _DEFAULT_HTTP_TIMEOUT_SECONDS = 5.0
+_STREAMDOCK_SDK_PATH_ENV = "AGENT_DECK_STREAMDOCK_SDK_PATH"
+_HARDWARE_OCCUPANT_PATTERNS = (
+    "agent-deckd",
+    "agent_deckd",
+    "streamdock",
+    "stream dock",
+    "donglemonitor",
+    "com.boegam.eshow.service",
+    "eshow.app",
+    "eshow dongle",
+    "mirabox",
+    "hotspotek",
+)
 
 #: Typer app for the local daemon entry point. The callback starts uvicorn when
 #: invoked without a subcommand; importing the app has no network or hardware
@@ -315,6 +331,41 @@ def version() -> None:
     """
 
     typer.echo(__version__)
+
+
+@ctl_app.command("doctor")
+def doctor(
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print machine-readable JSON.",
+        ),
+    ] = False,
+    skip_streamdock_probe: Annotated[
+        bool,
+        typer.Option(
+            "--skip-streamdock-probe",
+            help="Skip the safe read-only StreamDock SDK probe.",
+        ),
+    ] = False,
+) -> None:
+    """运行本机 Agent Deck 诊断并输出硬件接管线索。
+
+    入参：`json_output` 控制输出 JSON 或人类可读摘要；`skip_streamdock_probe`
+    可跳过 StreamDock SDK 只读探针，只保留环境和进程占用线索。
+    返回：无显式返回值；stdout 输出诊断报告。
+    错误处理：StreamDock SDK 导入或枚举失败会记录到 report，不让 doctor 命令失败；
+    进程表读取失败同样记录为 warning，方便用户继续查看其他线索。
+    副作用：默认会短暂执行安全 StreamDock 只读 probe，并运行一次 `ps` 读取本机进程表；
+    不调用设备 init、不渲染、不写文件、不停止或启动任何进程。
+    """
+
+    report = _build_doctor_report(skip_streamdock_probe=skip_streamdock_probe)
+    if json_output:
+        _echo_json(report)
+        return
+    _echo_doctor_report(report)
 
 
 @ctl_app.command()
@@ -911,6 +962,228 @@ def _codex_session_key_frame_paths(
         start_key=1,
         max_keys=10,
     )
+
+
+def _build_doctor_report(*, skip_streamdock_probe: bool = False) -> dict[str, Any]:
+    """构建本机诊断报告，不修改硬件或用户配置。
+
+    入参：`skip_streamdock_probe` 为 True 时不加载官方 SDK，也不短暂 open StreamDock 设备。
+    返回：包含版本、SDK 路径、StreamDock 探针结果、疑似硬件占用进程和 warnings 的 JSON-like dict。
+    错误处理：SDK probe 或进程表读取失败会被捕获并写入报告，避免诊断命令在最需要时中断。
+    副作用：可能读取环境变量、短暂执行 StreamDock 只读 probe，以及运行一次 `ps` 读取进程表。
+    """
+
+    sdk_path = os.environ.get(_STREAMDOCK_SDK_PATH_ENV)
+    warnings: list[str] = []
+    streamdock_probe_error: str | None = None
+    streamdock_devices: list[dict[str, Any]] = []
+
+    if not skip_streamdock_probe:
+        try:
+            streamdock_devices = [
+                result.model_dump(mode="json") for result in probe_streamdock_devices()
+            ]
+        except Exception as exc:
+            streamdock_probe_error = str(exc)
+            warnings.append(f"StreamDock 只读探针失败: {exc}")
+    else:
+        warnings.append("已跳过 StreamDock 只读探针")
+
+    if not sdk_path and (skip_streamdock_probe or streamdock_probe_error is not None):
+        warnings.append(
+            f"未设置 {_STREAMDOCK_SDK_PATH_ENV}；macOS 上建议指向官方 Python-SDK 或 Python-SDK/src"
+        )
+
+    if not skip_streamdock_probe and not streamdock_devices and streamdock_probe_error is None:
+        warnings.append("未发现 StreamDock 设备")
+
+    if any(device.get("can_open") is False for device in streamdock_devices):
+        warnings.append(
+            "至少一个 StreamDock 设备无法 open；可能被官方软件、旧 agent-deckd 或其他 HID 进程占用"
+        )
+
+    try:
+        hardware_occupants = _scan_hardware_occupants()
+    except Exception as exc:
+        hardware_occupants = []
+        warnings.append(f"读取进程表失败: {exc}")
+
+    if hardware_occupants:
+        warnings.append("发现疑似硬件占用进程；如需真实接管 N4 Pro，请先确认这些进程是否应退出")
+
+    return {
+        "version": __version__,
+        "streamdock_sdk_path_env": _STREAMDOCK_SDK_PATH_ENV,
+        "streamdock_sdk_path": sdk_path,
+        "streamdock_probe_skipped": skip_streamdock_probe,
+        "streamdock_probe_error": streamdock_probe_error,
+        "streamdock_devices": streamdock_devices,
+        "hardware_occupants": hardware_occupants,
+        "warnings": warnings,
+    }
+
+
+def _scan_hardware_occupants() -> list[dict[str, Any]]:
+    """扫描疑似会占用 StreamDock/N4 Pro HID 的本机进程。
+
+    入参：无。
+    返回：按 pid 升序排列的 dict 列表，每项包含 `pid`、`ppid`、`command` 和命中的
+    `matched_pattern`。
+    错误处理：`ps` 不存在、超时或返回非零时由 `subprocess.run` 抛出异常给调用方。
+    副作用：运行一次 `ps -axo pid=,ppid=,command=` 读取进程表；不发送信号、不改进程状态。
+    """
+
+    completed = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,command="],
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=2.0,
+    )
+    current_pid = os.getpid()
+    occupants: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    for line in completed.stdout.splitlines():
+        parsed = _parse_ps_process_line(line)
+        if parsed is None:
+            continue
+        pid, ppid, command = parsed
+        if pid == current_pid:
+            continue
+        matched_pattern = _hardware_occupant_pattern(command)
+        if matched_pattern is None:
+            continue
+        key = (pid, matched_pattern)
+        if key in seen:
+            continue
+        seen.add(key)
+        occupants.append(
+            {
+                "pid": pid,
+                "ppid": ppid,
+                "command": command,
+                "matched_pattern": matched_pattern,
+            }
+        )
+    return sorted(occupants, key=lambda item: item["pid"])
+
+
+def _parse_ps_process_line(line: str) -> tuple[int, int, str] | None:
+    """解析 `ps -axo pid=,ppid=,command=` 的一行输出。
+
+    入参：`line` 是一行进程表文本，预期前两列为 pid/ppid，剩余部分为 command。
+    返回：解析成功时返回 `(pid, ppid, command)`；空行、列不足或 pid 非整数时返回 None。
+    错误处理：解析失败不抛异常，避免异常进程名影响整体 doctor 报告。
+    副作用：无；只处理内存字符串。
+    """
+
+    parts = line.strip().split(None, 2)
+    if len(parts) != 3:
+        return None
+    try:
+        pid = int(parts[0])
+        ppid = int(parts[1])
+    except ValueError:
+        return None
+    command = parts[2].strip()
+    if not command:
+        return None
+    return pid, ppid, command
+
+
+def _hardware_occupant_pattern(command: str) -> str | None:
+    """判断进程命令行是否命中已知硬件占用线索。
+
+    入参：`command` 是进程完整命令行。
+    返回：首个命中的小写 pattern；无命中时返回 None。
+    错误处理：本函数不抛业务异常。
+    副作用：无；只做字符串匹配。
+    """
+
+    normalized = command.lower()
+    for pattern in _HARDWARE_OCCUPANT_PATTERNS:
+        if pattern in normalized:
+            if pattern == "agent_deckd":
+                return "agent-deckd"
+            return pattern
+    return None
+
+
+def _echo_doctor_report(report: dict[str, Any]) -> None:
+    """把 doctor JSON-like 报告格式化为人类可读文本。
+
+    入参：`report` 是 `_build_doctor_report` 返回的 dict。
+    返回：无显式返回值；stdout 输出多行摘要。
+    错误处理：缺失字段时使用默认空值降级输出，不抛业务异常。
+    副作用：向 stdout 写入诊断文本。
+    """
+
+    typer.echo(f"Agent Deck {report.get('version', 'unknown')} doctor")
+    sdk_path = report.get("streamdock_sdk_path")
+    if sdk_path:
+        typer.echo(f"StreamDock SDK: {sdk_path}")
+    else:
+        typer.echo(
+            f"StreamDock SDK: unset ({report.get('streamdock_sdk_path_env', _STREAMDOCK_SDK_PATH_ENV)})"
+        )
+
+    devices = report.get("streamdock_devices")
+    if not isinstance(devices, list):
+        devices = []
+    if report.get("streamdock_probe_skipped"):
+        typer.echo("StreamDock probe: skipped")
+    elif report.get("streamdock_probe_error"):
+        typer.echo(f"StreamDock probe: error: {report['streamdock_probe_error']}")
+    else:
+        typer.echo(f"StreamDock devices: {len(devices)}")
+        for index, device in enumerate(devices, start=1):
+            typer.echo(
+                "  "
+                f"{index}. {device.get('device_type', 'unknown')} "
+                f"open={_yes_no(device.get('can_open'))} "
+                f"init={_yes_no(device.get('can_init'))} "
+                f"path={device.get('path', '')}"
+            )
+            if device.get("error"):
+                typer.echo(f"     error={device['error']}")
+
+    occupants = report.get("hardware_occupants")
+    if not isinstance(occupants, list):
+        occupants = []
+    typer.echo(f"Hardware occupant processes: {len(occupants)}")
+    for process in occupants:
+        typer.echo(
+            "  "
+            f"pid={process.get('pid')} "
+            f"match={process.get('matched_pattern')} "
+            f"cmd={process.get('command')}"
+        )
+
+    warnings = report.get("warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    if warnings:
+        typer.echo("Warnings:")
+        for warning in warnings:
+            typer.echo(f"  - {warning}")
+    else:
+        typer.echo("Warnings: none")
+
+
+def _yes_no(value: Any) -> str:
+    """将布尔诊断字段格式化为 yes/no/unknown。
+
+    入参：`value` 是任意诊断字段值。
+    返回：True 返回 `yes`，False 返回 `no`，其他值返回 `unknown`。
+    错误处理：本函数不抛业务异常。
+    副作用：无；只格式化内存值。
+    """
+
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return "unknown"
 
 
 @ctl_app.command("codex-detect")

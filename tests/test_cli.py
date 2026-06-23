@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 from agent_deck import __version__
 from agent_deck import cli
 from agent_deck.core.state import AgentStatus
+from agent_deck.hardware.streamdock_probe import ProbeResult
 from agent_deck.rendering.asset_builder import CodexVisualAssetBuildResult
 
 
@@ -166,6 +167,150 @@ def test_version_preserves_existing_output() -> None:
 
     assert result.exit_code == 0
     assert result.output.strip() == __version__
+
+
+def test_doctor_json_reports_streamdock_probe_and_occupants(monkeypatch: Any) -> None:
+    """验证 doctor JSON 汇总安全探针和疑似占用进程。
+
+    入参：`monkeypatch` 注入 fake probe、fake 进程扫描和 SDK 环境变量。
+    返回：无返回值；断言通过代表命令输出稳定 JSON report。
+    错误处理：退出码、JSON 结构或字段内容不符合预期时由 pytest 报告。
+    副作用：只运行 Typer in-process；不访问真实硬件、不读取真实进程表。
+    """
+
+    monkeypatch.setenv("AGENT_DECK_STREAMDOCK_SDK_PATH", "/tmp/StreamDock-Device-SDK/Python-SDK")
+    monkeypatch.setattr(
+        cli,
+        "probe_streamdock_devices",
+        lambda: [
+            ProbeResult(
+                device_type="N4Pro",
+                path="DevSrvsID:4295063691",
+                can_open=True,
+                can_init=False,
+                firmware_version="1.0.0",
+                serial_number="serial-1",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        cli,
+        "_scan_hardware_occupants",
+        lambda: [
+            {
+                "pid": 123,
+                "ppid": 1,
+                "command": "/Users/kenn/Library/boegam/donglemonitor eshow dongle",
+                "matched_pattern": "donglemonitor",
+            }
+        ],
+    )
+
+    result = runner.invoke(cli.ctl_app, ["doctor", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["streamdock_sdk_path"] == "/tmp/StreamDock-Device-SDK/Python-SDK"
+    assert payload["streamdock_probe_error"] is None
+    assert payload["streamdock_devices"][0]["device_type"] == "N4Pro"
+    assert payload["streamdock_devices"][0]["can_open"] is True
+    assert payload["hardware_occupants"][0]["matched_pattern"] == "donglemonitor"
+    assert any("疑似硬件占用进程" in warning for warning in payload["warnings"])
+
+
+def test_doctor_keeps_running_when_streamdock_probe_fails(monkeypatch: Any) -> None:
+    """验证 SDK 探针失败时 doctor 仍输出诊断报告。
+
+    入参：`monkeypatch` 注入会抛错的 fake probe 和空进程扫描。
+    返回：无返回值；断言通过代表现场 SDK/import 错误不会中断 doctor。
+    错误处理：命令失败或 warning 缺失时由 pytest 报告。
+    副作用：只运行 Typer in-process；不访问真实硬件、不读取真实进程表。
+    """
+
+    monkeypatch.delenv("AGENT_DECK_STREAMDOCK_SDK_PATH", raising=False)
+
+    def fail_probe() -> list[ProbeResult]:
+        """模拟官方 SDK 不可导入或枚举失败。
+
+        入参：无。
+        返回：不会返回；总是抛出 RuntimeError。
+        错误处理：调用方应把异常收敛到 doctor report。
+        副作用：无；不访问真实硬件。
+        """
+
+        raise RuntimeError("SDK unavailable")
+
+    monkeypatch.setattr(cli, "probe_streamdock_devices", fail_probe)
+    monkeypatch.setattr(cli, "_scan_hardware_occupants", lambda: [])
+
+    result = runner.invoke(cli.ctl_app, ["doctor", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["streamdock_sdk_path"] is None
+    assert payload["streamdock_probe_error"] == "SDK unavailable"
+    assert payload["streamdock_devices"] == []
+    assert any("AGENT_DECK_STREAMDOCK_SDK_PATH" in warning for warning in payload["warnings"])
+    assert any("StreamDock 只读探针失败" in warning for warning in payload["warnings"])
+
+
+def test_scan_hardware_occupants_parses_ps_output(monkeypatch: Any) -> None:
+    """验证疑似硬件占用进程扫描能解析 ps 输出。
+
+    入参：`monkeypatch` 替换 `subprocess.run` 和当前进程 pid。
+    返回：无返回值；断言通过代表 scanner 不依赖真实系统进程表。
+    错误处理：解析结果或过滤逻辑不符合预期时由 pytest 报告。
+    副作用：无真实 subprocess 调用，不发送信号、不修改进程。
+    """
+
+    class Completed:
+        """提供 `_scan_hardware_occupants` 需要的 subprocess 返回值。
+
+        入参：无。
+        返回：fake completed process 实例。
+        错误处理：构造过程不抛异常。
+        副作用：只保存 stdout 字符串。
+        """
+
+        stdout = "\n".join(
+            [
+                "  10   1 /Applications/StreamDock.app/Contents/MacOS/StreamDock",
+                "  11   1 /usr/bin/python -m agent_deckd",
+                "  12   1 /bin/zsh",
+                "  99   1 agent-deckctl doctor",
+            ]
+        )
+
+    def fake_run(*_args: Any, **_kwargs: Any) -> Completed:
+        """返回固定 ps 输出。
+
+        入参：忽略 subprocess.run 的参数。
+        返回：包含固定 stdout 的 fake completed process。
+        错误处理：不模拟失败。
+        副作用：无；不启动子进程。
+        """
+
+        return Completed()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli.os, "getpid", lambda: 99)
+
+    occupants = cli._scan_hardware_occupants()
+
+    assert occupants == [
+        {
+            "pid": 10,
+            "ppid": 1,
+            "command": "/Applications/StreamDock.app/Contents/MacOS/StreamDock",
+            "matched_pattern": "streamdock",
+        },
+        {
+            "pid": 11,
+            "ppid": 1,
+            "command": "/usr/bin/python -m agent_deckd",
+            "matched_pattern": "agent-deckd",
+        },
+    ]
 
 
 def test_codex_hosts_prints_resolver_json(monkeypatch: Any) -> None:
