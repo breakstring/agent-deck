@@ -615,7 +615,15 @@ def test_default_n4pro_renderer_input_callback_routes_sdk_events(
             object(),
             _sdk_event(event_type="touch_point", x=657, y=91),
         )
-        input_callback(
+        first_knob_response = input_callback(
+            object(),
+            _sdk_event(
+                event_type="knob_rotate",
+                knob_id="knob_4",
+                direction="right",
+            ),
+        )
+        second_knob_response = input_callback(
             object(),
             _sdk_event(
                 event_type="knob_rotate",
@@ -625,11 +633,14 @@ def test_default_n4pro_renderer_input_callback_routes_sdk_events(
         )
         status = client.get("/status").json()
 
+    assert first_knob_response["handled"] is False
+    assert first_knob_response["accumulated"] is True
+    assert second_knob_response["handled"] is True
     assert status["logical_panel"]["selection"]["active_kind"] == "tokens"
     assert status["logical_panel"]["selection"]["token_period"] == "week"
-    assert status["streamdock_input"]["event_count"] == 3
+    assert status["streamdock_input"]["event_count"] == 4
     assert status["streamdock_input"]["last_event"] == {
-        "count": 3,
+        "count": 4,
         "event_type": "knob_rotate",
         "knob_id": "knob_4",
         "direction": "right",
@@ -639,6 +650,8 @@ def test_default_n4pro_renderer_input_callback_routes_sdk_events(
         "panel_event": "knob_4.rotate_right",
         "handled": True,
         "debounced": False,
+        "accumulated": False,
+        "knob4_rotate_accumulator": 0,
     }
 
 

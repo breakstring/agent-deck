@@ -79,6 +79,9 @@ StreamDockN4ProRendererSink = Callable[..., StreamDockN4ProAnimationResult]
 _STREAMDOCK_TOUCH_TAP_DEBOUNCE_SECONDS = 0.45
 """真实 StreamDock touch bar 连续 touch_point 归并为一次 tap 的最短间隔。"""
 
+_STREAMDOCK_KNOB4_ROTATE_THRESHOLD = 2
+"""真实 StreamDock 第 4 旋钮累计多少个 rotate 事件后切换一次 token 周期。"""
+
 
 class DaemonPollerConfig(BaseModel):
     """Configure optional daemon-side Codex polling loops.
@@ -199,6 +202,7 @@ class _DaemonRuntime:
     codex_token_usage_last_error: str | None
     logical_panel_selection: PanelSelection
     streamdock_touch_tap_last_handled_monotonic: float | None
+    streamdock_knob4_rotate_accumulator: int
     streamdock_input_event_count: int
     streamdock_last_input_event: dict[str, Any] | None
     streamdock_quota_touchscreen_result: StreamDockTouchscreenRenderResult | None
@@ -416,6 +420,7 @@ class _DaemonRuntime:
                 panel_event=None,
                 handled=False,
                 debounced=False,
+                accumulated=False,
             )
             return {
                 "handled": False,
@@ -428,6 +433,7 @@ class _DaemonRuntime:
                 panel_event=panel_event,
                 handled=False,
                 debounced=True,
+                accumulated=False,
             )
             return {
                 "handled": False,
@@ -435,12 +441,27 @@ class _DaemonRuntime:
                 "selection": _dump_model(self.logical_panel_selection),
                 "debounced": True,
             }
+        if self._should_accumulate_streamdock_knob_event(panel_event):
+            self._record_streamdock_input_event(
+                event,
+                panel_event=panel_event,
+                handled=False,
+                debounced=False,
+                accumulated=True,
+            )
+            return {
+                "handled": False,
+                "panel_event": panel_event.value,
+                "selection": _dump_model(self.logical_panel_selection),
+                "accumulated": True,
+            }
         result = self.apply_logical_panel_input(LogicalPanelInputBody(event=panel_event))
         self._record_streamdock_input_event(
             event,
             panel_event=panel_event,
             handled=True,
             debounced=False,
+            accumulated=False,
         )
         return {
             "handled": True,
@@ -455,11 +476,13 @@ class _DaemonRuntime:
         panel_event: PanelInputEvent | None,
         handled: bool,
         debounced: bool,
+        accumulated: bool,
     ) -> None:
         """记录最近一次真实 StreamDock 输入诊断。
 
         入参：`event` 是 SDK-like 输入事件；`panel_event` 是 logical panel 映射结果；
-        `handled` 表示本次是否改变 runtime 状态；`debounced` 表示是否因防抖被丢弃。
+        `handled` 表示本次是否改变 runtime 状态；`debounced` 表示是否因防抖被丢弃；
+        `accumulated` 表示是否仍在等待旋钮累计阈值。
         返回：无。
         错误处理：缺失属性按 None 记录，不抛业务异常。
         副作用：更新 runtime 内存中的输入计数和最近事件摘要。
@@ -477,7 +500,37 @@ class _DaemonRuntime:
             "panel_event": panel_event.value if panel_event is not None else None,
             "handled": handled,
             "debounced": debounced,
+            "accumulated": accumulated,
+            "knob4_rotate_accumulator": self.streamdock_knob4_rotate_accumulator,
         }
+
+    def _should_accumulate_streamdock_knob_event(self, event: PanelInputEvent) -> bool:
+        """判断真实 StreamDock 旋钮事件是否尚未达到周期切换阈值。
+
+        入参：`event` 是 SDK 事件映射后的 logical panel 输入。
+        返回：需要继续累计、暂不切换 token 周期时为 True；达到阈值时清零并返回 False。
+        错误处理：无。
+        副作用：更新第 4 旋钮的有符号累计步数。
+        """
+
+        if event == PanelInputEvent.KNOB_4_ROTATE_RIGHT:
+            step = 1
+        elif event == PanelInputEvent.KNOB_4_ROTATE_LEFT:
+            step = -1
+        else:
+            return False
+
+        if self.logical_panel_selection.active_kind != PanelKind.TOKENS:
+            self.streamdock_knob4_rotate_accumulator = 0
+            return False
+
+        self.streamdock_knob4_rotate_accumulator += step
+        if abs(self.streamdock_knob4_rotate_accumulator) < (
+            _STREAMDOCK_KNOB4_ROTATE_THRESHOLD
+        ):
+            return True
+        self.streamdock_knob4_rotate_accumulator = 0
+        return False
 
     def _should_debounce_streamdock_panel_event(self, event: PanelInputEvent) -> bool:
         """判断真实 StreamDock panel 输入是否应因连续触发被忽略。
@@ -918,6 +971,7 @@ def create_app(
         codex_token_usage_last_error=None,
         logical_panel_selection=PanelSelection(),
         streamdock_touch_tap_last_handled_monotonic=None,
+        streamdock_knob4_rotate_accumulator=0,
         streamdock_input_event_count=0,
         streamdock_last_input_event=None,
         streamdock_quota_touchscreen_result=None,
