@@ -76,6 +76,9 @@ CodexTokenUsageReader = Callable[[], CodexTokenUsageSnapshot]
 QuotaTouchscreenSink = Callable[[Any], StreamDockTouchscreenRenderResult]
 StreamDockN4ProRendererSink = Callable[..., StreamDockN4ProAnimationResult]
 
+_STREAMDOCK_TOUCH_TAP_DEBOUNCE_SECONDS = 0.45
+"""真实 StreamDock touch bar 连续 touch_point 归并为一次 tap 的最短间隔。"""
+
 
 class DaemonPollerConfig(BaseModel):
     """Configure optional daemon-side Codex polling loops.
@@ -195,6 +198,9 @@ class _DaemonRuntime:
     codex_token_usage_updated_at: datetime | None
     codex_token_usage_last_error: str | None
     logical_panel_selection: PanelSelection
+    streamdock_touch_tap_last_handled_monotonic: float | None
+    streamdock_input_event_count: int
+    streamdock_last_input_event: dict[str, Any] | None
     streamdock_quota_touchscreen_result: StreamDockTouchscreenRenderResult | None
     streamdock_n4pro_renderer_result: StreamDockN4ProAnimationResult | None
     streamdock_n4pro_renderer_updated_at: datetime | None
@@ -405,17 +411,94 @@ class _DaemonRuntime:
 
         panel_event = panel_event_from_streamdock_input_event(event)
         if panel_event is None:
+            self._record_streamdock_input_event(
+                event,
+                panel_event=None,
+                handled=False,
+                debounced=False,
+            )
             return {
                 "handled": False,
                 "panel_event": None,
                 "selection": _dump_model(self.logical_panel_selection),
             }
+        if self._should_debounce_streamdock_panel_event(panel_event):
+            self._record_streamdock_input_event(
+                event,
+                panel_event=panel_event,
+                handled=False,
+                debounced=True,
+            )
+            return {
+                "handled": False,
+                "panel_event": panel_event.value,
+                "selection": _dump_model(self.logical_panel_selection),
+                "debounced": True,
+            }
         result = self.apply_logical_panel_input(LogicalPanelInputBody(event=panel_event))
+        self._record_streamdock_input_event(
+            event,
+            panel_event=panel_event,
+            handled=True,
+            debounced=False,
+        )
         return {
             "handled": True,
             "panel_event": panel_event.value,
             **result,
         }
+
+    def _record_streamdock_input_event(
+        self,
+        event: object,
+        *,
+        panel_event: PanelInputEvent | None,
+        handled: bool,
+        debounced: bool,
+    ) -> None:
+        """记录最近一次真实 StreamDock 输入诊断。
+
+        入参：`event` 是 SDK-like 输入事件；`panel_event` 是 logical panel 映射结果；
+        `handled` 表示本次是否改变 runtime 状态；`debounced` 表示是否因防抖被丢弃。
+        返回：无。
+        错误处理：缺失属性按 None 记录，不抛业务异常。
+        副作用：更新 runtime 内存中的输入计数和最近事件摘要。
+        """
+
+        self.streamdock_input_event_count += 1
+        self.streamdock_last_input_event = {
+            "count": self.streamdock_input_event_count,
+            "event_type": _dump_event_field(getattr(event, "event_type", None)),
+            "knob_id": _dump_event_field(getattr(event, "knob_id", None)),
+            "direction": _dump_event_field(getattr(event, "direction", None)),
+            "state": getattr(event, "state", None),
+            "x": getattr(event, "x", None),
+            "y": getattr(event, "y", None),
+            "panel_event": panel_event.value if panel_event is not None else None,
+            "handled": handled,
+            "debounced": debounced,
+        }
+
+    def _should_debounce_streamdock_panel_event(self, event: PanelInputEvent) -> bool:
+        """判断真实 StreamDock panel 输入是否应因连续触发被忽略。
+
+        入参：`event` 是 SDK 事件映射后的 logical panel 输入。
+        返回：需要忽略本次事件时为 True；否则更新 touch tap 时间并返回 False。
+        错误处理：无。
+        副作用：当事件是未被忽略的 `TOUCH_TAP` 时更新 runtime 内存时间戳。
+        """
+
+        if event != PanelInputEvent.TOUCH_TAP:
+            return False
+        now = time.monotonic()
+        last = self.streamdock_touch_tap_last_handled_monotonic
+        if (
+            last is not None
+            and now - last < _STREAMDOCK_TOUCH_TAP_DEBOUNCE_SECONDS
+        ):
+            return True
+        self.streamdock_touch_tap_last_handled_monotonic = now
+        return False
 
     def build_current_logical_panel_background(self) -> tuple[Any, str] | None:
         """Build the current logical panel background image without recording it.
@@ -668,6 +751,10 @@ class _DaemonRuntime:
                 ),
                 "last_error": self.streamdock_n4pro_renderer_last_error,
             },
+            "streamdock_input": {
+                "event_count": self.streamdock_input_event_count,
+                "last_event": self.streamdock_last_input_event,
+            },
         }
 
     def render_current(self) -> LayoutPlan:
@@ -830,6 +917,9 @@ def create_app(
         codex_token_usage_updated_at=None,
         codex_token_usage_last_error=None,
         logical_panel_selection=PanelSelection(),
+        streamdock_touch_tap_last_handled_monotonic=None,
+        streamdock_input_event_count=0,
+        streamdock_last_input_event=None,
         streamdock_quota_touchscreen_result=None,
         streamdock_n4pro_renderer_result=None,
         streamdock_n4pro_renderer_updated_at=None,
@@ -1502,6 +1592,23 @@ def _dump_datetime(value: datetime | None) -> str | None:
     """
 
     return value.isoformat() if value is not None else None
+
+
+def _dump_event_field(value: object) -> object:
+    """把 SDK enum-like 字段转换成 status 可读值。
+
+    入参：`value` 是 SDK enum、字符串、数字或 None。
+    返回：优先返回 `.value` 字符串，其次返回原始 JSON 基础值，其他对象退化为字符串。
+    错误处理：无。
+    副作用：无；只读取对象属性。
+    """
+
+    enum_value = getattr(value, "value", None)
+    if isinstance(enum_value, str):
+        return enum_value
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    return str(value)
 
 
 def _image_size(image: Any | None) -> list[int] | None:

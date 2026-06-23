@@ -58,15 +58,11 @@ def panel_event_from_streamdock_input_event(event: object) -> PanelInputEvent | 
     if event_type == "touch_point":
         x = _int_value(getattr(event, "x", None))
         y = _int_value(getattr(event, "y", None))
-        if x is not None and y is not None and _is_inside_logical_panel(x, y):
+        if x is not None and y is not None and _is_inside_touch_bar_local_panel(x, y):
             return PanelInputEvent.TOUCH_TAP
         return None
 
     if event_type == "knob_press":
-        knob_id = _enum_or_string(getattr(event, "knob_id", None))
-        state = _int_value(getattr(event, "state", None))
-        if knob_id == "knob_4" and state == 1:
-            return PanelInputEvent.TOUCH_TAP
         return None
 
     if event_type == "knob_rotate":
@@ -105,6 +101,20 @@ def _is_inside_logical_panel(x: int, y: int) -> bool:
 
     viewport = N4PRO_LOGICAL_PANEL_VIEWPORT
     return viewport.left <= x < viewport.right and viewport.top <= y < viewport.bottom
+
+
+def _is_inside_touch_bar_local_panel(x: int, y: int) -> bool:
+    """判断 SDK touch bar 本地坐标是否落在 logical panel 内。
+
+    入参：`x` 和 `y` 是 N4 Pro SDK `touch_point` 回调给出的 touch bar 本地坐标，
+    不是 800x480 背景图坐标。
+    返回：坐标落在当前 logical panel 尺寸内时为 True。
+    错误处理：无。
+    副作用：无。
+    """
+
+    width, height = N4PRO_LOGICAL_PANEL_VIEWPORT.size
+    return 0 <= x < width and 0 <= y < height
 
 
 def _mapping_value(value: object) -> Mapping[Any, Any] | None:

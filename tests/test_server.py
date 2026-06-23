@@ -609,7 +609,11 @@ def test_default_n4pro_renderer_input_callback_routes_sdk_events(
         assert callable(input_callback)
         input_callback(
             object(),
-            _sdk_event(event_type="knob_press", knob_id="knob_4", state=1),
+            _sdk_event(event_type="touch_point", x=658, y=94),
+        )
+        input_callback(
+            object(),
+            _sdk_event(event_type="touch_point", x=657, y=91),
         )
         input_callback(
             object(),
@@ -623,6 +627,19 @@ def test_default_n4pro_renderer_input_callback_routes_sdk_events(
 
     assert status["logical_panel"]["selection"]["active_kind"] == "tokens"
     assert status["logical_panel"]["selection"]["token_period"] == "week"
+    assert status["streamdock_input"]["event_count"] == 3
+    assert status["streamdock_input"]["last_event"] == {
+        "count": 3,
+        "event_type": "knob_rotate",
+        "knob_id": "knob_4",
+        "direction": "right",
+        "state": None,
+        "x": None,
+        "y": None,
+        "panel_event": "knob_4.rotate_right",
+        "handled": True,
+        "debounced": False,
+    }
 
 
 async def test_streamdock_n4pro_loop_deducts_render_time_from_interval(

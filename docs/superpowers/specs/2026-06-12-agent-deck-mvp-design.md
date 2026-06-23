@@ -273,8 +273,9 @@ Codex quota 来自短生命周期 `codex -s read-only -a untrusted app-server` �
   `ccusage codex daily --compact --json` 读取 Codex token usage；runtime 保存
   `CodexTokenUsageSnapshot`，并在 active logical panel 为 `tokens` 时用
   `render_logical_panel_touchscreen` 渲染到底部 viewport。
-- `/logical-panel/input` 接收已经归一化的 panel input event，例如 `touch.tap`；当前实现用
-  touch tap 循环切换 `quota -> tokens -> pets -> message`。
+- `/logical-panel/input` 接收已经归一化的 panel input event，例如 `touch.tap`；当前真实链路用
+  touch tap 循环切换 `quota -> tokens`。`pets` 和 `message` 仍保留在内容模型中，但在对应
+  真实内容接入前不进入 N4 Pro touch bar 的默认切换顺序。
 - `/hardware/input` 接收低层 `HardwareInput`，并通过 input router 映射到 logical panel event。
   N4 Pro touch point 落在底部 logical panel viewport 内时映射为 `touch.tap`；第 4 旋钮左右旋转
   映射为 `knob_4.rotate_left/right`，用于 tokens 面板切换 today/week/month/all。
@@ -446,10 +447,11 @@ N4 Pro 需要区分三组概念：
 设备会话里同时写背景和主按键图层；产品语义上它应被看作 logical panel / touch bar viewport，
 后续可由 device capability profile 决定映射到 background viewport、secondary screen slot
 或其他显示目标。
-第一批 logical panel 内容类型是 `quota`、`tokens`、`pets`、`message`。N4 Pro 上跨面板切换
-优先使用 touch bar 自身的 tap/click，旋钮系统保留给面板内操作：旋钮 1 确认，旋钮 2 滚动，
-tokens 面板中旋钮 4 切换 today/week/month/all 统计周期。所有硬件事件都先映射成 intent，
-再由后续 input router 决定是否执行动作。
+第一批 logical panel 内容类型是 `quota`、`tokens`、`pets`、`message`。当前 N4 Pro 真实链路
+只把已有实质内容的 `quota` 和 `tokens` 放入 touch bar tap/click 切换顺序；`pets` 和 `message`
+待内容接入后再开放。旋钮系统保留给面板内操作：旋钮 1 确认，旋钮 2 滚动，tokens 面板中
+旋钮 4 切换 today/week/month/all 统计周期。所有硬件事件都先映射成 intent，再由后续 input
+router 决定是否执行动作。
 
 ### overview
 

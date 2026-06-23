@@ -97,8 +97,8 @@ def test_streamdock_input_event_shape_maps_to_panel_events() -> None:
 
     touch = SimpleNamespace(
         event_type=_ValueObject("touch_point"),
-        x=60,
-        y=410,
+        x=658,
+        y=94,
     )
     knob_right = SimpleNamespace(
         event_type=_ValueObject("knob_rotate"),
@@ -114,9 +114,7 @@ def test_streamdock_input_event_shape_maps_to_panel_events() -> None:
     assert panel_event_from_streamdock_input_event(touch) == (
         PanelInputEvent.TOUCH_TAP
     )
-    assert panel_event_from_streamdock_input_event(knob_press) == (
-        PanelInputEvent.TOUCH_TAP
-    )
+    assert panel_event_from_streamdock_input_event(knob_press) is None
     assert panel_event_from_streamdock_input_event(knob_right) == (
         PanelInputEvent.KNOB_4_ROTATE_RIGHT
     )

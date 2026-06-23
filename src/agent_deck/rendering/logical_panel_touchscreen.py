@@ -12,7 +12,7 @@ from typing import Final
 
 from PIL import Image, ImageDraw, ImageFont
 
-from agent_deck.rendering.logical_panel import LogicalPanelPlan, PanelMetric
+from agent_deck.rendering.logical_panel import LogicalPanelPlan, PanelKind, PanelMetric
 from agent_deck.rendering.n4pro_panel import (
     N4PRO_BACKGROUND_COLOR,
     N4PRO_BACKGROUND_SIZE,
@@ -27,6 +27,7 @@ _TEXT: Final[tuple[int, int, int]] = (238, 244, 255)
 _MUTED: Final[tuple[int, int, int]] = (145, 160, 182)
 _PRIMARY: Final[tuple[int, int, int]] = (76, 205, 255)
 _SECONDARY: Final[tuple[int, int, int]] = (126, 236, 165)
+_GOLD: Final[tuple[int, int, int]] = (255, 202, 83)
 _DIVIDER: Final[tuple[int, int, int]] = (34, 44, 64)
 
 
@@ -79,6 +80,16 @@ def render_logical_panel(
     )
     draw.line((left + 28, top + 10, right - 28, top + 10), fill=_DIVIDER, width=1)
 
+    if plan.kind == PanelKind.TOKENS:
+        _draw_token_panel(
+            draw,
+            plan=plan,
+            content_left=content_left,
+            content_right=content_right,
+            content_top=content_top,
+        )
+        return image
+
     title_font = _load_font(21, bold=True)
     metric_value_font = _load_font(35, bold=True)
     metric_label_font = _load_font(15, bold=True)
@@ -105,6 +116,126 @@ def render_logical_panel(
         draw.text((lines_left, y), text, fill=_TEXT, font=line_font)
 
     return image
+
+
+def _draw_token_panel(
+    draw: ImageDraw.ImageDraw,
+    *,
+    plan: LogicalPanelPlan,
+    content_left: int,
+    content_right: int,
+    content_top: int,
+) -> None:
+    """绘制 tokens 面板的专用小屏布局。
+
+    入参：`draw` 是绘图对象；`plan` 是 tokens logical panel；`content_left`、
+    `content_right` 和 `content_top` 是卡片内部内容边界。
+    返回：无返回值。
+    错误处理：Pillow 绘制失败时异常传播；缺少指标或辅助行时按可用内容降级绘制。
+    副作用：修改内存图像，不访问外部 I/O。
+    """
+
+    title_font = _load_font(20, bold=True)
+    main_value_font = _load_font(43, bold=True)
+    main_label_font = _load_font(14, bold=True)
+    detail_label_font = _load_font(13, bold=True)
+    detail_value_font = _load_font(22, bold=True)
+
+    draw.text((content_left, content_top), plan.title, fill=_MUTED, font=title_font)
+
+    metric_top = content_top + 34
+    _draw_token_main_metrics(
+        draw,
+        metrics=plan.metrics[:2],
+        origin=(content_left, metric_top),
+        value_font=main_value_font,
+        label_font=main_label_font,
+    )
+    _draw_token_detail_grid(
+        draw,
+        lines=plan.lines[:4],
+        origin=(content_left + 475, content_top + 16),
+        max_right=content_right,
+        label_font=detail_label_font,
+        value_font=detail_value_font,
+    )
+
+
+def _draw_token_main_metrics(
+    draw: ImageDraw.ImageDraw,
+    *,
+    metrics: tuple[PanelMetric, ...],
+    origin: tuple[int, int],
+    value_font: ImageFont.ImageFont,
+    label_font: ImageFont.ImageFont,
+) -> None:
+    """绘制 token 面板左侧金额和总 token 主指标。
+
+    入参：`draw` 是绘图对象；`metrics` 是最多两个主指标，约定为 Cost 与 Total；
+    `origin` 是主指标区域左上角；`value_font`/`label_font` 是字体。
+    返回：无返回值。
+    错误处理：文本过长会在各自较宽 slot 内截断，避免压到右侧 2x2 指标区。
+    副作用：修改内存图像。
+    """
+
+    x, y = origin
+    slots = ((x, 235), (x + 275, 160))
+    for metric, (slot_x, slot_width) in zip(metrics, slots, strict=False):
+        value = _fit_text(draw, metric.value, font=value_font, max_width=slot_width)
+        label = _fit_text(draw, metric.label, font=label_font, max_width=slot_width)
+        draw.text((slot_x, y), value, fill=_GOLD, font=value_font)
+        draw.text((slot_x + 3, y + 50), label, fill=_MUTED, font=label_font)
+
+
+def _draw_token_detail_grid(
+    draw: ImageDraw.ImageDraw,
+    *,
+    lines: tuple[str, ...],
+    origin: tuple[int, int],
+    max_right: int,
+    label_font: ImageFont.ImageFont,
+    value_font: ImageFont.ImageFont,
+) -> None:
+    """把 token 辅助指标绘制成右侧 2x2 网格。
+
+    入参：`draw` 是绘图对象；`lines` 是如 `Input 954K` 的格式化指标行；`origin`
+    是网格左上角；`max_right` 是右边界；`label_font`/`value_font` 是字体。
+    返回：无返回值。
+    错误处理：行文本拆分失败时把整行作为 label、value 留空；文本过长会在 cell 内截断。
+    副作用：修改内存图像。
+    """
+
+    x, y = origin
+    cell_width = max(110, (max_right - x) // 2)
+    row_gap = 50
+    for index, line in enumerate(lines[:4]):
+        col = index % 2
+        row = index // 2
+        cell_x = x + col * cell_width
+        cell_y = y + row * row_gap
+        label, value = _split_token_detail_line(line)
+        label_text = _fit_text(draw, label, font=label_font, max_width=cell_width - 12)
+        value_text = _fit_text(draw, value, font=value_font, max_width=cell_width - 12)
+        draw.text((cell_x, cell_y), label_text, fill=_MUTED, font=label_font)
+        draw.text((cell_x, cell_y + 16), value_text, fill=_PRIMARY, font=value_font)
+
+
+def _split_token_detail_line(line: str) -> tuple[str, str]:
+    """拆分 token 辅助指标的标签和值。
+
+    入参：`line` 是 `tokens_panel_plan` 生成的展示行，例如 `Cache read 13.3B`。
+    返回：`(label, value)`；无法拆出值时 value 为空字符串。
+    错误处理：空字符串返回空 label 和空 value，不抛异常。
+    副作用：无。
+    """
+
+    text = line.strip()
+    if not text:
+        return "", ""
+    label, separator, value = text.rpartition(" ")
+    if not separator:
+        return text, ""
+    return label, value
 
 
 def _draw_metrics(

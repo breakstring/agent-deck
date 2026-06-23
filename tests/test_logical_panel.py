@@ -152,11 +152,11 @@ def test_panel_plan_is_frozen_and_rejects_empty_content() -> None:
         LogicalPanelPlan(kind=PanelKind.MESSAGE, title="Notice", lines=())
 
 
-def test_touch_tap_cycles_between_logical_panels() -> None:
-    """touch bar 点击应在四个 logical panel 之间循环切换。
+def test_touch_tap_cycles_between_active_logical_panels() -> None:
+    """touch bar 点击应只在当前真实开放的 logical panel 之间循环切换。
 
     入参：无；测试内从默认 selection 开始连续应用 touch tap。
-    返回：无返回值；断言通过代表 panel 切换不再占用下方旋钮。
+    返回：无返回值；断言通过代表空占位 panel 不进入真实切换链路。
     错误处理：切换顺序或环回错误时由 pytest 报告。
     副作用：仅创建内存模型。
     """
@@ -165,10 +165,6 @@ def test_touch_tap_cycles_between_logical_panels() -> None:
 
     selection = apply_panel_input(selection, PanelInputEvent.TOUCH_TAP)
     assert selection.active_kind == PanelKind.TOKENS
-    selection = apply_panel_input(selection, PanelInputEvent.TOUCH_TAP)
-    assert selection.active_kind == PanelKind.PETS
-    selection = apply_panel_input(selection, PanelInputEvent.TOUCH_TAP)
-    assert selection.active_kind == PanelKind.MESSAGE
     selection = apply_panel_input(selection, PanelInputEvent.TOUCH_TAP)
     assert selection.active_kind == PanelKind.QUOTA
 

@@ -142,7 +142,8 @@ flowchart LR
     渲染到底部 N4 Pro touch-bar viewport，并默认交给真实硬件 renderer 下发。这个 viewport
     是 Agent Deck 的 logical panel，不是 quota 专用屏；第一批 panel kind 为 `quota`、
     `tokens`、`pets`、`message`，其中 `message` 承载审批详情、host context 或系统提示等复杂文字。
-    touch bar tap/click 用于切换 logical panel；daemon 默认启用 token usage poller，tokens 面板通过
+    当前真实 touch bar tap/click 只在已有实质内容的 `quota` 和 `tokens` 之间切换；`pets` 和
+    `message` 待内容接入后再加入默认切换顺序。daemon 默认启用 token usage poller，tokens 面板通过
     `ccusage codex daily --compact --json` 读取 Codex token usage，聚合 today/week/month/all。
     `/logical-panel/input` 提供归一化 panel 事件入口，`/hardware/input` 提供低层 `HardwareInput`
     入口并把 N4 Pro touch point / knob4 rotate 映射到 panel event；默认 persistent N4 Pro renderer

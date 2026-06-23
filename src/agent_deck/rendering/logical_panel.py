@@ -37,7 +37,17 @@ PANEL_KIND_ORDER: tuple[PanelKind, ...] = (
     PanelKind.PETS,
     PanelKind.MESSAGE,
 )
-"""touch bar 点击切换 logical panel 时使用的稳定顺序。"""
+"""Agent Deck 当前已建模的 logical panel 类型稳定顺序。"""
+
+ACTIVE_PANEL_KIND_ORDER: tuple[PanelKind, ...] = (
+    PanelKind.QUOTA,
+    PanelKind.TOKENS,
+)
+"""touch bar 点击切换真实 logical panel 时当前开放的稳定顺序。
+
+`pets` 和 `message` 已进入内容模型，但尚未接入真实展示内容。真实链路先只暴露
+`quota` 与 `tokens`，避免用户切到空占位面板。
+"""
 
 
 class PanelInputRole(StrEnum):
@@ -364,11 +374,7 @@ def apply_panel_input(
     if event == PanelInputEvent.TOUCH_TAP:
         return selection.model_copy(
             update={
-                "active_kind": _next_cyclic_value(
-                    PANEL_KIND_ORDER,
-                    selection.active_kind,
-                    step=1,
-                )
+                "active_kind": _next_active_panel_kind(selection.active_kind)
             }
         )
 
@@ -397,6 +403,20 @@ def apply_panel_input(
         )
 
     return selection
+
+
+def _next_active_panel_kind(current: PanelKind) -> PanelKind:
+    """返回真实链路当前开放的下一个 panel kind。
+
+    入参：`current` 是当前 active kind，可能来自旧状态或手动构造。
+    返回：`ACTIVE_PANEL_KIND_ORDER` 中的下一个值；若当前值尚未开放，则回到 `quota`。
+    错误处理：无。
+    副作用：无。
+    """
+
+    if current not in ACTIVE_PANEL_KIND_ORDER:
+        return ACTIVE_PANEL_KIND_ORDER[0]
+    return _next_cyclic_value(ACTIVE_PANEL_KIND_ORDER, current, step=1)
 
 
 def _default_rotary_controls() -> tuple[PanelControlHint, ...]:
