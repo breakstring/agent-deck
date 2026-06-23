@@ -9,10 +9,11 @@ from __future__ import annotations
 import subprocess
 from typing import Any
 
+import platform
 from agent_deck.actions.focus import focus_agent_target
 
 
-def test_focus_agent_target_activates_app_with_osascript_runner() -> None:
+def test_focus_agent_target_activates_app_with_osascript_runner(monkeypatch: Any) -> None:
     """`app:<name>` focus target 应通过 osascript 激活对应 App。
 
     入参：无；测试内注入 fake runner 捕获命令。
@@ -20,6 +21,8 @@ def test_focus_agent_target_activates_app_with_osascript_runner() -> None:
     错误处理：命令参数或结果映射错误时由 pytest 报告。
     副作用：只记录 fake runner 调用。
     """
+
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
 
     calls: list[list[str]] = []
 
@@ -63,7 +66,7 @@ def test_focus_agent_target_rejects_unsupported_target() -> None:
     assert result.message == "unsupported focus target: tmux:%7"
 
 
-def test_focus_agent_target_activates_app_and_reports_thread_level_limit() -> None:
+def test_focus_agent_target_activates_app_and_reports_thread_level_limit(monkeypatch: Any) -> None:
     """`codex-app:<thread_id>` target 先激活 App，再返回 thread 级别未支持的诊断。
 
     入参：无；通过 fake runner 捕获 osascript 调用。
@@ -71,6 +74,8 @@ def test_focus_agent_target_activates_app_and_reports_thread_level_limit() -> No
     错误处理：命令参数或状态错误时由 pytest 报告。
     副作用：无。
     """
+
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
 
     calls: list[list[str]] = []
 
@@ -92,8 +97,10 @@ def test_focus_agent_target_activates_app_and_reports_thread_level_limit() -> No
     assert "System Events" in calls[1][2]
 
 
-def test_focus_agent_target_reports_restore_warning() -> None:
+def test_focus_agent_target_reports_restore_warning(monkeypatch: Any) -> None:
     """窗口恢复命令失败时，返回 message 中保留 warning，不影响 App 激活成功判定。"""
+
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
 
     def fake_runner(args: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
         script = args[2]
@@ -113,3 +120,18 @@ def test_focus_agent_target_reports_restore_warning() -> None:
     assert result.focus_target == "app:Codex"
     assert result.message.startswith("activated app Codex;")
     assert "unable to restore minimized windows" in result.message
+
+
+def test_focus_agent_target_returns_unsupported_on_non_darwin(monkeypatch: Any) -> None:
+    """非 Darwin 系统返回 unsupported，而不是尝试系统命令。
+
+    入参：通过 monkeypatch 将平台模拟为 Windows。
+    返回：`focus_agent_target` 应给出清晰的 unsupported 诊断。
+    """
+
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    result = focus_agent_target("app:Codex")
+
+    assert result.ok is False
+    assert result.status == "unsupported"
+    assert "currently unsupported" in result.message

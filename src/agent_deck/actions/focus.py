@@ -8,12 +8,14 @@
 
 from __future__ import annotations
 
+import platform
 import textwrap
 import subprocess
 from collections.abc import Callable
 
 from pydantic import BaseModel, ConfigDict
 
+PLATFORM_KEY = "darwin"
 FocusRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
@@ -69,7 +71,43 @@ def focus_agent_target(
             focus_target=focus_target,
             message="unsupported focus target: empty app name",
         )
-    return _activate_app(app_name, focus_target, runner=runner)
+    return _focus_app(app_name, focus_target, runner=runner)
+
+
+def _focus_app(
+    app_name: str,
+    focus_target: str,
+    *,
+    runner: FocusRunner,
+) -> FocusActionResult:
+    """按当前操作系统执行 app focus。
+
+    入参：`app_name` 为目标 App；`focus_target` 为原始 target；`runner` 为可注入 subprocess runner。
+    返回：平台支持时返回具体执行结果；平台不支持时返回 unsupported。
+    错误处理：非支持平台不会抛异常，返回 clear unsupported 诊断，避免将不完整动作当成功。
+    副作用：仅在 macOS 执行 osascript；Windows/Linux 当前返回 unsupported stub。
+    """
+
+    platform_name = platform.system().lower()
+    if platform_name == PLATFORM_KEY:
+        return _activate_app_macos(app_name, focus_target, runner=runner)
+    return _unsupported_platform(focus_target, platform_name)
+
+
+def _unsupported_platform(focus_target: str, platform_name: str) -> FocusActionResult:
+    """返回跨平台未实现的统一诊断。
+
+    入参：`focus_target` 当前执行目标；`platform_name` 为 `platform.system()`。
+    返回：`ok=False` + `unsupported`，并提示未来支持计划。
+    副作用：无。
+    """
+
+    return FocusActionResult(
+        ok=False,
+        status="unsupported",
+        focus_target=focus_target,
+        message=f"focus execution on {platform_name} is currently unsupported; planned",
+    )
 
 
 def _focus_codex_app_thread(
@@ -95,7 +133,7 @@ def _focus_codex_app_thread(
             focus_target=original,
             message="unsupported focus target: empty Codex App thread id",
         )
-    result = _activate_app("Codex", original, runner=runner)
+    result = _focus_app("Codex", original, runner=runner)
     if not result.ok:
         return result
     warning_suffix = ""
@@ -115,13 +153,13 @@ def _focus_codex_app_thread(
     )
 
 
-def _activate_app(
+def _activate_app_macos(
     app_name: str,
     focus_target: str,
     *,
     runner: FocusRunner,
 ) -> FocusActionResult:
-    """通过 AppleScript 激活指定 App。
+    """通过 macOS AppleScript 激活指定 App。
 
     入参：`app_name` 是 macOS App 名称；`focus_target` 是用于诊断回传的原始目标；
     `runner` 是可注入 subprocess runner。
