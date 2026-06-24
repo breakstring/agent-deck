@@ -11,6 +11,7 @@ from pathlib import Path
 from PIL import Image
 
 from agent_deck.hardware.streamdock_touchscreen import (
+    render_dual_device_touchscreen_image_to_n4pro,
     render_touchscreen_image_to_n4pro,
 )
 
@@ -195,6 +196,42 @@ def test_render_touchscreen_image_to_n4pro_calls_sdk_sequence(tmp_path: Path) ->
         "open",
         "init",
         "set_frame_background",
+        "refresh",
+        "close",
+    ]
+    assert device.calls[-1] == ("close", False)
+    assert device.image_path_seen is not None
+    assert not device.image_path_seen.exists()
+
+
+def test_render_dual_device_touchscreen_image_to_n4pro_uses_touchscreen_api(
+    tmp_path: Path,
+) -> None:
+    """dual-device sink 应明确调用可见触屏层 API。
+
+    入参：`tmp_path` 提供临时图片目录。
+    返回：无返回值；断言通过表示退出/默认图清残留路径不会误写 frame layer。
+    错误处理：调用顺序、API 名称或临时文件清理不符合预期时由 pytest 报告。
+    副作用：只在临时目录短暂写入 JPEG，不访问真实硬件。
+    """
+
+    device = FakeN4ProDevice(set_result=0)
+    manager = FakeManager([device])
+    image = Image.new("RGB", (800, 480), (1, 2, 3))
+
+    result = render_dual_device_touchscreen_image_to_n4pro(
+        image,
+        manager=manager,
+        temp_dir=tmp_path,
+    )
+
+    assert result.ok is True
+    assert result.background_api == "set_touchscreen_image"
+    assert result.sdk_result == "0"
+    assert [name for name, _ in device.calls] == [
+        "open",
+        "init",
+        "set_touchscreen_image",
         "refresh",
         "close",
     ]

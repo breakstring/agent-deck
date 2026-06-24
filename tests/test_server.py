@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 from PIL import Image
 
+from agent_deck.actions.focus import FocusActionResult
 from agent_deck.adapters.codex_app_state import CodexAppActiveSession
 from agent_deck.adapters.codex_quota import CodexQuotaSnapshot
 from agent_deck.adapters.codex_tokens import (
@@ -163,6 +164,7 @@ def test_codex_app_state_poller_applies_active_sessions() -> None:
     assert status["agents"][0]["agent_key"] == "codex:thread-1"
     assert status["agents"][0]["status"] == "running_tool"
     assert status["agents"][0]["active_tool"] == "shell"
+    assert status["agents"][0]["focus_target"] == "codex-app:thread-1"
     assert status["layout"]["keys"][0]["visual"]["variant_id"] == "working"
 
 
@@ -364,6 +366,172 @@ def test_hardware_input_endpoint_routes_touch_and_knob_to_logical_panel() -> Non
     assert status["logical_panel"]["selection"]["token_period"] == "week"
 
 
+def test_hardware_key_selects_agent_and_reports_missing_focus_target() -> None:
+    """低层 agent key input 应选择 agent，并报告缺少 focus target。
+
+    入参：无；测试内创建两个 agent session，再按当前 layout 的 agent slot。
+    返回：无返回值；断言通过代表 agent key 会选择并尝试激活对应 agent。
+    错误处理：selection、intent 记录或 dry-run 状态不符合预期时由 pytest 报告。
+    副作用：只修改测试 app 的内存 runtime，不访问真实窗口系统或硬件。
+    """
+
+    app = create_app()
+    with TestClient(app) as client:
+        client.post("/events", json=_event("session-1").model_dump(mode="json"))
+        client.post("/events", json=_event("session-2").model_dump(mode="json"))
+        status_before = client.get("/status").json()
+        session_1_key = _key_index_for_agent(status_before, "codex:session-1")
+
+        select_response = client.post(
+            "/hardware/input",
+            json=_hardware_input(
+                kind="key",
+                index=session_1_key,
+                value={"state": 1},
+            ),
+        )
+        status_after = client.get("/status").json()
+
+    assert select_response.status_code == 200
+    assert select_response.json()["handled"] is True
+    assert select_response.json()["interaction_intent"]["intent"] == "select_agent"
+    assert select_response.json()["interaction_intent"]["agent_key"] == (
+        "codex:session-1"
+    )
+    assert select_response.json()["action"]["status"] == "missing_target"
+    assert status_after["deck_selection"]["selected_agent_key"] == "codex:session-1"
+    assert status_after["interaction"]["last_intent"]["intent"] == "select_agent"
+    assert status_after["interaction"]["last_action"] == {
+        "intent": "focus_agent",
+        "agent_key": "codex:session-1",
+        "decision_id": None,
+        "status": "missing_target",
+        "ok": False,
+        "target_available": False,
+        "focus_target": None,
+        "message": "focus_agent ignored; missing focus target",
+    }
+
+
+def test_agent_key_focus_uses_state_focus_target_by_default() -> None:
+    """agent key 默认应使用 state 中已有的 focus target 调用 executor。
+
+    入参：无；测试内创建带 `focus_target` payload 的 session 并按 agent key。
+    返回：无返回值；断言通过代表真实 focus executor 默认启用但可被测试注入替身。
+    错误处理：executor 未调用或 focus target 未保存时由 pytest 报告。
+    副作用：只调用 fake executor，不执行真实 focus。
+    """
+
+    calls: list[str] = []
+
+    def fake_focus_executor(focus_target: str) -> FocusActionResult:
+        """记录 focus target 并返回成功。
+
+        入参：`focus_target` 是 runtime 决定执行的目标。
+        返回：成功结果。
+        错误处理：无。
+        副作用：写入测试内存列表。
+        """
+
+        calls.append(focus_target)
+        return FocusActionResult(
+            ok=True,
+            status="succeeded",
+            focus_target=focus_target,
+            message=f"activated {focus_target}",
+        )
+
+    app = create_app(focus_action_executor=fake_focus_executor)
+    with TestClient(app) as client:
+        client.post(
+            "/events",
+            json=_event(
+                "session-1",
+                payload={"focus_target": "app:Codex"},
+            ).model_dump(mode="json"),
+        )
+        client.get("/status")
+        response = client.post(
+            "/hardware/input",
+            json=_hardware_input(
+                kind="key",
+                index=0,
+                value={"state": 1},
+            ),
+        )
+        status = client.get("/status").json()
+
+    assert calls == ["app:Codex"]
+    assert response.status_code == 200
+    assert response.json()["action"]["status"] == "succeeded"
+    assert response.json()["action"]["focus_target"] == "app:Codex"
+    assert status["agents"][0]["focus_target"] == "app:Codex"
+    assert status["interaction"]["last_action"]["message"] == (
+        "activated app:Codex"
+    )
+
+
+def test_focus_action_can_be_disabled_for_diagnostics() -> None:
+    """显式关闭 focus actions 后，agent key 只记录 dry-run。
+
+    入参：无；测试内注入 fake focus executor 并提供 app focus target。
+    返回：无返回值；断言通过代表排障时仍可关闭真实本机动作。
+    错误处理：executor 被调用或 action 诊断错误时由 pytest 报告。
+    副作用：只修改测试 app 内存 runtime。
+    """
+
+    calls: list[str] = []
+
+    def fake_focus_executor(focus_target: str) -> FocusActionResult:
+        """记录 focus target 并返回成功。
+
+        入参：`focus_target` 是 runtime 决定执行的目标。
+        返回：成功结果。
+        错误处理：无。
+        副作用：写入测试内存列表。
+        """
+
+        calls.append(focus_target)
+        return FocusActionResult(
+            ok=True,
+            status="succeeded",
+            focus_target=focus_target,
+            message=f"activated {focus_target}",
+        )
+
+    app = create_app(
+        poller_config=DaemonPollerConfig(focus_actions_enabled=False),
+        focus_action_executor=fake_focus_executor,
+    )
+    with TestClient(app) as client:
+        client.post(
+            "/events",
+            json=_event(
+                "session-1",
+                payload={"focus_target": "app:Codex"},
+            ).model_dump(mode="json"),
+        )
+        client.get("/status")
+        response = client.post(
+            "/hardware/input",
+            json=_hardware_input(
+                kind="key",
+                index=0,
+                value={"state": 1},
+            ),
+        )
+        status = client.get("/status").json()
+
+    assert calls == []
+    assert response.json()["interaction_intent"]["intent"] == "select_agent"
+    assert response.json()["action"]["status"] == "dry_run"
+    assert response.json()["action"]["target_available"] is True
+    assert response.json()["action"]["message"] == (
+        "focus_agent dry-run recorded for app:Codex"
+    )
+    assert status["interaction"]["last_action"]["status"] == "dry_run"
+
+
 def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
     tmp_path: Path,
 ) -> None:
@@ -384,6 +552,7 @@ def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
     Image.new("RGB", (112, 112), (3, 4, 5)).save(frame_path)
     renderer_calls: list[dict[str, object]] = []
     quota_touchscreen_calls: list[object] = []
+    visible_splash_calls: list[object] = []
 
     def fake_codex_app_state_reader() -> tuple[NormalizedEvent, ...]:
         """返回一个 running_tool 事件供 daemon layout 映射 working 帧。
@@ -453,6 +622,23 @@ def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
             key_count=len(kwargs["key_frame_paths"]),
         )
 
+    def fake_visible_splash_sink(
+        image: object,
+    ) -> StreamDockTouchscreenRenderResult:
+        """记录 dual-device 可见层 splash 调用。
+
+        入参：`image` 是默认 splash 背景图。
+        返回：固定成功结果。
+        错误处理：无。
+        副作用：追加调用记录，不访问硬件。
+        """
+
+        visible_splash_calls.append(image)
+        return StreamDockTouchscreenRenderResult(
+            ok=True,
+            background_api="set_touchscreen_image",
+        )
+
     app = create_app(
         poller_config=DaemonPollerConfig(
             codex_app_state_enabled=True,
@@ -468,17 +654,22 @@ def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
         codex_quota_reader=fake_quota_reader,
         quota_touchscreen_sink=fake_quota_touchscreen_sink,
         streamdock_n4pro_renderer_sink=fake_n4pro_renderer,
+        visible_splash_touchscreen_sink=fake_visible_splash_sink,
     )
     with TestClient(app) as client:
         status = client.get("/status").json()
 
     assert quota_touchscreen_calls == []
     assert renderer_calls
-    call = renderer_calls[-1]
+    call = renderer_calls[0]
     assert getattr(call["background_image"], "size") == (800, 480)
     assert call["key_frame_paths"] == {1: (frame_path.resolve(),)}
     assert call["duration_seconds"] == 0.5
     assert call["fps"] == 4
+    assert len(visible_splash_calls) == 2
+    assert getattr(visible_splash_calls[0], "size") == (800, 480)
+    assert getattr(visible_splash_calls[-1], "size") == (800, 480)
+    assert visible_splash_calls[-1].getpixel((82, 408)) != (14, 18, 28)
     assert status["streamdock_n4pro_renderer"]["last_result"] == {
         "background_result": None,
         "device_type": "FakeN4ProDevice",
@@ -496,15 +687,17 @@ def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
 def test_streamdock_n4pro_renderer_starts_with_placeholder_without_panel_data(
     tmp_path: Path,
 ) -> None:
-    """Verify N4 Pro renderer starts even before quota/token snapshots exist.
+    """Verify N4 Pro renderer starts and exits with branded splash before panel data.
 
     入参：`tmp_path` 提供 fake frame root。
-    返回：无返回值；断言通过代表真实 renderer 不依赖当前 panel 数据已加载。
+    返回：无返回值；断言通过代表真实 renderer 会用 Agent Deck 默认图接管残留显示，
+    并在 daemon 退出前再写一次默认图。
     错误处理：renderer 未被调用或背景缺失时由 pytest 报告。
     副作用：只调用 fake renderer，不访问真实 N4 Pro。
     """
 
     renderer_calls: list[dict[str, object]] = []
+    visible_splash_calls: list[object] = []
 
     def fake_n4pro_renderer(**kwargs: object) -> StreamDockN4ProAnimationResult:
         """记录 renderer 调用并返回成功结果。
@@ -518,6 +711,23 @@ def test_streamdock_n4pro_renderer_starts_with_placeholder_without_panel_data(
         renderer_calls.append(kwargs)
         return StreamDockN4ProAnimationResult(ok=True)
 
+    def fake_visible_splash_sink(
+        image: object,
+    ) -> StreamDockTouchscreenRenderResult:
+        """记录 dual-device 可见层 splash 调用。
+
+        入参：`image` 是默认 splash 背景图。
+        返回：固定成功结果。
+        错误处理：无。
+        副作用：追加调用记录。
+        """
+
+        visible_splash_calls.append(image)
+        return StreamDockTouchscreenRenderResult(
+            ok=True,
+            background_api="set_touchscreen_image",
+        )
+
     app = create_app(
         poller_config=DaemonPollerConfig(
             streamdock_n4pro_renderer_enabled=True,
@@ -525,14 +735,22 @@ def test_streamdock_n4pro_renderer_starts_with_placeholder_without_panel_data(
             streamdock_n4pro_render_interval_seconds=0.5,
         ),
         streamdock_n4pro_renderer_sink=fake_n4pro_renderer,
+        visible_splash_touchscreen_sink=fake_visible_splash_sink,
     )
     with TestClient(app) as client:
         status = client.get("/status").json()
 
     assert renderer_calls
-    call = renderer_calls[-1]
-    assert getattr(call["background_image"], "size") == (800, 480)
+    call = renderer_calls[0]
+    background_image = call["background_image"]
+    assert getattr(background_image, "size") == (800, 480)
+    assert background_image.getpixel((400, 120)) == (14, 18, 28)
+    assert background_image.getpixel((82, 408)) != (14, 18, 28)
     assert call["key_frame_paths"] == {}
+    assert len(visible_splash_calls) == 2
+    shutdown_background_image = visible_splash_calls[-1]
+    assert getattr(shutdown_background_image, "size") == (800, 480)
+    assert shutdown_background_image.getpixel((82, 408)) != (14, 18, 28)
     assert status["streamdock_n4pro_renderer"]["last_error"] is None
     assert status["streamdock_n4pro_renderer"]["last_result"]["ok"] is True
 
@@ -642,6 +860,7 @@ def test_default_n4pro_renderer_input_callback_routes_sdk_events(
     assert status["streamdock_input"]["last_event"] == {
         "count": 4,
         "event_type": "knob_rotate",
+        "key": None,
         "knob_id": "knob_4",
         "direction": "right",
         "state": None,
@@ -653,6 +872,102 @@ def test_default_n4pro_renderer_input_callback_routes_sdk_events(
         "accumulated": False,
         "knob4_rotate_accumulator": 0,
     }
+
+
+def test_default_n4pro_renderer_input_callback_routes_button_intents(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    """默认 N4 Pro renderer callback 应把 SDK agent button 路由为 selection intent。
+
+    入参：`monkeypatch` 替换 persistent animator；`tmp_path` 提供无真实访问的 frame root。
+    返回：无返回值；断言通过代表真实 key callback 可以复用当前 layout 的 agent key 语义。
+    错误处理：callback 未注入、button 编号或 dry-run 记录错误时由 pytest 报告。
+    副作用：只修改测试 app 内存 runtime，不访问真实 N4 Pro 或 macOS 窗口系统。
+    """
+
+    captured: dict[str, object] = {}
+
+    class FakePersistentAnimator:
+        """捕获 daemon 传入的 input callback。
+
+        入参：`input_callback` 是待测 callback。
+        返回：fake renderer。
+        错误处理：无。
+        副作用：保存 callback 到测试 dict。
+        """
+
+        def __init__(self, *, input_callback: object | None = None) -> None:
+            """保存 input callback。
+
+            入参：`input_callback` 是 daemon 传入的 callback。
+            返回：无。
+            错误处理：无。
+            副作用：写入测试 dict。
+            """
+
+            captured["input_callback"] = input_callback
+
+        def __call__(self, **_: object) -> StreamDockN4ProAnimationResult:
+            """模拟一次统一 renderer 成功。
+
+            入参：忽略 renderer 参数。
+            返回：固定成功结果。
+            错误处理：无。
+            副作用：无。
+            """
+
+            return StreamDockN4ProAnimationResult(ok=True)
+
+        def close(self) -> None:
+            """模拟 renderer close。
+
+            入参：无。
+            返回：无。
+            错误处理：无。
+            副作用：无。
+            """
+
+    monkeypatch.setattr(
+        server_app,
+        "StreamDockN4ProPersistentAnimator",
+        FakePersistentAnimator,
+    )
+    app = create_app(
+        poller_config=DaemonPollerConfig(
+            streamdock_n4pro_renderer_enabled=True,
+            streamdock_n4pro_frame_root=tmp_path,
+        ),
+    )
+    with TestClient(app) as client:
+        client.post("/events", json=_event("session-1").model_dump(mode="json"))
+        client.get("/status")
+        input_callback = captured["input_callback"]
+        assert callable(input_callback)
+        response = input_callback(
+            object(),
+            _sdk_event(event_type="button", key=11, state=1),
+        )
+        release_response = input_callback(
+            object(),
+            _sdk_event(event_type="button", key=11, state=0),
+        )
+        status = client.get("/status").json()
+
+    assert response["handled"] is True
+    assert response["interaction_intent"]["intent"] == "select_agent"
+    assert response["action"]["status"] == "missing_target"
+    assert release_response["handled"] is False
+    assert status["interaction"]["last_intent"]["source"] == "streamdock_button"
+    assert status["interaction"]["last_action"]["intent"] == "focus_agent"
+    assert status["streamdock_input"]["recent_events"][-2]["key"] == 11
+    assert status["streamdock_input"]["recent_events"][-2]["state"] == 1
+    assert status["streamdock_input"]["recent_events"][-2]["handled"] is True
+    assert status["streamdock_input"]["recent_events"][-1]["key"] == 11
+    assert status["streamdock_input"]["recent_events"][-1]["state"] == 0
+    assert status["streamdock_input"]["recent_events"][-1]["handled"] is False
+    assert status["interaction"]["recent"][-1]["intent"]["intent"] == "select_agent"
+    assert status["interaction"]["recent"][-1]["action"]["intent"] == "focus_agent"
 
 
 async def test_streamdock_n4pro_loop_deducts_render_time_from_interval(
@@ -746,6 +1061,94 @@ def test_decision_request_updates_pending_status_and_decision_layout() -> None:
     assert body["decisions"][0]["decision_id"] == decision["decision_id"]
     assert body["layout"]["mode"] == "decision"
     assert body["agents"][0]["pending_decision_count"] == 1
+    assert body["logical_panel"]["selection"]["active_kind"] == "message"
+    assert body["logical_panel"]["touchscreen_image_source"] == "decision_message"
+
+
+def test_hardware_approval_key_resolves_decision_and_restores_quota_panel() -> None:
+    """硬件 allow key 应 resolve 当前 decision 并把 message panel 收回。
+
+    入参：无；测试内创建 agent 和 pending decision，再按 decision mode 的 ALLOW 键。
+    返回：无返回值；断言通过代表硬件审批闭环能从 layout key intent 写入 broker result。
+    错误处理：decision 未 resolve、hook wait 结果错误或 panel 未回到 quota 时由 pytest 报告。
+    副作用：只修改测试 app 内存 broker/state，不访问真实硬件或 Codex。
+    """
+
+    client = TestClient(create_app())
+    client.post("/events", json=_event("session-1").model_dump(mode="json"))
+    decision_id = _request_decision(client)
+
+    response = client.post(
+        "/hardware/input",
+        json=_hardware_input(
+            kind="key",
+            index=10,
+            value={"state": 1},
+        ),
+    )
+    wait_response = client.get(
+        f"/decisions/{decision_id}/wait",
+        params={"timeout_seconds": 0.001},
+    )
+    status = client.get("/status").json()
+
+    assert response.status_code == 200
+    assert response.json()["handled"] is True
+    assert response.json()["interaction_intent"]["intent"] == "approve_request"
+    assert response.json()["action"] == {
+        "intent": "approve_request",
+        "agent_key": "codex:session-1",
+        "decision_id": decision_id,
+        "status": "resolved",
+        "ok": True,
+        "behavior": "allow",
+        "message": "Approved by Agent Deck hardware.",
+    }
+    assert wait_response.status_code == 200
+    assert wait_response.json() == {
+        "behavior": "allow",
+        "message": "Approved by Agent Deck hardware.",
+    }
+    assert status["decisions"] == []
+    assert status["agents"][0]["pending_decision_count"] == 0
+    assert status["logical_panel"]["selection"]["active_kind"] == "quota"
+    assert status["logical_panel"]["touchscreen_image_source"] == "agent_deck:splash"
+
+
+def test_hardware_deny_key_resolves_decision() -> None:
+    """硬件 deny key 应把当前 decision resolve 为 deny。
+
+    入参：无；测试内创建 pending decision，再按 decision mode 的 DENY 键。
+    返回：无返回值；断言通过代表 deny 路径同样通过 layout key intent 驱动 broker。
+    错误处理：intent、behavior 或 wait 结果错误时由 pytest 报告。
+    副作用：只修改测试 app 内存 broker/state。
+    """
+
+    client = TestClient(create_app())
+    client.post("/events", json=_event("session-1").model_dump(mode="json"))
+    decision_id = _request_decision(client)
+
+    response = client.post(
+        "/hardware/input",
+        json=_hardware_input(
+            kind="key",
+            index=11,
+            value={"state": 1},
+        ),
+    )
+    wait_response = client.get(
+        f"/decisions/{decision_id}/wait",
+        params={"timeout_seconds": 0.001},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["interaction_intent"]["intent"] == "deny_request"
+    assert response.json()["action"]["behavior"] == "deny"
+    assert response.json()["action"]["message"] == "Denied by Agent Deck hardware."
+    assert wait_response.json() == {
+        "behavior": "deny",
+        "message": "Denied by Agent Deck hardware.",
+    }
 
 
 def test_decision_resolve_deny_clears_pending_state() -> None:
@@ -1065,9 +1468,32 @@ def _hardware_input(
     }
 
 
+def _key_index_for_agent(status: dict[str, object], agent_key: str) -> int:
+    """从 status layout 中查找指定 agent 当前所在键位。
+
+    入参：`status` 是 `/status` JSON；`agent_key` 是目标 agent key。
+    返回：匹配 key plan 的 index。
+    错误处理：找不到时让测试失败。
+    副作用：无。
+    """
+
+    layout = status["layout"]
+    assert isinstance(layout, dict)
+    keys = layout["keys"]
+    assert isinstance(keys, list)
+    for key in keys:
+        assert isinstance(key, dict)
+        if key.get("agent_key") == agent_key:
+            key_index = key.get("index")
+            assert isinstance(key_index, int)
+            return key_index
+    raise AssertionError(f"missing key for {agent_key}")
+
+
 def _sdk_event(
     *,
     event_type: str,
+    key: int | None = None,
     knob_id: str | None = None,
     direction: str | None = None,
     state: int | None = None,
@@ -1076,7 +1502,7 @@ def _sdk_event(
 ) -> object:
     """构造 SDK-like InputEvent 测试替身。
 
-    入参：`event_type` 是 SDK event type；`knob_id`、`direction`、`state`、`x`、`y`
+    入参：`event_type` 是 SDK event type；`key`、`knob_id`、`direction`、`state`、`x`、`y`
     是可选属性。
     返回：带 `.value` enum-like 属性的对象。
     错误处理：无。
@@ -1114,6 +1540,7 @@ def _sdk_event(
 
     event = Event()
     event.event_type = ValueObject(event_type)
+    event.key = ValueObject(key) if key is not None else None
     event.knob_id = ValueObject(knob_id) if knob_id is not None else None
     event.direction = ValueObject(direction) if direction is not None else None
     event.state = state

@@ -9,6 +9,7 @@ already-normalized events and persisting snapshots if they need durability.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
@@ -53,7 +54,8 @@ class AgentState(BaseModel):
     """Immutable projection of the latest known state for one agent.
 
     入参：字段覆盖 agent identity、展示上下文、当前状态、时间戳、最新摘要、活跃工具、
-    active turn、待处理决策数、布局槽位、焦点目标和静音标记；时间字段必须带 timezone。
+    active turn、待处理决策数、布局槽位、焦点目标、父 agent、child 标记和静音标记；
+    时间字段必须带 timezone。
     返回：frozen Pydantic model，可通过 `model_copy(update=...)` 派生新版本。
     错误处理：非法枚举、负 pending count 或 naive datetime 由 Pydantic 报告。
     副作用：仅保存内存数据；实例化不访问网络、硬件或文件系统。
@@ -74,6 +76,8 @@ class AgentState(BaseModel):
     pending_decision_count: int = Field(default=0, ge=0)
     slot_id: str | None = None
     focus_target: str | None = None
+    parent_agent_key: str | None = None
+    is_child_agent: bool = False
     muted: bool = False
 
     @field_validator("status_since", "last_event_at")
@@ -267,12 +271,17 @@ class AgentStateStore:
         cwd: str | None = None,
         summary: str | None = None,
         active_tool: str | None = None,
+        focus_target: str | None = None,
+        parent_session_id: str | None = None,
+        is_child_agent: bool = False,
     ) -> AgentState:
         """幂等写入外部扫描器观测到的当前 Agent 状态。
 
         入参：`source` 和 `session_id` 组成稳定 agent key；`observed_at` 是观测时间，
         必须 timezone-aware；`status` 是扫描器确认的当前状态；`title`/`cwd`/`summary`
-        是展示上下文；`active_tool` 仅在 `status=RUNNING_TOOL` 时用于展示活跃工具名。
+        是展示上下文；`active_tool` 仅在 `status=RUNNING_TOOL` 时用于展示活跃工具名；
+        `focus_target` 是可选激活目标，缺省时保留旧值；`parent_session_id` 和
+        `is_child_agent` 描述外部扫描器识别出的父子关系。
         被动扫描器的 `IDLE` 观测是弱信号：若当前会话刚进入 `THINKING` 或 `RUNNING_TOOL`
         不久，则保留 live working 状态，避免本地 rollout 扫描打断正在播放的 working 动画。
         返回：更新后的 `AgentState`。
@@ -283,6 +292,17 @@ class AgentStateStore:
         _ensure_timezone_aware_datetime(observed_at)
         agent_key = f"{source.value}:{session_id}"
         current = self._states.get(agent_key)
+        parent_agent_key = _parent_agent_key_from_session(
+            source=source,
+            session_id=session_id,
+            parent_session_id=parent_session_id,
+            fallback=current.parent_agent_key if current is not None else None,
+        )
+        next_is_child_agent = (
+            is_child_agent
+            or parent_agent_key is not None
+            or (current.is_child_agent if current is not None else False)
+        )
         pending_count = current.pending_decision_count if current is not None else 0
         observed_status = (
             AgentStatus.APPROVAL_NEEDED
@@ -312,6 +332,11 @@ class AgentStateStore:
                 last_summary=summary,
                 active_tool=next_active_tool,
                 pending_decision_count=pending_count,
+                focus_target=focus_target.strip()
+                if isinstance(focus_target, str) and focus_target.strip()
+                else None,
+                parent_agent_key=parent_agent_key,
+                is_child_agent=next_is_child_agent,
             )
         else:
             status_since = (
@@ -329,6 +354,13 @@ class AgentStateStore:
                     else current.last_summary,
                     "active_tool": next_active_tool,
                     "pending_decision_count": pending_count,
+                    "focus_target": (
+                        focus_target.strip()
+                        if isinstance(focus_target, str) and focus_target.strip()
+                        else current.focus_target
+                    ),
+                    "parent_agent_key": parent_agent_key,
+                    "is_child_agent": next_is_child_agent,
                 }
             )
         self._states[agent_key] = updated
@@ -384,6 +416,9 @@ class AgentStateStore:
             status_since=event.occurred_at,
             last_event_at=event.occurred_at,
             last_summary=event.summary,
+            focus_target=_focus_target(event),
+            parent_agent_key=_parent_agent_key(event),
+            is_child_agent=_is_child_agent_event(event),
         )
 
     def _copy_state(
@@ -423,6 +458,15 @@ class AgentStateStore:
                 "active_tool": active_tool,
                 "active_turn_id": active_turn_id,
                 "pending_decision_count": pending_decision_count,
+                "focus_target": _focus_target(event, fallback=state.focus_target),
+                "parent_agent_key": _parent_agent_key(
+                    event,
+                    fallback=state.parent_agent_key,
+                ),
+                "is_child_agent": _is_child_agent_event(
+                    event,
+                    fallback=state.is_child_agent,
+                ),
             }
         )
 
@@ -460,6 +504,142 @@ def _display_name(event: NormalizedEvent) -> str:
     """
 
     return event.title or event.agent_id or event.session_id
+
+
+def _focus_target(event: NormalizedEvent, fallback: str | None = None) -> str | None:
+    """从事件 payload 中读取可选 focus target。
+
+    入参：`event` 是 normalized event；`fallback` 是 payload 未携带目标时保留的旧值。
+    返回：非空 focus target 字符串，或 fallback。
+    错误处理：非字符串或空字符串字段被忽略。
+    副作用：无。
+    """
+
+    payload = event.payload
+    if not isinstance(payload, Mapping):
+        return fallback
+    for key in ("focus_target", "focusTarget"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return fallback
+
+
+def _parent_agent_key(
+    event: NormalizedEvent,
+    fallback: str | None = None,
+) -> str | None:
+    """从事件 payload 中读取父 session 并转换为父 agent key。
+
+    入参：`event` 是 normalized event；`fallback` 是 payload 未携带父级时保留的旧值。
+    返回：形如 `source:parent_session_id` 的父 agent key，或 fallback。
+    错误处理：非字符串、空字符串或等于当前 session id 的父级会被忽略。
+    副作用：无；只读取内存事件。
+    """
+
+    payload = event.payload
+    if not isinstance(payload, Mapping):
+        return fallback
+    parent_session_id = _string_payload_value(
+        payload,
+        "parent_thread_id",
+        "parentThreadId",
+        "parent_session_id",
+        "parentSessionId",
+    )
+    return _parent_agent_key_from_session(
+        source=event.source,
+        session_id=event.session_id,
+        parent_session_id=parent_session_id,
+        fallback=fallback,
+    )
+
+
+def _parent_agent_key_from_session(
+    *,
+    source: AgentSource,
+    session_id: str,
+    parent_session_id: str | None,
+    fallback: str | None = None,
+) -> str | None:
+    """把父 session id 转成同 source 下的父 agent key。
+
+    入参：`source` 是 agent 来源；`session_id` 是当前 session；`parent_session_id` 可空；
+    `fallback` 是无有效父级时保留值。
+    返回：有效父级对应的 agent key，或 fallback。
+    错误处理：空白父级或自身父级被忽略，避免把主 agent 错标为 child。
+    副作用：无；只处理字符串。
+    """
+
+    if not isinstance(parent_session_id, str) or not parent_session_id.strip():
+        return fallback
+    normalized_parent = parent_session_id.strip()
+    if normalized_parent == session_id:
+        return fallback
+    return f"{source.value}:{normalized_parent}"
+
+
+def _is_child_agent_event(
+    event: NormalizedEvent,
+    fallback: bool = False,
+) -> bool:
+    """判断事件是否携带 child/subagent 语义。
+
+    入参：`event` 是 normalized event；`fallback` 是事件没有相关 metadata 时的旧标记。
+    返回：存在显式 child 标记、父 agent、`thread_source=subagent` 或 `source.subagent` 时为
+    True，否则 fallback。
+    错误处理：payload 结构未知时降级为 fallback。
+    副作用：无；只读取内存事件。
+    """
+
+    payload = event.payload
+    if not isinstance(payload, Mapping):
+        return fallback
+    if _bool_payload_value(
+        payload,
+        "is_child_thread",
+        "isChildThread",
+        "is_child_agent",
+        "isChildAgent",
+    ):
+        return True
+    if _parent_agent_key(event) is not None:
+        return True
+    thread_source = _string_payload_value(payload, "thread_source", "threadSource")
+    if thread_source == "subagent":
+        return True
+    source = payload.get("source")
+    if isinstance(source, Mapping) and "subagent" in source:
+        return True
+    return fallback
+
+
+def _string_payload_value(payload: Mapping[str, object], *keys: str) -> str | None:
+    """从 payload 中读取第一个非空字符串值。
+
+    入参：`payload` 是事件 payload；`keys` 是候选字段名。
+    返回：去空白后的字符串；没有有效字符串时返回 None。
+    错误处理：非字符串值被忽略。
+    副作用：无；只读取 mapping。
+    """
+
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _bool_payload_value(payload: Mapping[str, object], *keys: str) -> bool:
+    """从 payload 中读取任一布尔 True 标记。
+
+    入参：`payload` 是事件 payload；`keys` 是候选字段名。
+    返回：任一字段值严格为 True 时返回 True，否则 False。
+    错误处理：非 bool 值被忽略，避免字符串误触发。
+    副作用：无；只读取 mapping。
+    """
+
+    return any(payload.get(key) is True for key in keys)
 
 
 def _should_ignore_stale_turn_event(

@@ -136,21 +136,26 @@ def _visible_main_button_states(
     """Filter agent snapshots down to sessions worth showing on main buttons.
 
     入参：`states` 是 state store 的完整快照，可能包含 TTL 投影出的 offline 会话。
-    返回：不包含 `AgentStatus.OFFLINE` 的新列表；调用方仍可在其他诊断视图使用原始 states。
+    返回：不包含 `AgentStatus.OFFLINE` 和 child agent 的新列表；调用方仍可在其他诊断视图
+    使用原始 states。
     错误处理：非法状态通常已由 `AgentState` 校验；未知对象按 Python 属性访问错误传播。
     副作用：无；只读取内存状态，不修改输入集合。
     """
 
-    return [state for state in states if state.status != AgentStatus.OFFLINE]
+    return [
+        state
+        for state in states
+        if state.status != AgentStatus.OFFLINE and not state.is_child_agent
+    ]
 
 
 def _sort_states_for_slots(
     states: list[AgentState] | tuple[AgentState, ...],
     selected_agent_key: str | None,
 ) -> list[AgentState]:
-    """Sort agents for key slots using selection, active status, then recency.
+    """Sort agents for key slots using active status, recency, then key.
 
-    入参：`states` 是 agent 快照集合；`selected_agent_key` 是需要置顶的 agent key，可空。
+    入参：`states` 是 agent 快照集合；`selected_agent_key` 当前只影响触屏选中，不改变槽位顺序。
     返回：新的 `AgentState` 列表；最多使用者由调用方截断。
     错误处理：状态值非法通常已被 `AgentState` 校验；未知状态按最低优先级处理。
     副作用：无；不修改输入集合或状态对象。
@@ -159,7 +164,6 @@ def _sort_states_for_slots(
     return sorted(
         states,
         key=lambda state: (
-            0 if state.agent_key == selected_agent_key else 1,
             _STATUS_SORT_PRIORITY.get(state.status, len(_STATUS_SORT_PRIORITY)),
             -state.last_event_at.timestamp(),
             state.agent_key,
@@ -281,11 +285,10 @@ def _apply_overview_actions(
     agent_key = selected_agent.agent_key if selected_agent is not None else None
     status = selected_agent.status if selected_agent is not None else None
     for index, label, intent in (
-        (10, "FOCUS", "focus_agent"),
-        (11, "MUTE", "mute_agent"),
-        (12, "PROMPT", "open_quick_prompt"),
-        (13, "DETAIL", "open_details"),
-        (14, "MODE", "cycle_mode"),
+        (10, "MUTE", "mute_agent"),
+        (11, "PROMPT", "open_quick_prompt"),
+        (12, "DETAIL", "open_details"),
+        (13, "MODE", "cycle_mode"),
     ):
         keys[index] = KeyPlan(
             index=index,

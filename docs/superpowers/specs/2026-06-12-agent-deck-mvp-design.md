@@ -274,11 +274,21 @@ Codex quota 来自短生命周期 `codex -s read-only -a untrusted app-server` �
   `CodexTokenUsageSnapshot`，并在 active logical panel 为 `tokens` 时用
   `render_logical_panel_touchscreen` 渲染到底部 viewport。
 - `/logical-panel/input` 接收已经归一化的 panel input event，例如 `touch.tap`；当前真实链路用
-  touch tap 循环切换 `quota -> tokens`。`pets` 和 `message` 仍保留在内容模型中，但在对应
-  真实内容接入前不进入 N4 Pro touch bar 的默认切换顺序。
+  touch tap 循环切换 `quota -> tokens`。有 pending decision 时 daemon 会临时把 active panel
+  切到 `message`，显示审批工具、Agent 和原因；审批完成且没有其他 pending decision 后回到
+  `quota`。`pets` 仍保留在内容模型中，但在对应真实内容接入前不进入默认切换顺序。
 - `/hardware/input` 接收低层 `HardwareInput`，并通过 input router 映射到 logical panel event。
   N4 Pro touch point 落在底部 logical panel viewport 内时映射为 `touch.tap`；第 4 旋钮左右旋转
-  映射为 `knob_4.rotate_left/right`，用于 tokens 面板切换 today/week/month/all。
+  映射为 `knob_4.rotate_left/right`，用于 tokens 面板切换 today/week/month/all；真实链路中
+  旋钮 4 累计两个同向 rotate 事件才切换一次周期。
+- 低层 key/button 输入结合当前 `LayoutPlan.keys` 映射为 `InteractionIntent`。当前真实链路
+  支持 agent slot 选择并立即尝试 focus 该 agent；缺少 `focus_target` 时只记录 `missing_target`
+  诊断，`app:<AppName>` 目标默认会调用 AppleScript 激活 App。decision mode 支持 allow/deny
+  硬件审批。
+- `/status` 暴露 `streamdock_input.recent_events` 和 `interaction.recent`，保留最近一小段
+  真实硬件输入、mapped intent 和 action 诊断，便于现场确认按键编号、press/release 和业务映射。
+- 实测 N4 Pro 的 10 个主物理按键在 SDK button event 中上报为 `key=11..20`，需要映射到
+  Agent Deck layout index `0..9`；`key=11` 是第一个主物理键，不是 action row。
 - 默认 N4 Pro persistent renderer 在首次 open/init 后，在同一 SDK 设备会话内注册 key/knob
   callback 和 touch bar callback；SDK `InputEvent` 会先进入 input router，再驱动 runtime
   logical panel selection。不要另起独立 N4 Pro listener 进程去 open 同一台设备，否则会和
@@ -448,8 +458,9 @@ N4 Pro 需要区分三组概念：
 后续可由 device capability profile 决定映射到 background viewport、secondary screen slot
 或其他显示目标。
 第一批 logical panel 内容类型是 `quota`、`tokens`、`pets`、`message`。当前 N4 Pro 真实链路
-只把已有实质内容的 `quota` 和 `tokens` 放入 touch bar tap/click 切换顺序；`pets` 和 `message`
-待内容接入后再开放。旋钮系统保留给面板内操作：旋钮 1 确认，旋钮 2 滚动，tokens 面板中
+只把已有常驻内容的 `quota` 和 `tokens` 放入 touch bar tap/click 切换顺序；有 pending
+decision 时临时展示 `message` 审批详情，结束后回到 `quota`；`pets` 待内容接入后再开放。
+旋钮系统保留给面板内操作：旋钮 1 确认，旋钮 2 滚动，tokens 面板中
 旋钮 4 切换 today/week/month/all 统计周期。所有硬件事件都先映射成 intent，再由后续 input
 router 决定是否执行动作。
 
@@ -637,6 +648,11 @@ Codex deny 返回：
 1. 如果配置了 tmux target，执行 `tmux select-window` 或 `tmux select-pane`。
 2. 如果配置了 terminal app，执行 AppleScript 激活 Terminal/iTerm/Warp。
 3. 如果配置了 Codex App bundle id，激活 Codex App。
+
+当前实现中，agent slot 按键会先选中 agent，再立即尝试 `focus_agent`。事件 payload 中的
+`focus_target` 会进入 state；目标是 `app:<AppName>` 时，action executor 默认通过 AppleScript
+激活对应 App。缺少目标时记录 `missing_target`，不执行外部动作；`[actions.focus].enabled = false`
+仅作为排障关闭开关。tmux target、terminal client attach、结构化 host context 和递归熔断仍需后续实现。
 
 所有命令执行时注入防递归环境变量，例如：
 

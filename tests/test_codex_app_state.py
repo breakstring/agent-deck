@@ -184,6 +184,43 @@ def _write_tool_rollout(path: Path, *, completed: bool = False) -> None:
     )
 
 
+def _write_subagent_rollout(path: Path, *, parent_thread_id: str) -> None:
+    """写入带 Codex 子代理 metadata 的 rollout JSONL。
+
+    入参：`path` 是输出 JSONL 路径；`parent_thread_id` 是父 Codex thread id。
+    返回：无返回值。
+    错误处理：文件写入或 JSON 序列化失败由标准异常报告。
+    副作用：在 pytest 临时目录写入一个 JSONL 文件。
+    """
+
+    rows = [
+        {
+            "timestamp": "2026-06-18T09:00:00.000Z",
+            "payload": {
+                "id": "child-thread",
+                "session_id": parent_thread_id,
+                "parent_thread_id": parent_thread_id,
+                "thread_source": "subagent",
+                "source": {"subagent": {"other": "worker"}},
+                "cwd": "/repo",
+            },
+        },
+        {
+            "timestamp": "2026-06-18T09:00:01.000Z",
+            "payload": {
+                "type": "function_call",
+                "call_id": "tool-call",
+                "name": "shell",
+                "arguments": "{}",
+            },
+        },
+    ]
+    path.write_text(
+        "".join(f"{json.dumps(row, ensure_ascii=False)}\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
 def _create_state_db_with_threads(
     path: Path,
     rows: list[tuple[str, Path, int, str, str]],
@@ -360,3 +397,56 @@ def test_select_active_codex_app_sessions_filters_and_infers_status(
     assert [session.thread_id for session in sessions] == ["active-thread"]
     assert sessions[0].status == AgentStatus.RUNNING_TOOL
     assert sessions[0].reason == "pending tool call: shell"
+
+
+def test_select_active_codex_app_sessions_excludes_subagent_threads(
+    tmp_path: Path,
+) -> None:
+    """验证 Codex App 活动会话不会把子代理 thread 放进主 agent 列表。
+
+    入参：`tmp_path` 提供 fake Codex home、state DB、主 thread 和子代理 rollout。
+    返回：无返回值；断言通过代表 `thread_source=subagent` 被保留在扫描报告但不进入 active sessions。
+    错误处理：子代理仍被选中或 metadata 未解析时由 pytest 断言报告。
+    副作用：只读扫描 pytest 临时目录中的 fake 文件。
+    """
+
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    parent_rollout = tmp_path / "parent.jsonl"
+    child_rollout = tmp_path / "child.jsonl"
+    _write_tool_rollout(parent_rollout)
+    _write_subagent_rollout(child_rollout, parent_thread_id="parent-thread")
+    now_epoch = 1781773200
+    _create_state_db_with_threads(
+        codex_home / "state_5.sqlite",
+        [
+            (
+                "child-thread",
+                child_rollout,
+                now_epoch - 10,
+                "/repo",
+                "The following is the Codex agent history...",
+            ),
+            (
+                "parent-thread",
+                parent_rollout,
+                now_epoch - 20,
+                "/repo",
+                "主 agent",
+            ),
+        ],
+    )
+
+    report = scan_codex_app_state(codex_home=codex_home, limit=10)
+    sessions = select_active_codex_app_sessions(
+        report,
+        now=datetime.fromtimestamp(now_epoch, tz=UTC),
+        active_window_seconds=3600,
+        max_sessions=10,
+    )
+
+    child = next(thread for thread in report.threads if thread.thread_id == "child-thread")
+    assert child.thread_source == "subagent"
+    assert child.parent_thread_id == "parent-thread"
+    assert child.is_child_thread is True
+    assert [session.thread_id for session in sessions] == ["parent-thread"]

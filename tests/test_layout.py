@@ -29,11 +29,13 @@ def _state(
     source: AgentSource = AgentSource.CODEX,
     active_tool: str | None = None,
     last_summary: str | None = None,
+    parent_agent_key: str | None = None,
+    is_child_agent: bool = False,
 ) -> AgentState:
     """Build an agent state for layout tests.
 
     入参：`agent_key`、`display_name` 和 `status` 描述待布局 agent；`last_event_offset`
-    以秒为单位偏移基础时间，其他关键字参数覆盖来源、活跃工具和摘要。
+    以秒为单位偏移基础时间，其他关键字参数覆盖来源、活跃工具、摘要和父子关系。
     返回：用于 `build_layout_plan` 的 frozen `AgentState`。
     错误处理：非法枚举、负 pending 数或 naive 时间由 `AgentState` 校验报告。
     副作用：仅创建内存模型，不访问网络、硬件或文件系统。
@@ -48,6 +50,8 @@ def _state(
         last_event_at=BASE_TIME + timedelta(seconds=last_event_offset),
         last_summary=last_summary,
         active_tool=active_tool,
+        parent_agent_key=parent_agent_key,
+        is_child_agent=is_child_agent,
     )
 
 
@@ -81,11 +85,11 @@ def _decision(
     )
 
 
-def test_overview_layout_prioritizes_selected_running_agent_and_touchscreen() -> None:
-    """Verify overview slots and touchscreen follow the selected agent.
+def test_overview_layout_keeps_status_slot_order_and_selected_touchscreen() -> None:
+    """Verify overview slots follow status while touchscreen follows selection.
 
     入参：无；测试内构造 selected running agent 与一个更新的 idle agent。
-    返回：无返回值；断言通过代表 selected agent 被排到首槽并驱动 overview 触屏。
+    返回：无返回值；断言通过代表运行中 agent 排到首槽，overview 触屏显示 selected agent。
     错误处理：slot 排序、mode、触屏或 key count 不符合契约时由 pytest 报告。
     副作用：仅创建内存模型和布局计划。
     """
@@ -119,8 +123,10 @@ def test_overview_layout_prioritizes_selected_running_agent_and_touchscreen() ->
     assert plan.keys[0].visual is not None
     assert plan.keys[0].visual.visual_state == VisualAgentState.WORKING
     assert plan.keys[10].visual is None
-    assert plan.keys[10].label == "FOCUS"
+    assert plan.keys[10].label == "MUTE"
     assert plan.keys[10].agent_key == selected.agent_key
+    assert plan.keys[10].intent == "mute_agent"
+    assert all(key.intent != "focus_agent" for key in plan.keys)
     assert plan.touchscreen.title == selected.display_name
     assert plan.touchscreen.selected_agent_key == selected.agent_key
     assert any("pytest" in line for line in plan.touchscreen.lines)
@@ -182,6 +188,46 @@ def test_overview_hides_offline_agents_from_main_button_slots() -> None:
     assert plan.keys[0].agent_key == idle.agent_key
     assert all(key.agent_key != offline.agent_key for key in plan.keys)
     assert plan.touchscreen.selected_agent_key == idle.agent_key
+
+
+def test_overview_hides_child_agents_from_main_button_slots() -> None:
+    """Verify child agents do not occupy overview agent key slots.
+
+    入参：无；测试内构造一个主 agent 和一个更新的 child agent。
+    返回：无返回值；断言通过代表主按钮区只显示顶层 agent，child agent 不抢占槽位。
+    错误处理：若 child agent 出现在 key slot 或影响触屏 fallback，由 pytest 报告。
+    副作用：仅创建内存模型和布局计划。
+    """
+
+    parent = _state(
+        "codex:parent",
+        "Parent Codex",
+        AgentStatus.IDLE,
+        last_event_offset=10,
+    )
+    child = _state(
+        "codex:child",
+        "Child Codex",
+        AgentStatus.RUNNING_TOOL,
+        active_tool="shell",
+        parent_agent_key=parent.agent_key,
+        is_child_agent=True,
+        last_event_offset=60,
+    )
+
+    plan = build_layout_plan(
+        [child, parent],
+        [],
+        DeckSelection(
+            mode=DeckMode.OVERVIEW,
+            selected_agent_key=child.agent_key,
+        ),
+    )
+
+    assert [key.agent_key for key in plan.keys[:10] if key.agent_key is not None] == [
+        parent.agent_key
+    ]
+    assert plan.touchscreen.selected_agent_key == parent.agent_key
 
 
 def test_overview_treats_offline_only_as_no_visible_agents() -> None:
@@ -453,11 +499,11 @@ def test_led_priority_across_agent_statuses() -> None:
     )
 
 
-def test_slot_sorting_prefers_selected_then_active_status_then_recency() -> None:
-    """Verify agent slot ordering follows selected, status priority, and recency.
+def test_slot_sorting_prefers_active_status_then_recency_without_selected_reorder() -> None:
+    """Verify agent slot ordering stays stable when selection changes.
 
     入参：无；测试内构造 selected idle、running、thinking、新旧 idle 多个 agent。
-    返回：无返回值；断言通过代表 selected 优先，非 selected 再按状态和时间排序。
+    返回：无返回值；断言通过代表物理槽位不因 selected agent 置顶而漂移。
     错误处理：slot 排序偏离契约时由 pytest 报告。
     副作用：仅创建内存模型和布局计划。
     """
@@ -503,12 +549,13 @@ def test_slot_sorting_prefers_selected_then_active_status_then_recency() -> None
     )
 
     assert [key.agent_key for key in plan.keys[:5]] == [
-        selected_idle.agent_key,
         running_old.agent_key,
         thinking_new.agent_key,
         idle_new.agent_key,
         idle_old.agent_key,
+        selected_idle.agent_key,
     ]
+    assert plan.touchscreen.selected_agent_key == selected_idle.agent_key
 
 
 def test_slot_sorting_places_error_before_running_and_thinking() -> None:

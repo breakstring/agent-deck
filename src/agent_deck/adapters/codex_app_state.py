@@ -73,7 +73,9 @@ class CodexAppThreadSnapshot(BaseModel):
     """描述 Codex App 一个 thread 的只读扫描快照。
 
     入参：字段来自 `threads` 表和对应 rollout JSONL；`status` 是 Agent Deck 用于展示的
-    粗粒度状态，当前只在发现待用户输入时标记为 `waiting_user`。
+    粗粒度状态，当前只在发现待用户输入时标记为 `waiting_user`；`parent_thread_id`、
+    `thread_source` 和 `is_child_thread` 来自 rollout metadata，用于区分主 thread 和子代理
+    thread。
     返回：不可变 Pydantic model，可直接序列化给 CLI。
     错误处理：字段类型非法时由 Pydantic 报告。
     副作用：无；模型自身不访问文件或数据库。
@@ -88,6 +90,9 @@ class CodexAppThreadSnapshot(BaseModel):
     updated_at: int | None = None
     status: str
     pending_user_input: CodexUserInputRequest | None = None
+    parent_thread_id: str | None = None
+    thread_source: str | None = None
+    is_child_thread: bool = False
 
 
 class CodexAppStateReport(BaseModel):
@@ -111,7 +116,8 @@ class CodexAppActiveSession(BaseModel):
     """描述一个适合显示到硬件按钮上的 Codex App 活动会话。
 
     入参：字段来自 scan report 和 rollout 推断；`status` 是 Agent Deck 内部状态枚举，
-    `reason` 用于解释为什么判定为该状态。
+    `reason` 用于解释为什么判定为该状态；父子 thread metadata 会透传给 daemon，
+    但默认 active session 选择器已经排除 child thread。
     返回：不可变 Pydantic model，可由 CLI/daemon 渲染按钮或输出诊断 JSON。
     错误处理：字段类型或状态枚举非法时由 Pydantic 报告。
     副作用：模型自身不读取文件、不访问 Codex、不操作硬件。
@@ -126,6 +132,26 @@ class CodexAppActiveSession(BaseModel):
     updated_at: int
     status: AgentStatus
     reason: str
+    parent_thread_id: str | None = None
+    thread_source: str | None = None
+    is_child_thread: bool = False
+
+
+class CodexThreadMetadata(BaseModel):
+    """描述 rollout metadata 中的 Codex thread 层级信息。
+
+    入参：`parent_thread_id` 是 Codex 写入的父 thread id；`thread_source` 是 Codex thread
+    来源，例如 `subagent`；`is_child_thread` 是 Agent Deck 归纳出的 child 标记。
+    返回：不可变模型，供扫描快照和 active session 筛选复用。
+    错误处理：字段类型非法时由 Pydantic 报告。
+    副作用：无；模型只保存已解析的内存数据。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    parent_thread_id: str | None = None
+    thread_source: str | None = None
+    is_child_thread: bool = False
 
 
 def scan_codex_app_state(
@@ -172,7 +198,7 @@ def select_active_codex_app_sessions(
     `active_window_seconds` 是 thread `updated_at` 距当前时间的最大秒数，默认 1 小时；
     `max_sessions` 是最多返回数量，N4 Pro 默认 10 个主按键槽；`exclude_patterns` 是
     在 title/cwd/rollout_path 中命中即排除的大小写不敏感子串。
-    返回：按 `updated_at` 倒序排列的 `CodexAppActiveSession` 元组。
+    返回：按 `updated_at` 倒序排列的顶层 `CodexAppActiveSession` 元组。
     错误处理：窗口或数量非正数时抛 `ValueError`；缺失 `updated_at` 的 thread 被跳过。
     副作用：可能只读解析每个候选 thread 的 rollout JSONL 以推断状态；不写文件、不访问网络。
     """
@@ -194,6 +220,8 @@ def select_active_codex_app_sessions(
     for thread in report.threads:
         if thread.updated_at is None or thread.updated_at < cutoff_epoch:
             continue
+        if thread.is_child_thread:
+            continue
         if _thread_matches_exclude_patterns(thread, normalized_patterns):
             continue
         status, reason = _infer_thread_agent_status(thread)
@@ -206,6 +234,9 @@ def select_active_codex_app_sessions(
                 updated_at=thread.updated_at,
                 status=status,
                 reason=reason,
+                parent_thread_id=thread.parent_thread_id,
+                thread_source=thread.thread_source,
+                is_child_thread=thread.is_child_thread,
             )
         )
 
@@ -360,7 +391,12 @@ def _thread_snapshot_from_row(row: Mapping[str, Any]) -> CodexAppThreadSnapshot:
 
     thread_id = _required_string(row, "id")
     rollout_path = _required_string(row, "rollout_path")
-    pending_user_input = _latest_pending_user_input(Path(rollout_path))
+    resolved_rollout_path = Path(rollout_path)
+    pending_user_input = _latest_pending_user_input(resolved_rollout_path)
+    metadata = _thread_metadata_from_rollout(
+        resolved_rollout_path,
+        thread_id=thread_id,
+    )
     return CodexAppThreadSnapshot(
         thread_id=thread_id,
         title=_optional_string(row.get("title")),
@@ -369,7 +405,91 @@ def _thread_snapshot_from_row(row: Mapping[str, Any]) -> CodexAppThreadSnapshot:
         updated_at=_optional_int(row.get("updated_at")),
         status="waiting_user" if pending_user_input is not None else "observed",
         pending_user_input=pending_user_input,
+        parent_thread_id=metadata.parent_thread_id,
+        thread_source=metadata.thread_source,
+        is_child_thread=metadata.is_child_thread,
     )
+
+
+def _thread_metadata_from_rollout(
+    rollout_path: Path,
+    *,
+    thread_id: str,
+) -> CodexThreadMetadata:
+    """从 rollout JSONL 的 metadata 行读取 thread 层级信息。
+
+    入参：`rollout_path` 是 thread 对应 JSONL 文件；`thread_id` 是 SQLite 中的当前 thread id。
+    返回：`CodexThreadMetadata`；文件缺失或 metadata 缺失时返回空 metadata。
+    错误处理：单行 JSON 或 payload 结构异常会跳过；文件编码错误由运行时传播。
+    副作用：只读打开 rollout 文件。
+    """
+
+    if not rollout_path.exists():
+        return CodexThreadMetadata()
+
+    with rollout_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            row = _loads_json_object(line)
+            if row is None:
+                continue
+            payload = row.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            if not _looks_like_thread_metadata(payload):
+                continue
+            parent_thread_id = _optional_string(payload.get("parent_thread_id"))
+            thread_source = _optional_string(payload.get("thread_source"))
+            is_child_thread = _is_child_thread_metadata(
+                payload,
+                thread_id=thread_id,
+                parent_thread_id=parent_thread_id,
+                thread_source=thread_source,
+            )
+            return CodexThreadMetadata(
+                parent_thread_id=parent_thread_id,
+                thread_source=thread_source,
+                is_child_thread=is_child_thread,
+            )
+    return CodexThreadMetadata()
+
+
+def _looks_like_thread_metadata(payload: Mapping[str, Any]) -> bool:
+    """判断一行 rollout payload 是否像 Codex thread metadata。
+
+    入参：`payload` 是已解析的 JSON object。
+    返回：包含 thread id、父 thread、thread_source 或 source metadata 任一线索时为 True。
+    错误处理：本函数不抛业务异常。
+    副作用：无；只读取内存 mapping。
+    """
+
+    return any(
+        key in payload
+        for key in ("id", "session_id", "parent_thread_id", "thread_source", "source")
+    )
+
+
+def _is_child_thread_metadata(
+    payload: Mapping[str, Any],
+    *,
+    thread_id: str,
+    parent_thread_id: str | None,
+    thread_source: str | None,
+) -> bool:
+    """根据 Codex metadata 判断当前 thread 是否是 child/subagent thread。
+
+    入参：`payload` 是 metadata payload；`thread_id` 是当前 thread id；`parent_thread_id`
+    和 `thread_source` 是已解析的字段。
+    返回：有非自身 parent、`thread_source=subagent` 或 `source.subagent` 时为 True。
+    错误处理：source 结构未知时降级为 False，不影响主 thread 扫描。
+    副作用：无；只读取内存 mapping。
+    """
+
+    if parent_thread_id is not None and parent_thread_id != thread_id:
+        return True
+    if thread_source == "subagent":
+        return True
+    source = payload.get("source")
+    return isinstance(source, Mapping) and "subagent" in source
 
 
 def _latest_pending_user_input(rollout_path: Path) -> CodexUserInputRequest | None:
@@ -581,6 +701,9 @@ def _event_from_thread_request(
             "rollout_path": thread.rollout_path,
             "line_number": request.line_number,
             "detected_by": "codex_app_state_scan",
+            "parent_thread_id": thread.parent_thread_id,
+            "thread_source": thread.thread_source,
+            "is_child_thread": thread.is_child_thread,
         },
         occurred_at=request.requested_at,
     )

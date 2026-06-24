@@ -731,6 +731,7 @@ def test_daemon_callback_configures_default_unified_n4pro_renderer(
     assert poller_config.streamdock_n4pro_frame_root == Path(
         "assets/codex/generated/n4pro-key-112-fps10"
     )
+    assert poller_config.focus_actions_enabled is True
 
 
 def test_daemon_callback_reads_hardware_renderer_config(
@@ -757,6 +758,9 @@ def test_daemon_callback_reads_hardware_renderer_config(
                 "render_interval_seconds = 3.5",
                 "fps = 8",
                 f'frame_root = "{frame_root}"',
+                "",
+                "[actions.focus]",
+                "enabled = false",
             ]
         ),
         encoding="utf-8",
@@ -778,6 +782,7 @@ def test_daemon_callback_reads_hardware_renderer_config(
     assert poller_config.streamdock_n4pro_render_interval_seconds == 3.5
     assert poller_config.streamdock_n4pro_renderer_fps == 8
     assert poller_config.streamdock_n4pro_frame_root == frame_root
+    assert poller_config.focus_actions_enabled is False
 
 
 def test_daemon_rejects_out_of_range_port_before_uvicorn(monkeypatch: Any) -> None:

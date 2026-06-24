@@ -147,7 +147,12 @@ flowchart LR
     `ccusage codex daily --compact --json` 读取 Codex token usage，聚合 today/week/month/all。
     `/logical-panel/input` 提供归一化 panel 事件入口，`/hardware/input` 提供低层 `HardwareInput`
     入口并把 N4 Pro touch point / knob4 rotate 映射到 panel event；默认 persistent N4 Pro renderer
-    在同一 SDK 设备会话中注册 key/touch callbacks，旋钮 4 每次旋转事件切换一个统计周期。
+    在同一 SDK 设备会话中注册 key/touch callbacks，旋钮 4 在真实链路中累计两个同向 rotate
+    事件后切换一个统计周期，避免一格旋转就快速跳变。
+    `/status` 的 `streamdock_input.recent_events` 和 `interaction.recent` 保留最近输入与
+    业务 intent/action 的小型 ring buffer，用于真实硬件现场调试按键序列。
+    实测 N4 Pro 的 10 个主物理按键在 SDK button event 中上报为 `key=11..20`，
+    映射到 Agent Deck layout index `0..9`；不要按通用 1-based `1..10` 解释。
     渲染层显示剩余百分比，不改 quota adapter 的 `used_percent` 原始语义。未来没有触屏能力的
     设备应通过 device profile 禁用该 panel 或切换到其他显示方式。若 daemon 禁用真实硬件
     renderer，则可回退到 quota-only 真实硬件 sink 或纯 fake surface。
@@ -158,6 +163,16 @@ flowchart LR
     不是 Terminal、iTerm2、Ghostty、Otty 这类终端 App 的同级枚举。若 Codex CLI
     运行在 tmux pane 中，`focus_target` 应优先保存 tmux pane id/session/window/pane
     等结构化目标；终端 App 只是 attach 或展示现有 tmux client 的手段。
+    当前已完成第一段硬件反向链路：低层 key/button 输入结合当前 `LayoutPlan.keys`
+    映射为 `InteractionIntent`，主 agent slot 会更新 `DeckSelection.selected_agent_key`
+    并立即尝试 focus 该 agent；缺少 `focus_target` 时记录 `missing_target` 诊断。
+    approval action key 会把
+    `approve_request` / `deny_request` 写入 decision broker，并在 pending decision 出现时
+    自动把 logical panel 切到 `message` 展示工具、Agent 和原因；没有 pending 后回到 `quota`。
+    state 会保存事件 payload 里的
+    `focus_target`，默认对 `app:<AppName>` 目标调用 AppleScript 激活 App；
+    `[actions.focus].enabled = false` 仅作为排障关闭开关。tmux pane/window、terminal client
+    attach、结构化 host context 和递归熔断仍属于后续扩展。
 
 16. installer / doctor
     检查 Codex 配置、SDK、设备权限、端口占用、官方软件设备占用，提供 dry-run patch。

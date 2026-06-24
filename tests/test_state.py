@@ -24,11 +24,13 @@ def _event(
     cwd: str | None = "/repo",
     tool_name: str | None = None,
     summary: str | None = None,
+    payload: dict[str, object] | None = None,
 ) -> NormalizedEvent:
     """Build a normalized event for reducer tests.
 
     入参：`normalized_type` 是要测试的规范事件类型；`occurred_at` 是带时区的事件时间；
-    其余关键字参数覆盖 session、turn、原始事件类型、展示标题、工作目录、工具名和摘要。
+    其余关键字参数覆盖 session、turn、原始事件类型、展示标题、工作目录、工具名、摘要和
+    payload。
     返回：用于 `AgentStateStore.apply` 的 `NormalizedEvent`。
     错误处理：字段非法或时间无时区时由 `NormalizedEvent.build` 抛出 Pydantic 校验异常。
     副作用：仅创建内存模型，不访问网络、硬件或文件系统。
@@ -45,6 +47,7 @@ def _event(
         cwd=cwd,
         tool_name=tool_name,
         summary=summary,
+        payload=payload,
     )
 
 
@@ -69,6 +72,35 @@ def test_session_started_creates_idle_state() -> None:
     assert state.status == AgentStatus.IDLE
     assert state.status_since == occurred_at
     assert state.last_event_at == occurred_at
+
+
+def test_session_started_preserves_child_agent_metadata() -> None:
+    """Verify child agent metadata from hook payload is retained in state.
+
+    入参：无；测试内构造带 `parent_thread_id` 和 `thread_source=subagent` 的 session 事件。
+    返回：无返回值；断言通过代表 hook 路径生成的 child session 会被标记为 child agent。
+    错误处理：父 agent key 或 child 标记缺失时由 pytest 报告。
+    副作用：仅修改测试内的 `AgentStateStore` 内存状态。
+    """
+
+    occurred_at = datetime(2026, 6, 12, 8, 0, tzinfo=UTC)
+    store = AgentStateStore()
+
+    state = store.apply(
+        _event(
+            EventType.SESSION_STARTED,
+            occurred_at,
+            session_id="child-thread",
+            payload={
+                "parent_thread_id": "parent-thread",
+                "thread_source": "subagent",
+            },
+        )
+    )
+
+    assert state.agent_key == "codex:child-thread"
+    assert state.parent_agent_key == "codex:parent-thread"
+    assert state.is_child_agent is True
 
 
 def test_turn_started_moves_agent_to_thinking() -> None:

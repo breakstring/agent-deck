@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from PIL import Image
 from pydantic import BaseModel, ConfigDict
@@ -152,6 +152,55 @@ def render_touchscreen_image_to_n4pro(
     优先 set frame background、refresh 并 close(notify=False)。
     """
 
+    return _render_touchscreen_image_to_n4pro(
+        image,
+        manager=manager,
+        temp_dir=temp_dir,
+        background_api="frame",
+    )
+
+
+def render_dual_device_touchscreen_image_to_n4pro(
+    image: Image.Image,
+    *,
+    manager: StreamDockTouchscreenManagerLike | None = None,
+    temp_dir: Path | None = None,
+) -> StreamDockTouchscreenRenderResult:
+    """把一张 800x480 背景图下发到 N4 Pro 的 dual-device 可见触屏层。
+
+    入参：`image` 是调用方已经渲染好的 RGB/RGBA Pillow 图像；`manager` 和 `temp_dir`
+    语义同 `render_touchscreen_image_to_n4pro`。
+    返回：`StreamDockTouchscreenRenderResult`，成功时 `background_api` 为 `set_touchscreen_image`。
+    错误处理：同默认 sink；失败会返回 `ok=False` 结果。
+    副作用：真实设备上会调用官方 SDK `set_touchscreen_image`，用于覆盖退出后残留的
+    dual-device 可见层；不应在需要和按键动画共存的常规渲染循环中使用。
+    """
+
+    return _render_touchscreen_image_to_n4pro(
+        image,
+        manager=manager,
+        temp_dir=temp_dir,
+        background_api="dual",
+    )
+
+
+def _render_touchscreen_image_to_n4pro(
+    image: Image.Image,
+    *,
+    manager: StreamDockTouchscreenManagerLike | None,
+    temp_dir: Path | None,
+    background_api: Literal["frame", "dual"],
+) -> StreamDockTouchscreenRenderResult:
+    """按指定 N4 Pro 背景 API 下发触屏图像。
+
+    入参：`image` 是待下发图像；`manager` 可注入 fake 或官方 DeviceManager；`temp_dir`
+    是临时 JPEG 目录；`background_api` 为 `frame` 时优先写 frame background，为 `dual`
+    时明确写 dual-device touchscreen layer。
+    返回：`StreamDockTouchscreenRenderResult`。
+    错误处理：同公开 wrapper。
+    副作用：可能访问真实 N4 Pro 并修改对应背景层。
+    """
+
     active_manager = manager if manager is not None else _load_default_manager()
     device = _first_n4pro_device(active_manager.enumerate())
     if device is None:
@@ -176,7 +225,11 @@ def render_touchscreen_image_to_n4pro(
         device.init()
         image_path = _save_temp_jpeg(image, temp_dir=temp_dir)
         try:
-            background_api, sdk_result = _set_background_image(device, str(image_path))
+            sdk_api, sdk_result = _set_background_image(
+                device,
+                str(image_path),
+                background_api=background_api,
+            )
         finally:
             image_path.unlink(missing_ok=True)
         if sdk_result == -1:
@@ -184,16 +237,16 @@ def render_touchscreen_image_to_n4pro(
                 ok=False,
                 device_type=device_type,
                 path=path,
-                background_api=background_api,
+                background_api=sdk_api,
                 sdk_result=str(sdk_result),
-                error=f"{background_api} failed: SDK returned -1",
+                error=f"{sdk_api} failed: SDK returned -1",
             )
         device.refresh()
         return StreamDockTouchscreenRenderResult(
             ok=True,
             device_type=device_type,
             path=path,
-            background_api=background_api,
+            background_api=sdk_api,
             sdk_result=str(sdk_result),
         )
     except Exception as exc:
@@ -214,16 +267,21 @@ def render_touchscreen_image_to_n4pro(
 def _set_background_image(
     device: StreamDockTouchscreenDeviceLike,
     path: str,
+    *,
+    background_api: Literal["frame", "dual"],
 ) -> tuple[str, object]:
     """选择 N4 Pro 背景写入接口并执行。
 
-    入参：`device` 是已 open/init 的 SDK device；`path` 是临时 JPEG 路径。
-    返回：`(api_name, sdk_result)`；N4 Pro 优先返回 `set_frame_background` 的结果，缺失该
-    方法时 fallback 到 `set_touchscreen_image`。
+    入参：`device` 是已 open/init 的 SDK device；`path` 是临时 JPEG 路径；`background_api`
+    指定优先写 frame background 还是 dual-device 触屏层。
+    返回：`(api_name, sdk_result)`；frame 模式缺失 `set_frame_background` 时 fallback 到
+    `set_touchscreen_image`。
     错误处理：SDK 方法抛出的异常向上传播，由调用方转换为失败结果。
     副作用：修改真实设备背景层。
     """
 
+    if background_api == "dual":
+        return "set_touchscreen_image", device.set_touchscreen_image(path)
     frame_background = getattr(device, "set_frame_background", None)
     if callable(frame_background):
         return "set_frame_background", frame_background(path)

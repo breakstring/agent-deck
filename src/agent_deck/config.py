@@ -99,11 +99,41 @@ class CodexConfig(BaseModel):
     )
 
 
+class FocusActionConfig(BaseModel):
+    """配置 Agent Deck 是否允许执行真实 focus action。
+
+    入参：`enabled` 为 true 时，daemon 收到 `focus_agent` intent 且目标 agent 有显式
+    focus target 后，会调用本机 action executor；默认 true，让 agent key 直接尝试激活会话。
+    返回：frozen Pydantic model。
+    错误处理：字段类型非法时由 Pydantic 报告。
+    副作用：模型自身不执行动作、不访问窗口系统。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = True
+
+
+class ActionsConfig(BaseModel):
+    """配置 Agent Deck 允许执行的外部动作开关。
+
+    入参：`focus` 控制 `focus_agent` 是否允许执行真实本机 focus，默认允许。
+    返回：frozen Pydantic model。
+    错误处理：子配置非法时由 Pydantic 报告。
+    副作用：模型自身不执行动作。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    focus: FocusActionConfig = Field(default_factory=FocusActionConfig)
+
+
 class AgentDeckConfig(BaseModel):
     """Agent Deck daemon 的本地可编辑配置根模型。
 
     入参：`hardware_renderer` 是真实硬件渲染相关默认值；`codex` 是 Codex 专属集成能力
-    配置域；后续可继续加入 agent、quota、interaction 等配置域。
+    配置域；`actions` 是外部动作能力开关，focus 默认启用；后续可继续加入 agent、quota、
+    interaction 等配置域。
     返回：frozen Pydantic model。
     错误处理：子配置非法时由 Pydantic 返回结构化校验错误。
     副作用：模型自身不读写外部资源。
@@ -115,6 +145,7 @@ class AgentDeckConfig(BaseModel):
         default_factory=HardwareRendererConfig
     )
     codex: CodexConfig = Field(default_factory=CodexConfig)
+    actions: ActionsConfig = Field(default_factory=ActionsConfig)
 
 
 def resolve_agent_deck_config_path(path: Path | None = None) -> Path:

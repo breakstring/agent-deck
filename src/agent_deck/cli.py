@@ -252,7 +252,8 @@ def daemon_callback(
     `disable_streamdock_quota_touchscreen` 可关闭旧 quota-only 真实硬件触屏下发；
     `config_path` 指向 daemon 默认配置；`disable_hardware_renderer` 可关闭默认真实硬件渲染；
     `device_profile`、`render_interval_seconds` 和 `renderer_fps` 是面向临时调试的通用覆盖项，
-    未传时沿用配置文件，当前默认设备 profile 为 `n4pro`。
+    未传时沿用配置文件，当前默认设备 profile 为 `n4pro`；真实 `focus_agent` 默认启用，
+    可由配置文件 `[actions.focus].enabled = false` 临时关闭。
     返回：无显式返回值；`uvicorn.run` 负责阻塞运行 ASGI app。
     错误处理：Typer 处理 CLI 参数错误，包括非法端口、poll interval 或 timeout 范围；
     `create_app` 或 `uvicorn.run` 抛出的异常会向上传播并使命令失败。
@@ -305,6 +306,7 @@ def daemon_callback(
         ),
         streamdock_n4pro_renderer_fps=hardware_renderer.fps,
         streamdock_n4pro_frame_root=hardware_renderer.frame_root,
+        focus_actions_enabled=local_config.actions.focus.enabled,
     )
     uvicorn.run(create_app(poller_config=poller_config), host=host, port=port)
 

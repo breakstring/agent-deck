@@ -22,6 +22,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent_deck.actions.focus import FocusActionResult, focus_agent_target
 from agent_deck.adapters.codex_app_state import (
     CodexAppActiveSession,
     build_codex_app_state_events,
@@ -48,12 +49,19 @@ from agent_deck.hardware.streamdock_n4pro import (
 )
 from agent_deck.hardware.streamdock_touchscreen import (
     StreamDockTouchscreenRenderResult,
+    render_dual_device_touchscreen_image_to_n4pro,
     render_touchscreen_image_to_n4pro,
 )
 from agent_deck.input.logical_panel import (
     panel_event_from_hardware_input,
     panel_event_from_streamdock_input_event,
 )
+from agent_deck.input.interactions import (
+    InteractionIntent,
+    interaction_intent_from_hardware_input,
+    interaction_intent_from_streamdock_input_event,
+)
+from agent_deck.rendering.brand import render_agent_deck_splash_touchscreen
 from agent_deck.rendering.codex_key_frames import codex_key_frame_paths_for_key_variants
 from agent_deck.rendering.layout import LayoutPlan, build_layout_plan
 from agent_deck.rendering.logical_panel import (
@@ -62,6 +70,7 @@ from agent_deck.rendering.logical_panel import (
     PanelKind,
     PanelSelection,
     apply_panel_input,
+    message_panel_plan,
     tokens_panel_plan,
 )
 from agent_deck.rendering.logical_panel_touchscreen import (
@@ -75,12 +84,20 @@ CodexQuotaReader = Callable[..., CodexQuotaSnapshot]
 CodexTokenUsageReader = Callable[[], CodexTokenUsageSnapshot]
 QuotaTouchscreenSink = Callable[[Any], StreamDockTouchscreenRenderResult]
 StreamDockN4ProRendererSink = Callable[..., StreamDockN4ProAnimationResult]
+FocusActionExecutor = Callable[[str], FocusActionResult]
+VisibleSplashTouchscreenSink = Callable[[Any], StreamDockTouchscreenRenderResult]
 
 _STREAMDOCK_TOUCH_TAP_DEBOUNCE_SECONDS = 0.45
 """真实 StreamDock touch bar 连续 touch_point 归并为一次 tap 的最短间隔。"""
 
 _STREAMDOCK_KNOB4_ROTATE_THRESHOLD = 2
 """真实 StreamDock 第 4 旋钮累计多少个 rotate 事件后切换一次 token 周期。"""
+
+_RECENT_STREAMDOCK_INPUT_LIMIT = 30
+"""status 中保留多少条最近真实 StreamDock 输入事件诊断。"""
+
+_RECENT_INTERACTION_LIMIT = 30
+"""status 中保留多少条最近业务 interaction 诊断。"""
 
 
 class DaemonPollerConfig(BaseModel):
@@ -97,6 +114,7 @@ class DaemonPollerConfig(BaseModel):
     `streamdock_n4pro_renderer_enabled` 控制是否启用统一 N4 Pro 背景+按钮渲染循环，启用后
     应替代 quota-only 真实触屏下发；`streamdock_n4pro_frame_root` 指向 generated 按键帧；
     `streamdock_n4pro_render_interval_seconds` 和 `streamdock_n4pro_renderer_fps` 控制真机刷新节奏；
+    `focus_actions_enabled` 控制是否允许 `focus_agent` 调用真实 action executor，默认开启；
     `poll_on_start` 控制启动时是否先同步一次，便于 daemon 刚启动就有状态。
     返回：frozen Pydantic model，供 `create_app` lifespan 使用。
     错误处理：非正间隔或 timeout 由 Pydantic 校验为 422/ValidationError。
@@ -121,6 +139,7 @@ class DaemonPollerConfig(BaseModel):
     streamdock_n4pro_frame_root: Path = Path("assets/codex/generated/n4pro-key-112-fps10")
     streamdock_n4pro_render_interval_seconds: float = Field(default=3.0, gt=0)
     streamdock_n4pro_renderer_fps: int = Field(default=10, gt=0)
+    focus_actions_enabled: bool = True
     poll_on_start: bool = True
 
 
@@ -205,6 +224,12 @@ class _DaemonRuntime:
     streamdock_knob4_rotate_accumulator: int
     streamdock_input_event_count: int
     streamdock_last_input_event: dict[str, Any] | None
+    streamdock_recent_input_events: list[dict[str, Any]]
+    last_interaction_intent: InteractionIntent | None
+    last_interaction_action: dict[str, Any] | None
+    recent_interactions: list[dict[str, Any]]
+    focus_actions_enabled: bool
+    focus_action_executor: FocusActionExecutor
     streamdock_quota_touchscreen_result: StreamDockTouchscreenRenderResult | None
     streamdock_n4pro_renderer_result: StreamDockN4ProAnimationResult | None
     streamdock_n4pro_renderer_updated_at: datetime | None
@@ -260,6 +285,11 @@ class _DaemonRuntime:
         """
 
         for session in sessions:
+            focus_target = (
+                f"codex-app:{session.thread_id}"
+                if session.thread_id
+                else "app:Codex"
+            )
             self.store.upsert_observed_state(
                 source=AgentSource.CODEX,
                 session_id=session.thread_id,
@@ -269,6 +299,9 @@ class _DaemonRuntime:
                 cwd=session.cwd,
                 summary=session.reason,
                 active_tool=_active_tool_from_reason(session.reason),
+                focus_target=focus_target,
+                parent_session_id=session.parent_thread_id,
+                is_child_agent=session.is_child_thread,
             )
         if sessions:
             self.render_current()
@@ -392,10 +425,20 @@ class _DaemonRuntime:
 
         panel_event = panel_event_from_hardware_input(event)
         if panel_event is None:
+            layout = self.render_current()
+            interaction_intent = interaction_intent_from_hardware_input(event, layout)
+            if interaction_intent is not None:
+                interaction_result = self.apply_interaction_intent(interaction_intent)
+                return {
+                    "handled": True,
+                    "panel_event": None,
+                    **interaction_result,
+                }
             return {
                 "handled": False,
                 "panel_event": None,
                 "selection": _dump_model(self.logical_panel_selection),
+                "interaction_intent": None,
             }
         result = self.apply_logical_panel_input(LogicalPanelInputBody(event=panel_event))
         return {
@@ -415,6 +458,25 @@ class _DaemonRuntime:
 
         panel_event = panel_event_from_streamdock_input_event(event)
         if panel_event is None:
+            layout = self.render_current()
+            interaction_intent = interaction_intent_from_streamdock_input_event(
+                event,
+                layout,
+            )
+            if interaction_intent is not None:
+                interaction_result = self.apply_interaction_intent(interaction_intent)
+                self._record_streamdock_input_event(
+                    event,
+                    panel_event=None,
+                    handled=True,
+                    debounced=False,
+                    accumulated=False,
+                )
+                return {
+                    "handled": True,
+                    "panel_event": None,
+                    **interaction_result,
+                }
             self._record_streamdock_input_event(
                 event,
                 panel_event=None,
@@ -426,6 +488,7 @@ class _DaemonRuntime:
                 "handled": False,
                 "panel_event": None,
                 "selection": _dump_model(self.logical_panel_selection),
+                "interaction_intent": None,
             }
         if self._should_debounce_streamdock_panel_event(panel_event):
             self._record_streamdock_input_event(
@@ -469,6 +532,100 @@ class _DaemonRuntime:
             **result,
         }
 
+    def apply_interaction_intent(self, intent: InteractionIntent) -> dict[str, Any]:
+        """应用一条 deck interaction intent。
+
+        入参：`intent` 是硬件输入结合当前 layout 得出的交互意图。
+        返回：JSON-safe dict，包含 intent、当前 deck selection 和可选 action 诊断。
+        错误处理：未知 intent 只记录 dry-run；未知 decision id 返回 missing_decision 诊断。
+        副作用：`select_agent` 会更新 deck selection；approval intent 会 resolve broker；
+        显式启用真实 focus 时可能调用本机 focus executor。
+        """
+
+        self.last_interaction_intent = intent
+        action: dict[str, Any] | None = None
+        if intent.intent == "select_agent" and intent.agent_key is not None:
+            self.selection = self.selection.model_copy(
+                update={"selected_agent_key": intent.agent_key}
+            )
+            self.render_current()
+            state = self.store.get(intent.agent_key)
+            focus_intent = intent.model_copy(
+                update={
+                    "intent": "focus_agent",
+                    "dry_run": True,
+                }
+            )
+            if self.focus_actions_enabled:
+                action = _execute_focus_action(
+                    focus_intent,
+                    state,
+                    self.focus_action_executor,
+                )
+            else:
+                action = _dry_run_action(focus_intent, state)
+        elif intent.intent in {"approve_request", "deny_request"}:
+            action = self._apply_decision_intent(intent)
+        else:
+            state = self.store.get(intent.agent_key) if intent.agent_key else None
+            if intent.intent == "focus_agent" and self.focus_actions_enabled:
+                action = _execute_focus_action(
+                    intent,
+                    state,
+                    self.focus_action_executor,
+                )
+            else:
+                action = _dry_run_action(intent, state)
+        self.last_interaction_action = action
+        _append_bounded(
+            self.recent_interactions,
+            {
+                "intent": _dump_model(intent),
+                "action": action,
+            },
+            limit=_RECENT_INTERACTION_LIMIT,
+        )
+        return {
+            "interaction_intent": _dump_model(intent),
+            "deck_selection": _dump_model(self.selection),
+            "action": action,
+        }
+
+    def _apply_decision_intent(self, intent: InteractionIntent) -> dict[str, Any]:
+        """把硬件 approval intent 应用到 decision broker。
+
+        入参：`intent` 是 `approve_request` 或 `deny_request`，应携带 decision id。
+        返回：JSON-safe action 诊断，说明是否 resolve 成功。
+        错误处理：缺少或未知 decision id 时不抛异常，返回 `missing_decision`。
+        副作用：成功时会 resolve broker、同步 agent pending 状态，并 render 当前 layout/panel。
+        """
+
+        behavior = (
+            DecisionBehavior.ALLOW
+            if intent.intent == "approve_request"
+            else DecisionBehavior.DENY
+        )
+        if intent.decision_id is None:
+            return _missing_decision_action(intent, behavior)
+        resolved = self.resolve_decision(
+            intent.decision_id,
+            DecisionResolveBody(
+                behavior=behavior,
+                message=_hardware_decision_message(behavior),
+            ),
+        )
+        if resolved is None or resolved.result is None:
+            return _missing_decision_action(intent, behavior)
+        return {
+            "intent": intent.intent,
+            "agent_key": intent.agent_key,
+            "decision_id": intent.decision_id,
+            "status": "resolved",
+            "ok": True,
+            "behavior": resolved.result.behavior.value,
+            "message": resolved.result.message,
+        }
+
     def _record_streamdock_input_event(
         self,
         event: object,
@@ -489,9 +646,10 @@ class _DaemonRuntime:
         """
 
         self.streamdock_input_event_count += 1
-        self.streamdock_last_input_event = {
+        snapshot = {
             "count": self.streamdock_input_event_count,
             "event_type": _dump_event_field(getattr(event, "event_type", None)),
+            "key": _dump_event_key(event),
             "knob_id": _dump_event_field(getattr(event, "knob_id", None)),
             "direction": _dump_event_field(getattr(event, "direction", None)),
             "state": getattr(event, "state", None),
@@ -503,6 +661,12 @@ class _DaemonRuntime:
             "accumulated": accumulated,
             "knob4_rotate_accumulator": self.streamdock_knob4_rotate_accumulator,
         }
+        self.streamdock_last_input_event = snapshot
+        _append_bounded(
+            self.streamdock_recent_input_events,
+            snapshot,
+            limit=_RECENT_STREAMDOCK_INPUT_LIMIT,
+        )
 
     def _should_accumulate_streamdock_knob_event(self, event: PanelInputEvent) -> bool:
         """判断真实 StreamDock 旋钮事件是否尚未达到周期切换阈值。
@@ -575,11 +739,12 @@ class _DaemonRuntime:
                 period=self.logical_panel_selection.token_period,
             )
             return render_logical_panel_touchscreen(plan), "codex_tokens"
-        plan = _logical_panel_placeholder_plan(
-            active_kind,
-            token_period=self.logical_panel_selection.token_period,
-        )
-        return render_logical_panel_touchscreen(plan), f"{active_kind.value}:placeholder"
+        if active_kind == PanelKind.MESSAGE:
+            decision = self._current_pending_decision()
+            if decision is not None:
+                plan = _decision_message_panel_plan(decision)
+                return render_logical_panel_touchscreen(plan), "decision_message"
+        return render_agent_deck_splash_touchscreen(), "agent_deck:splash"
 
     def render_current_logical_panel_image(self) -> Any | None:
         """Render and record the current logical panel image when possible.
@@ -692,6 +857,10 @@ class _DaemonRuntime:
             }
         )
         self.render_current()
+        self.logical_panel_selection = self.logical_panel_selection.model_copy(
+            update={"active_kind": PanelKind.MESSAGE}
+        )
+        self.render_current_logical_panel_image()
         return decision
 
     def resolve_decision(
@@ -716,6 +885,11 @@ class _DaemonRuntime:
                 update={"selected_decision_id": None}
             )
         self.render_current()
+        if not self.broker.pending():
+            self.logical_panel_selection = self.logical_panel_selection.model_copy(
+                update={"active_kind": PanelKind.QUOTA}
+            )
+        self.render_current_logical_panel_image()
         return resolved
 
     async def wait_for_decision(
@@ -807,6 +981,13 @@ class _DaemonRuntime:
             "streamdock_input": {
                 "event_count": self.streamdock_input_event_count,
                 "last_event": self.streamdock_last_input_event,
+                "recent_events": list(self.streamdock_recent_input_events),
+            },
+            "deck_selection": _dump_model(self.selection),
+            "interaction": {
+                "last_intent": _dump_optional_model(self.last_interaction_intent),
+                "last_action": self.last_interaction_action,
+                "recent": list(self.recent_interactions),
             },
         }
 
@@ -826,6 +1007,24 @@ class _DaemonRuntime:
         layout = build_layout_plan(states, decisions, self.selection)
         self.surface.render(layout)
         return layout
+
+    def _current_pending_decision(self) -> PendingDecision | None:
+        """读取当前 message panel 应展示的 pending decision。
+
+        入参：无；读取 broker pending 快照和当前 selection。
+        返回：优先返回 selection 指向的 pending decision，否则返回最早 pending decision。
+        错误处理：无 pending 时返回 None。
+        副作用：无；只读取内存 broker。
+        """
+
+        decisions = self.broker.pending()
+        if not decisions:
+            return None
+        if self.selection.selected_decision_id is not None:
+            for decision in decisions:
+                if decision.decision_id == self.selection.selected_decision_id:
+                    return decision
+        return decisions[0]
 
     def _ensure_first_agent_selected(self, states: list[AgentState]) -> None:
         """Select the first snapshot agent when no agent has been selected.
@@ -936,6 +1135,8 @@ def create_app(
     codex_token_usage_reader: CodexTokenUsageReader = read_codex_token_usage,
     quota_touchscreen_sink: QuotaTouchscreenSink = render_touchscreen_image_to_n4pro,
     streamdock_n4pro_renderer_sink: StreamDockN4ProRendererSink | None = None,
+    visible_splash_touchscreen_sink: VisibleSplashTouchscreenSink = render_dual_device_touchscreen_image_to_n4pro,
+    focus_action_executor: FocusActionExecutor = focus_agent_target,
 ) -> FastAPI:
     """Create the local daemon FastAPI app without binding sockets.
 
@@ -946,7 +1147,11 @@ def create_app(
     `codex_token_usage_reader` 是可注入 reader，生产默认通过 ccusage 读取 Codex token usage；
     `quota_touchscreen_sink` 是 quota-only 真实硬件触屏下发函数，仅在配置启用时调用；
     `streamdock_n4pro_renderer_sink` 是统一背景+按钮真实硬件下发函数，测试可替换；为空时
-    使用 daemon 专用 persistent sink，避免每轮渲染都 close/open N4 Pro。
+    使用 daemon 专用 persistent sink，避免每轮渲染都 close/open N4 Pro；
+    `visible_splash_touchscreen_sink` 专门写 N4 Pro dual-device 可见触屏层，用于启动/退出时
+    清掉旧 quota 残留；不参与常规按键动画渲染；
+    `focus_action_executor` 是 `focus_agent` 的真实动作执行器，poller config 未禁用
+    `focus_actions_enabled` 且目标 agent 有 focus target 时会被调用。
     返回：配置好路由且持有 in-memory runtime 的 `FastAPI` ASGI app。
     错误处理：对象构造失败会直接抛出；poller 单次失败会记录到 status，不让 app 启动失败。
     副作用：总是分配内存对象并注册路由；只有显式启用 poller 时，lifespan startup 才会只读访问
@@ -974,6 +1179,12 @@ def create_app(
         streamdock_knob4_rotate_accumulator=0,
         streamdock_input_event_count=0,
         streamdock_last_input_event=None,
+        streamdock_recent_input_events=[],
+        last_interaction_intent=None,
+        last_interaction_action=None,
+        recent_interactions=[],
+        focus_actions_enabled=resolved_poller_config.focus_actions_enabled,
+        focus_action_executor=focus_action_executor,
         streamdock_quota_touchscreen_result=None,
         streamdock_n4pro_renderer_result=None,
         streamdock_n4pro_renderer_updated_at=None,
@@ -999,6 +1210,10 @@ def create_app(
         """
 
         tasks: list[asyncio.Task[None]] = []
+        if resolved_poller_config.streamdock_n4pro_renderer_enabled:
+            await _render_streamdock_n4pro_visible_splash(
+                visible_splash_touchscreen_sink,
+            )
         if resolved_poller_config.poll_on_start:
             await _run_enabled_pollers_once(
                 runtime,
@@ -1079,6 +1294,10 @@ def create_app(
             for task in tasks:
                 with suppress(asyncio.CancelledError):
                     await task
+            if resolved_poller_config.streamdock_n4pro_renderer_enabled:
+                await _render_streamdock_n4pro_visible_splash(
+                    visible_splash_touchscreen_sink,
+                )
             close_renderer = getattr(
                 resolved_streamdock_n4pro_renderer_sink,
                 "close",
@@ -1411,41 +1630,40 @@ async def _render_streamdock_n4pro_once(
         runtime.mark_streamdock_n4pro_renderer_error(exc, rendered_at=rendered_at)
 
 
-def _logical_panel_placeholder_plan(
-    kind: PanelKind,
-    *,
-    token_period: Any,
-) -> LogicalPanelPlan:
-    """为缺少数据的 logical panel 创建可渲染占位计划。
+async def _render_streamdock_n4pro_visible_splash(
+    touchscreen_sink: VisibleSplashTouchscreenSink,
+) -> None:
+    """把 N4 Pro 可见 touch layer 尽量改成 Agent Deck 默认图。
 
-    入参：`kind` 是当前面板类型；`token_period` 是 tokens 面板当前周期，会用于标题。
-    返回：`LogicalPanelPlan`，可被真实 renderer 用来启动硬件会话和输入回调。
-    错误处理：未知 kind 走通用占位文案。
-    副作用：无；只创建内存模型。
+    入参：`touchscreen_sink` 是 dual-device 可见触屏层 sink。
+    返回：无显式返回值。
+    错误处理：启动/退出阶段不应阻塞 daemon，渲染或硬件异常会被吞掉。
+    副作用：可能在线程中调用真实硬件 sink，覆盖旧 quota 等 dual-device 残留层。
     """
 
-    if kind == PanelKind.QUOTA:
-        return LogicalPanelPlan(
-            kind=kind,
-            title="Quota",
-            lines=("Waiting for quota data",),
+    with suppress(Exception):
+        await asyncio.to_thread(
+            touchscreen_sink,
+            render_agent_deck_splash_touchscreen(),
         )
-    if kind == PanelKind.TOKENS:
-        return LogicalPanelPlan(
-            kind=kind,
-            title=f"Tokens · {getattr(token_period, 'value', token_period)}",
-            lines=("Waiting for token data",),
-        )
-    if kind == PanelKind.PETS:
-        return LogicalPanelPlan(
-            kind=kind,
-            title="Pets",
-            lines=("Pet panel is not ready",),
-        )
-    return LogicalPanelPlan(
-        kind=kind,
-        title="Message",
-        lines=("No message",),
+
+
+def _decision_message_panel_plan(decision: PendingDecision) -> LogicalPanelPlan:
+    """把 pending decision 转换成 message logical panel。
+
+    入参：`decision` 是当前待用户审批的 broker 快照。
+    返回：`kind=message` 的 logical panel plan，包含工具名、来源 agent 和审批原因。
+    错误处理：模型字段非法时由 Pydantic 报告。
+    副作用：无；只创建内存展示计划。
+    """
+
+    return message_panel_plan(
+        title="Approval needed",
+        lines=(
+            f"Tool: {decision.tool_name}",
+            f"Agent: {decision.agent_key}",
+            decision.reason,
+        ),
     )
 
 
@@ -1648,6 +1866,132 @@ def _dump_datetime(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
+def _dry_run_action(
+    intent: InteractionIntent,
+    state: AgentState | None,
+) -> dict[str, Any]:
+    """返回第一阶段 action dry-run 诊断。
+
+    入参：`intent` 是待执行交互意图；`state` 是目标 agent 当前状态，可空。
+    返回：包含 action 状态、目标和说明的 JSON-safe dict。
+    错误处理：未知 intent 使用通用 dry-run 文案。
+    副作用：无。
+    """
+
+    if intent.intent == "focus_agent":
+        focus_target = state.focus_target if state is not None else None
+        target_available = focus_target is not None
+        message = (
+            f"focus_agent dry-run recorded for {focus_target}"
+            if target_available
+            else "focus_agent dry-run recorded; missing focus target"
+        )
+        return {
+            "intent": intent.intent,
+            "agent_key": intent.agent_key,
+            "decision_id": intent.decision_id,
+            "status": "dry_run",
+            "target_available": target_available,
+            "focus_target": focus_target,
+            "message": message,
+        }
+    return {
+        "intent": intent.intent,
+        "agent_key": intent.agent_key,
+        "decision_id": intent.decision_id,
+        "status": "dry_run",
+        "message": f"{intent.intent} dry-run recorded; no external action executed",
+    }
+
+
+def _missing_decision_action(
+    intent: InteractionIntent,
+    behavior: DecisionBehavior,
+) -> dict[str, Any]:
+    """返回 approval intent 找不到 decision 时的诊断。
+
+    入参：`intent` 是 approval 交互意图；`behavior` 是它想要写入的 allow/deny。
+    返回：JSON-safe action 诊断。
+    错误处理：无。
+    副作用：无。
+    """
+
+    return {
+        "intent": intent.intent,
+        "agent_key": intent.agent_key,
+        "decision_id": intent.decision_id,
+        "status": "missing_decision",
+        "ok": False,
+        "behavior": behavior.value,
+        "message": "approval intent ignored; missing pending decision",
+    }
+
+
+def _missing_focus_target_action(intent: InteractionIntent) -> dict[str, Any]:
+    """返回 focus intent 找不到目标时的诊断。
+
+    入参：`intent` 是待执行的 focus intent。
+    返回：JSON-safe action 诊断，说明当前 agent 尚无可执行 focus target。
+    错误处理：无。
+    副作用：无。
+    """
+
+    return {
+        "intent": "focus_agent",
+        "agent_key": intent.agent_key,
+        "decision_id": intent.decision_id,
+        "status": "missing_target",
+        "ok": False,
+        "target_available": False,
+        "focus_target": None,
+        "message": "focus_agent ignored; missing focus target",
+    }
+
+
+def _hardware_decision_message(behavior: DecisionBehavior) -> str:
+    """返回硬件审批写入 broker result 的可读说明。
+
+    入参：`behavior` 是用户通过硬件选择的 allow/deny。
+    返回：稳定英文说明，供 Codex hook 或 status 诊断展示。
+    错误处理：无。
+    副作用：无。
+    """
+
+    if behavior == DecisionBehavior.ALLOW:
+        return "Approved by Agent Deck hardware."
+    return "Denied by Agent Deck hardware."
+
+
+def _execute_focus_action(
+    intent: InteractionIntent,
+    state: AgentState | None,
+    focus_action_executor: FocusActionExecutor,
+) -> dict[str, Any]:
+    """执行显式启用后的 `focus_agent` 动作并返回诊断。
+
+    入参：`intent` 是硬件输入归一化后的 focus intent；`state` 是目标 agent 当前状态；
+    `focus_action_executor` 是受配置保护的真实动作执行器。
+    返回：JSON-safe action 诊断；缺少 focus target 时退回 dry-run 缺目标诊断。
+    错误处理：executor 自己负责把系统异常转换为 `FocusActionResult`，本函数只序列化结果。
+    副作用：当存在 focus target 时会调用 executor，可能激活本机窗口。
+    """
+
+    focus_target = state.focus_target if state is not None else None
+    if focus_target is None:
+        return _missing_focus_target_action(intent)
+    result = focus_action_executor(focus_target)
+    return {
+        "intent": intent.intent,
+        "agent_key": intent.agent_key,
+        "decision_id": intent.decision_id,
+        "status": result.status,
+        "ok": result.ok,
+        "target_available": True,
+        "focus_target": result.focus_target,
+        "message": result.message,
+    }
+
+
 def _dump_event_field(value: object) -> object:
     """把 SDK enum-like 字段转换成 status 可读值。
 
@@ -1663,6 +2007,42 @@ def _dump_event_field(value: object) -> object:
     if value is None or isinstance(value, str | int | float | bool):
         return value
     return str(value)
+
+
+def _dump_event_key(event: object) -> object:
+    """从 SDK-like event 中读取可序列化的物理 button key。
+
+    入参：`event` 是官方 SDK 输入事件或测试替身，`key` 可能是 enum-like 对象。
+    返回：优先返回 `event.key.value`，否则返回 `event.key` 的 JSON-safe 表示；缺失时返回 None。
+    错误处理：无。
+    副作用：无。
+    """
+
+    key = getattr(event, "key", None)
+    return _dump_event_field(getattr(key, "value", key))
+
+
+def _append_bounded(
+    items: list[Any],
+    item: Any,
+    *,
+    limit: int,
+) -> None:
+    """向内存诊断列表追加一项并保留最新的有限条数。
+
+    入参：`items` 是 runtime 持有的可变列表；`item` 是新诊断；`limit` 是保留上限。
+    返回：无。
+    错误处理：非正 limit 会清空历史，只保留空列表语义。
+    副作用：原地修改 `items`。
+    """
+
+    items.append(item)
+    if limit <= 0:
+        items.clear()
+        return
+    extra = len(items) - limit
+    if extra > 0:
+        del items[:extra]
 
 
 def _image_size(image: Any | None) -> list[int] | None:
