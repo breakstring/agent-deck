@@ -254,6 +254,193 @@ def test_doctor_keeps_running_when_streamdock_probe_fails(monkeypatch: Any) -> N
     assert any("StreamDock 只读探针失败" in warning for warning in payload["warnings"])
 
 
+def test_n4pro_splash_json_writes_default_visible_layer(monkeypatch: Any) -> None:
+    """验证 N4 Pro splash 命令会把默认图写到可见触屏层。
+
+    入参：`monkeypatch` 注入 fake dual-device sink。
+    返回：无返回值；断言通过代表 CLI 使用 800x480 默认图和 `set_touchscreen_image` 语义。
+    错误处理：命令失败、图片尺寸或 JSON 结构错误时由 pytest 报告。
+    副作用：只运行 Typer in-process，不访问真实硬件。
+    """
+
+    calls: list[Image.Image] = []
+
+    def fake_splash_sink(image: Image.Image) -> cli.StreamDockTouchscreenRenderResult:
+        """记录写屏图片并返回成功。
+
+        入参：`image` 是 CLI 渲染出的默认触屏图。
+        返回：固定成功结果。
+        错误处理：无。
+        副作用：追加测试内存列表。
+        """
+
+        calls.append(image)
+        return cli.StreamDockTouchscreenRenderResult(
+            ok=True,
+            device_type="StreamDockN4Pro",
+            path="DevSrvsID:4295109180",
+            background_api="set_touchscreen_image",
+            sdk_result="None",
+        )
+
+    monkeypatch.setattr(
+        cli,
+        "render_dual_device_touchscreen_image_to_n4pro",
+        fake_splash_sink,
+    )
+
+    result = runner.invoke(cli.ctl_app, ["hardware", "n4pro", "splash", "--json"])
+
+    assert result.exit_code == 0
+    assert len(calls) == 1
+    assert calls[0].size == (800, 480)
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["target"] == "streamdock:n4pro:visible-touchscreen"
+    assert payload["image_size"] == [800, 480]
+    assert payload["visible_layer_api"] == "set_touchscreen_image"
+    assert payload["result"]["background_api"] == "set_touchscreen_image"
+
+
+def test_n4pro_splash_exits_1_when_sink_reports_failure(monkeypatch: Any) -> None:
+    """验证 splash sink 失败时命令输出结果并返回 exit 1。
+
+    入参：`monkeypatch` 注入失败 fake sink。
+    返回：无返回值；断言通过代表手动修屏失败不会被误报为成功。
+    错误处理：退出码或 payload 错误时由 pytest 报告。
+    副作用：只运行 Typer in-process，不访问真实硬件。
+    """
+
+    def fake_splash_sink(_: Image.Image) -> cli.StreamDockTouchscreenRenderResult:
+        """返回固定失败结果。
+
+        入参：忽略图片。
+        返回：`ok=False` 的写屏结果。
+        错误处理：无。
+        副作用：无。
+        """
+
+        return cli.StreamDockTouchscreenRenderResult(
+            ok=False,
+            background_api="set_touchscreen_image",
+            error="no N4 Pro device found",
+        )
+
+    monkeypatch.setattr(
+        cli,
+        "render_dual_device_touchscreen_image_to_n4pro",
+        fake_splash_sink,
+    )
+
+    result = runner.invoke(cli.ctl_app, ["hardware", "n4pro", "splash", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["result"]["error"] == "no N4 Pro device found"
+
+
+def test_hardware_status_json_reports_all_devices_and_n4pro_actions(
+    monkeypatch: Any,
+) -> None:
+    """验证通用 hardware status 会报告所有设备和 N4 Pro 专属动作。
+
+    入参：`monkeypatch` 注入 fake probe 和进程扫描。
+    返回：无返回值；断言通过代表通用诊断不绑定单一硬件型号。
+    错误处理：JSON 字段或过滤逻辑不符合预期时由 pytest 报告。
+    副作用：只运行 Typer in-process；不访问真实硬件或真实进程表。
+    """
+
+    monkeypatch.setenv("AGENT_DECK_STREAMDOCK_SDK_PATH", "/tmp/StreamDock-Device-SDK/Python-SDK")
+    monkeypatch.setattr(
+        cli,
+        "probe_streamdock_devices",
+        lambda: [
+            ProbeResult(
+                device_type="StreamDockBiz",
+                path="biz",
+                can_open=True,
+                can_init=False,
+            ),
+            ProbeResult(
+                device_type="StreamDockN4Pro",
+                path="n4pro",
+                can_open=True,
+                can_init=False,
+            ),
+        ],
+    )
+    monkeypatch.setattr(cli, "_scan_hardware_occupants", lambda: [])
+
+    result = runner.invoke(cli.ctl_app, ["hardware", "status", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["hardware_families"] == [
+        {
+            "family": "streamdock",
+            "status": "available",
+            "device_count": 2,
+        }
+    ]
+    assert len(payload["hardware_devices"]) == 2
+    assert payload["hardware_devices"][0]["profile"] == "streamdock.unknown"
+    assert payload["hardware_devices"][0]["supported_commands"] == []
+    assert payload["hardware_devices"][1]["profile"] == "mirabox.n4pro"
+    assert payload["hardware_devices"][1]["can_rewrite_splash"] is True
+    assert payload["hardware_devices"][1]["supported_commands"] == [
+        "agent-deckctl hardware n4pro splash"
+    ]
+    assert payload["commands"] == {
+        "streamdock:n4pro:splash": "agent-deckctl hardware n4pro splash"
+    }
+    assert payload["warnings"] == []
+
+
+def test_n4pro_status_json_is_narrow_view_over_hardware_status(
+    monkeypatch: Any,
+) -> None:
+    """验证 N4 Pro status 是通用 hardware status 的窄视图。
+
+    入参：`monkeypatch` 注入 fake probe 和进程扫描。
+    返回：无返回值；断言通过代表兼容入口只返回 N4 Pro 相关设备。
+    错误处理：JSON 字段或过滤逻辑不符合预期时由 pytest 报告。
+    副作用：只运行 Typer in-process；不访问真实硬件或真实进程表。
+    """
+
+    monkeypatch.setattr(
+        cli,
+        "probe_streamdock_devices",
+        lambda: [
+            ProbeResult(
+                device_type="StreamDockBiz",
+                path="biz",
+                can_open=True,
+                can_init=False,
+            ),
+            ProbeResult(
+                device_type="StreamDockN4Pro",
+                path="n4pro",
+                can_open=True,
+                can_init=False,
+            ),
+        ],
+    )
+    monkeypatch.setattr(cli, "_scan_hardware_occupants", lambda: [])
+
+    result = runner.invoke(cli.ctl_app, ["hardware", "n4pro", "status", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["splash_command"] == "agent-deckctl hardware n4pro splash"
+    assert payload["visible_layer_api"] == "set_touchscreen_image"
+    assert payload["can_rewrite_splash"] is True
+    assert len(payload["n4pro_devices"]) == 1
+    assert payload["n4pro_devices"][0]["profile"] == "mirabox.n4pro"
+    assert payload["n4pro_devices"][0]["device_type"] == "StreamDockN4Pro"
+    assert payload["warnings"] == []
+
+
 def test_scan_hardware_occupants_parses_ps_output(monkeypatch: Any) -> None:
     """验证疑似硬件占用进程扫描能解析 ps 输出。
 
@@ -310,6 +497,59 @@ def test_scan_hardware_occupants_parses_ps_output(monkeypatch: Any) -> None:
             "command": "/usr/bin/python -m agent_deckd",
             "matched_pattern": "agent-deckd",
         },
+    ]
+
+
+def test_scan_hardware_occupants_ignores_agent_deckctl_wrapper(
+    monkeypatch: Any,
+) -> None:
+    """验证当前 agent-deckctl 诊断包装命令不会被误判为硬件占用。
+
+    入参：`monkeypatch` 替换 `subprocess.run` 和当前进程 pid。
+    返回：无返回值；断言通过代表 `uv run agent-deckctl ... streamdock ...` 不产生假阳性。
+    错误处理：scanner 误报时由 pytest 报告。
+    副作用：无真实 subprocess 调用。
+    """
+
+    class Completed:
+        """提供包含 agent-deckctl wrapper 的 ps 输出。
+
+        入参：无。
+        返回：fake completed process 实例。
+        错误处理：构造过程不抛异常。
+        副作用：只保存 stdout 字符串。
+        """
+
+        stdout = "\n".join(
+            [
+                "  20   1 uv run agent-deckctl hardware n4pro status --json",
+                "  21   1 /Applications/StreamDock.app/Contents/MacOS/StreamDock",
+            ]
+        )
+
+    def fake_run(*_args: Any, **_kwargs: Any) -> Completed:
+        """返回固定 ps 输出。
+
+        入参：忽略 subprocess.run 参数。
+        返回：包含固定 stdout 的 fake completed process。
+        错误处理：不模拟失败。
+        副作用：无。
+        """
+
+        return Completed()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli.os, "getpid", lambda: 999)
+
+    occupants = cli._scan_hardware_occupants()
+
+    assert occupants == [
+        {
+            "pid": 21,
+            "ppid": 1,
+            "command": "/Applications/StreamDock.app/Contents/MacOS/StreamDock",
+            "matched_pattern": "streamdock",
+        }
     ]
 
 

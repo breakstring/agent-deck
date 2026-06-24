@@ -118,6 +118,11 @@ flowchart LR
 
 12. N4 Pro renderer
     根据 DeckMode 生成 slot icons、详情屏、决策界面、LED 聚合状态。
+
+13. Hardware ops
+    提供 `agent-deckctl hardware status` 通用只读诊断，并把 N4 Pro 默认图重写收敛到
+    `agent-deckctl hardware n4pro splash` 这类设备专属动作。通用诊断应报告硬件族、
+    已识别设备、占用进程和可用运维命令；具体写屏、重置、亮度等动作再放到对应设备子命令。
     当前 daemon 默认执行真实硬件渲染，`agent-deck.toml` 的默认 device profile 是 `n4pro`：
     内部 N4 Pro renderer 从 runtime layout
     读取前 10 个 Codex agent slot 的 `VisualIconSpec.variant_id`，加载

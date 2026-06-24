@@ -47,9 +47,14 @@ from agent_deck.core.decisions import DecisionBehavior
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
 from agent_deck.hardware.streamdock_probe import probe_streamdock_devices
 from agent_deck.hardware.streamdock_n4pro import animate_key_images_on_n4pro
+from agent_deck.hardware.streamdock_touchscreen import (
+    StreamDockTouchscreenRenderResult,
+    render_dual_device_touchscreen_image_to_n4pro,
+)
 from agent_deck.hosts.codex import CodexHostResolver
 from agent_deck.hosts.models import AgentHostContext
 from agent_deck.rendering.asset_builder import build_codex_visual_assets
+from agent_deck.rendering.brand import render_agent_deck_splash_touchscreen
 from agent_deck.rendering.codex_key_frames import (
     codex_key_frame_paths_for_variants,
 )
@@ -87,6 +92,19 @@ ctl_app = typer.Typer(
     help="Control a running Agent Deck daemon.",
     no_args_is_help=True,
 )
+
+hardware_app = typer.Typer(
+    help="Operate and diagnose local hardware integrations.",
+    no_args_is_help=True,
+)
+
+n4pro_app = typer.Typer(
+    help="Operate and diagnose Mirabox StreamDock N4 Pro hardware.",
+    no_args_is_help=True,
+)
+
+ctl_app.add_typer(hardware_app, name="hardware")
+hardware_app.add_typer(n4pro_app, name="n4pro")
 
 #: Typer app for Codex hook helper commands. It reads hook payloads from stdin
 #: but never installs hooks or edits user configuration.
@@ -368,6 +386,110 @@ def doctor(
         _echo_json(report)
         return
     _echo_doctor_report(report)
+
+
+@hardware_app.command("status")
+def hardware_status(
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print machine-readable JSON.",
+        ),
+    ] = False,
+    skip_streamdock_probe: Annotated[
+        bool,
+        typer.Option(
+            "--skip-streamdock-probe",
+            help="Skip the safe read-only StreamDock SDK probe.",
+        ),
+    ] = False,
+) -> None:
+    """输出本机硬件接管诊断，不绑定具体设备型号。
+
+    入参：`json_output` 控制输出 JSON；`skip_streamdock_probe` 跳过 StreamDock 安全探针。
+    返回：无显式返回值；stdout 输出所有已识别硬件族、设备和可用运维命令。
+    错误处理：沿用 doctor report 的收敛策略，SDK 或进程扫描失败只进入 warnings。
+    副作用：默认只执行安全 StreamDock 只读 probe 和进程表扫描；不会 init 设备或写屏。
+    """
+
+    report = _build_hardware_status_report(
+        skip_streamdock_probe=skip_streamdock_probe,
+    )
+    if json_output:
+        _echo_json(report)
+        return
+    _echo_hardware_status_report(report)
+
+
+@n4pro_app.command("splash")
+def n4pro_splash(
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print machine-readable JSON.",
+        ),
+    ] = False,
+) -> None:
+    """把 Agent Deck 默认图写入 N4 Pro 可见触屏层。
+
+    入参：`json_output` 控制输出 JSON 还是简短人类可读摘要。
+    返回：无显式返回值；成功时 stdout 输出写屏结果。
+    错误处理：渲染或 SDK 写屏异常写 stderr 并以 exit 1 退出；SDK 返回失败结果时
+    仍输出结构化 payload，再以 exit 1 退出。
+    副作用：会调用真实 N4 Pro dual-device `set_touchscreen_image` 路径，用于手动覆盖
+    daemon 退出后残留的 quota 或旧触屏层内容。
+    """
+
+    try:
+        image = render_agent_deck_splash_touchscreen()
+        result = render_dual_device_touchscreen_image_to_n4pro(image)
+    except Exception as exc:
+        typer.echo(f"agent-deckctl hardware n4pro splash: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    payload = _build_n4pro_splash_payload(result, image_size=list(image.size))
+    if json_output:
+        _echo_json(payload)
+    else:
+        _echo_n4pro_splash_result(payload)
+    if not result.ok:
+        raise typer.Exit(1)
+
+
+@n4pro_app.command("status")
+def n4pro_status(
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print machine-readable JSON.",
+        ),
+    ] = False,
+    skip_streamdock_probe: Annotated[
+        bool,
+        typer.Option(
+            "--skip-streamdock-probe",
+            help="Skip the safe read-only StreamDock SDK probe.",
+        ),
+    ] = False,
+) -> None:
+    """输出 N4 Pro 窄视图诊断，不修改硬件。
+
+    入参：`json_output` 控制输出 JSON；`skip_streamdock_probe` 跳过 StreamDock 安全探针。
+    返回：无显式返回值；stdout 输出从通用硬件诊断中过滤出的 N4 Pro 摘要。
+    错误处理：沿用 doctor report 的收敛策略，SDK 或进程扫描失败只进入 warnings。
+    副作用：默认只执行安全 StreamDock 只读 probe 和进程表扫描；不会 init 设备或写屏。
+    """
+
+    hardware_report = _build_hardware_status_report(
+        skip_streamdock_probe=skip_streamdock_probe,
+    )
+    report = _build_n4pro_status_report(hardware_report)
+    if json_output:
+        _echo_json(report)
+        return
+    _echo_n4pro_status_report(report)
 
 
 @ctl_app.command()
@@ -1025,6 +1147,189 @@ def _build_doctor_report(*, skip_streamdock_probe: bool = False) -> dict[str, An
     }
 
 
+def _build_n4pro_splash_payload(
+    result: StreamDockTouchscreenRenderResult,
+    *,
+    image_size: list[int],
+) -> dict[str, Any]:
+    """把 N4 Pro 默认图写屏结果转换成 CLI JSON payload。
+
+    入参：`result` 是真实 sink 返回的 Pydantic 结果；`image_size` 是本次下发图片尺寸。
+    返回：JSON-safe dict，包含命令语义、目标 API、图片尺寸和 SDK 结果。
+    错误处理：模型序列化错误由 Pydantic 或运行时传播给调用方。
+    副作用：无；只处理内存对象。
+    """
+
+    return {
+        "ok": result.ok,
+        "command": "hardware n4pro splash",
+        "target": "streamdock:n4pro:visible-touchscreen",
+        "image_size": image_size,
+        "visible_layer_api": "set_touchscreen_image",
+        "result": result.model_dump(mode="json"),
+    }
+
+
+def _build_hardware_status_report(
+    *,
+    skip_streamdock_probe: bool = False,
+) -> dict[str, Any]:
+    """构建通用硬件运维诊断报告，不写硬件。
+
+    入参：`skip_streamdock_probe` 为 True 时不运行 StreamDock 只读 probe。
+    返回：JSON-safe dict，包含硬件族、已识别设备、设备能力和可用运维命令。
+    错误处理：复用 `_build_doctor_report` 的异常收敛策略。
+    副作用：可能读取环境变量、执行安全只读 probe 和运行 `ps`。
+    """
+
+    doctor_report = _build_doctor_report(skip_streamdock_probe=skip_streamdock_probe)
+    devices = doctor_report.get("streamdock_devices")
+    if not isinstance(devices, list):
+        devices = []
+    hardware_devices = [_hardware_device_status(device) for device in devices]
+    warnings = list(doctor_report.get("warnings", []))
+    return {
+        "version": __version__,
+        "streamdock_sdk_path_env": _STREAMDOCK_SDK_PATH_ENV,
+        "streamdock_sdk_path": doctor_report.get("streamdock_sdk_path"),
+        "streamdock_probe_skipped": doctor_report.get("streamdock_probe_skipped"),
+        "streamdock_probe_error": doctor_report.get("streamdock_probe_error"),
+        "hardware_families": [
+            {
+                "family": "streamdock",
+                "status": _hardware_family_status(
+                    probe_error=doctor_report.get("streamdock_probe_error"),
+                    probe_skipped=bool(doctor_report.get("streamdock_probe_skipped")),
+                    device_count=len(devices),
+                ),
+                "device_count": len(devices),
+            }
+        ],
+        "hardware_devices": hardware_devices,
+        "hardware_occupants": doctor_report.get("hardware_occupants", []),
+        "commands": {
+            "streamdock:n4pro:splash": "agent-deckctl hardware n4pro splash",
+        },
+        "warnings": warnings,
+    }
+
+
+def _build_n4pro_status_report(hardware_report: dict[str, Any]) -> dict[str, Any]:
+    """从通用硬件报告构建 N4 Pro 窄视图。
+
+    入参：`hardware_report` 是 `_build_hardware_status_report` 的返回值。
+    返回：JSON-safe dict，聚焦 N4 Pro 设备、默认图重写命令和疑似占用进程。
+    错误处理：缺失字段时按空列表或 None 降级。
+    副作用：无；只处理内存 dict。
+    """
+
+    devices = hardware_report.get("hardware_devices")
+    if not isinstance(devices, list):
+        devices = []
+    n4pro_devices = [
+        device
+        for device in devices
+        if isinstance(device, dict) and device.get("profile") == "mirabox.n4pro"
+    ]
+    warnings = list(hardware_report.get("warnings", []))
+    if not n4pro_devices and not hardware_report.get("streamdock_probe_skipped"):
+        warnings.append("未发现 N4 Pro；无法确认默认图重写命令是否有目标设备")
+    if any(device.get("can_open") is False for device in n4pro_devices):
+        warnings.append("至少一个 N4 Pro 无法 open；默认图重写可能会失败")
+    can_rewrite_splash = any(
+        bool(device.get("can_rewrite_splash")) for device in n4pro_devices
+    )
+    return {
+        "version": hardware_report.get("version", __version__),
+        "streamdock_sdk_path_env": hardware_report.get(
+            "streamdock_sdk_path_env",
+            _STREAMDOCK_SDK_PATH_ENV,
+        ),
+        "streamdock_sdk_path": hardware_report.get("streamdock_sdk_path"),
+        "streamdock_probe_skipped": hardware_report.get("streamdock_probe_skipped"),
+        "streamdock_probe_error": hardware_report.get("streamdock_probe_error"),
+        "n4pro_devices": n4pro_devices,
+        "hardware_occupants": hardware_report.get("hardware_occupants", []),
+        "visible_layer_api": "set_touchscreen_image",
+        "splash_image_size": [800, 480],
+        "splash_command": "agent-deckctl hardware n4pro splash",
+        "can_rewrite_splash": can_rewrite_splash,
+        "warnings": warnings,
+    }
+
+
+def _hardware_device_status(device: dict[str, Any]) -> dict[str, Any]:
+    """把 StreamDock probe device 转换成通用硬件设备状态。
+
+    入参：`device` 是 `ProbeResult.model_dump()` 得到的 StreamDock 设备 dict。
+    返回：JSON-safe 设备状态，包含硬件族、profile、原始 probe 字段和支持的命令。
+    错误处理：未知设备类型按 `streamdock.unknown` profile 降级。
+    副作用：无。
+    """
+
+    is_n4pro = _is_n4pro_probe_device(device)
+    supported_commands: list[str] = []
+    supported_actions: list[str] = []
+    can_rewrite_splash = False
+    if is_n4pro:
+        supported_commands.append("agent-deckctl hardware n4pro splash")
+        supported_actions.append("visible_touchscreen_splash")
+        can_rewrite_splash = device.get("can_open") is True
+    return {
+        **device,
+        "family": "streamdock",
+        "profile": "mirabox.n4pro" if is_n4pro else "streamdock.unknown",
+        "can_rewrite_splash": can_rewrite_splash,
+        "supported_actions": supported_actions,
+        "supported_commands": supported_commands,
+    }
+
+
+def _hardware_family_status(
+    *,
+    probe_error: object,
+    probe_skipped: bool,
+    device_count: int,
+) -> str:
+    """返回硬件族探针状态。
+
+    入参：`probe_error` 是探针错误；`probe_skipped` 表示是否跳过；`device_count`
+    是该族已发现设备数量。
+    返回：`skipped`、`error`、`available` 或 `not_found`。
+    错误处理：无。
+    副作用：无。
+    """
+
+    if probe_skipped:
+        return "skipped"
+    if probe_error:
+        return "error"
+    if device_count > 0:
+        return "available"
+    return "not_found"
+
+
+def _is_n4pro_probe_device(device: object) -> bool:
+    """判断一个 probe device dict 是否代表 N4 Pro。
+
+    入参：`device` 是 `ProbeResult.model_dump()` 得到的 dict 或未知对象。
+    返回：device_type 归一化后包含 `n4pro` 时返回 True。
+    错误处理：非 dict 或缺字段返回 False。
+    副作用：无。
+    """
+
+    if not isinstance(device, dict):
+        return False
+    device_type = str(device.get("device_type", ""))
+    normalized = (
+        device_type.lower()
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", "")
+    )
+    return "n4pro" in normalized
+
+
 def _scan_hardware_occupants() -> list[dict[str, Any]]:
     """扫描疑似会占用 StreamDock/N4 Pro HID 的本机进程。
 
@@ -1097,12 +1402,14 @@ def _hardware_occupant_pattern(command: str) -> str | None:
     """判断进程命令行是否命中已知硬件占用线索。
 
     入参：`command` 是进程完整命令行。
-    返回：首个命中的小写 pattern；无命中时返回 None。
+    返回：首个命中的小写 pattern；无命中或只是 `agent-deckctl` 诊断命令时返回 None。
     错误处理：本函数不抛业务异常。
     副作用：无；只做字符串匹配。
     """
 
     normalized = command.lower()
+    if "agent-deckctl" in normalized:
+        return None
     for pattern in _HARDWARE_OCCUPANT_PATTERNS:
         if pattern in normalized:
             if pattern == "agent_deckd":
@@ -1148,6 +1455,152 @@ def _echo_doctor_report(report: dict[str, Any]) -> None:
             )
             if device.get("error"):
                 typer.echo(f"     error={device['error']}")
+
+    occupants = report.get("hardware_occupants")
+    if not isinstance(occupants, list):
+        occupants = []
+    typer.echo(f"Hardware occupant processes: {len(occupants)}")
+    for process in occupants:
+        typer.echo(
+            "  "
+            f"pid={process.get('pid')} "
+            f"match={process.get('matched_pattern')} "
+            f"cmd={process.get('command')}"
+        )
+
+    warnings = report.get("warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    if warnings:
+        typer.echo("Warnings:")
+        for warning in warnings:
+            typer.echo(f"  - {warning}")
+    else:
+        typer.echo("Warnings: none")
+
+
+def _echo_n4pro_splash_result(payload: dict[str, Any]) -> None:
+    """把 N4 Pro 默认图写屏结果格式化为简短文本。
+
+    入参：`payload` 是 `_build_n4pro_splash_payload` 的返回值。
+    返回：无显式返回值；stdout 输出一组 key=value 摘要。
+    错误处理：缺失字段时使用 unknown 降级输出。
+    副作用：向 stdout 写入文本。
+    """
+
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        result = {}
+    typer.echo(
+        "N4 Pro splash: "
+        f"ok={_yes_no(payload.get('ok'))} "
+        f"api={payload.get('visible_layer_api', 'unknown')} "
+        f"device={result.get('device_type') or 'unknown'} "
+        f"path={result.get('path') or ''}"
+    )
+    if result.get("error"):
+        typer.echo(f"error={result['error']}")
+
+
+def _echo_hardware_status_report(report: dict[str, Any]) -> None:
+    """把通用硬件诊断报告格式化为人类可读文本。
+
+    入参：`report` 是 `_build_hardware_status_report` 返回的 dict。
+    返回：无显式返回值；stdout 输出硬件族、设备、可用命令和 warning 摘要。
+    错误处理：缺失字段时使用默认空值降级输出。
+    副作用：向 stdout 写入文本。
+    """
+
+    typer.echo(f"Agent Deck {report.get('version', 'unknown')} hardware status")
+    families = report.get("hardware_families")
+    if not isinstance(families, list):
+        families = []
+    typer.echo(f"Hardware families: {len(families)}")
+    for family in families:
+        typer.echo(
+            "  "
+            f"{family.get('family', 'unknown')} "
+            f"status={family.get('status', 'unknown')} "
+            f"devices={family.get('device_count', 0)}"
+        )
+
+    devices = report.get("hardware_devices")
+    if not isinstance(devices, list):
+        devices = []
+    typer.echo(f"Hardware devices: {len(devices)}")
+    for index, device in enumerate(devices, start=1):
+        typer.echo(
+            "  "
+            f"{index}. {device.get('profile', 'unknown')} "
+            f"type={device.get('device_type', 'unknown')} "
+            f"open={_yes_no(device.get('can_open'))} "
+            f"path={device.get('path', '')}"
+        )
+        commands = device.get("supported_commands")
+        if isinstance(commands, list) and commands:
+            typer.echo(f"     commands={'; '.join(str(command) for command in commands)}")
+
+    occupants = report.get("hardware_occupants")
+    if not isinstance(occupants, list):
+        occupants = []
+    typer.echo(f"Hardware occupant processes: {len(occupants)}")
+    for process in occupants:
+        typer.echo(
+            "  "
+            f"pid={process.get('pid')} "
+            f"match={process.get('matched_pattern')} "
+            f"cmd={process.get('command')}"
+        )
+
+    warnings = report.get("warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+    if warnings:
+        typer.echo("Warnings:")
+        for warning in warnings:
+            typer.echo(f"  - {warning}")
+    else:
+        typer.echo("Warnings: none")
+
+
+def _echo_n4pro_status_report(report: dict[str, Any]) -> None:
+    """把 N4 Pro 运维诊断报告格式化为人类可读文本。
+
+    入参：`report` 是 `_build_n4pro_status_report` 返回的 dict。
+    返回：无显式返回值；stdout 输出多行诊断摘要。
+    错误处理：缺失字段时使用默认空值降级输出。
+    副作用：向 stdout 写入文本。
+    """
+
+    typer.echo(f"Agent Deck {report.get('version', 'unknown')} N4 Pro status")
+    typer.echo(f"Splash command: {report.get('splash_command', '')}")
+    typer.echo(f"Visible layer API: {report.get('visible_layer_api', 'unknown')}")
+    typer.echo(f"Can rewrite splash: {_yes_no(report.get('can_rewrite_splash'))}")
+    sdk_path = report.get("streamdock_sdk_path")
+    if sdk_path:
+        typer.echo(f"StreamDock SDK: {sdk_path}")
+    else:
+        typer.echo(
+            f"StreamDock SDK: unset ({report.get('streamdock_sdk_path_env', _STREAMDOCK_SDK_PATH_ENV)})"
+        )
+
+    devices = report.get("n4pro_devices")
+    if not isinstance(devices, list):
+        devices = []
+    if report.get("streamdock_probe_skipped"):
+        typer.echo("N4 Pro probe: skipped")
+    elif report.get("streamdock_probe_error"):
+        typer.echo(f"N4 Pro probe: error: {report['streamdock_probe_error']}")
+    else:
+        typer.echo(f"N4 Pro devices: {len(devices)}")
+        for index, device in enumerate(devices, start=1):
+            typer.echo(
+                "  "
+                f"{index}. {device.get('device_type', 'unknown')} "
+                f"open={_yes_no(device.get('can_open'))} "
+                f"init={_yes_no(device.get('can_init'))} "
+                f"path={device.get('path', '')}"
+            )
 
     occupants = report.get("hardware_occupants")
     if not isinstance(occupants, list):
