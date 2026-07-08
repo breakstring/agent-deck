@@ -23,6 +23,10 @@ DEFAULT_APP_ROOTS = (
     Path("/System/Applications"),
     Path("/System/Applications/Utilities"),
 )
+DEFAULT_APP_BUNDLES = (
+    Path("/System/Library/CoreServices/Finder.app"),
+)
+"""不会稳定出现在常规应用目录扫描中的系统核心 App。"""
 
 
 class LocalAppInfo(BaseModel):
@@ -65,19 +69,37 @@ class LocalAppActionResult(BaseModel):
 def list_local_apps(
     *,
     roots: Iterable[Path] = DEFAULT_APP_ROOTS,
+    app_bundles: Iterable[Path] = DEFAULT_APP_BUNDLES,
     limit: int = 120,
+    include_icon_data_url: bool = False,
 ) -> tuple[LocalAppInfo, ...]:
     """扫描本机应用目录并返回可配置 App 列表。
 
-    入参：`roots` 是允许扫描的应用目录；`limit` 控制最多返回多少个 App。
+    入参：`roots` 是允许扫描的应用目录；`app_bundles` 是额外显式纳入的系统 App；
+    `limit` 控制最多返回多少个 App；`include_icon_data_url` 只供兼容或测试使用，正式 GUI
+    应优先消费 App icon cache URL。
     返回：按名称排序的 `LocalAppInfo` tuple。
     错误处理：不可读目录、坏 plist 或坏图标会跳过对应项，不让 catalog API 失败。
     副作用：只读访问指定目录下 `.app` bundle 和图标文件；不启动 App、不访问网络。
     """
 
     apps: dict[str, LocalAppInfo] = {}
+    for app_path in app_bundles:
+        info = _read_app_info(
+            app_path.expanduser(),
+            include_icon_data_url=include_icon_data_url,
+        )
+        if info is None:
+            continue
+        key = info.bundle_id or info.app_path
+        apps.setdefault(key, info)
+        if len(apps) >= limit:
+            return tuple(sorted(apps.values(), key=lambda app: app.name.casefold()))
     for app_path in _iter_app_bundles(roots):
-        info = _read_app_info(app_path)
+        info = _read_app_info(
+            app_path,
+            include_icon_data_url=include_icon_data_url,
+        )
         if info is None:
             continue
         key = info.bundle_id or info.app_path
@@ -111,6 +133,25 @@ def load_local_app_icon(
     if icon_path is None:
         return None
     return load_image_icon(icon_path, max_size=max_size)
+
+
+def resolve_local_app_icon_path(app_path: str | Path) -> Path | None:
+    """解析 `.app` bundle 中声明的图标文件路径。
+
+    入参：`app_path` 是 `.app` bundle 路径。
+    返回：存在的图标文件路径；缺少 plist、缺少图标或文件不存在时返回 None。
+    错误处理：读取或解析 plist 失败返回 None。
+    副作用：只读访问 bundle 内 `Info.plist` 和 Resources 目录。
+    """
+
+    bundle_path = Path(app_path).expanduser()
+    plist_path = bundle_path / "Contents" / "Info.plist"
+    try:
+        with plist_path.open("rb") as handle:
+            info = plistlib.load(handle)
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    return _icon_path(info, bundle_path)
 
 
 def load_image_icon(
@@ -235,7 +276,11 @@ def _iter_app_bundles(roots: Iterable[Path]) -> Iterable[Path]:
                     yield child
 
 
-def _read_app_info(app_path: Path) -> LocalAppInfo | None:
+def _read_app_info(
+    app_path: Path,
+    *,
+    include_icon_data_url: bool = False,
+) -> LocalAppInfo | None:
     """读取一个 `.app` bundle 的基础信息。
 
     入参：`app_path` 是 `.app` bundle 路径。
@@ -253,7 +298,7 @@ def _read_app_info(app_path: Path) -> LocalAppInfo | None:
     name = _app_name(info, app_path)
     if not name:
         return None
-    icon_path = _icon_path(info, app_path)
+    icon_path = _icon_path(info, app_path) if include_icon_data_url else None
     return LocalAppInfo(
         name=name,
         app_path=str(app_path),

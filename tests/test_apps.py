@@ -31,7 +31,12 @@ def test_list_local_apps_reads_bundle_metadata_and_icon(tmp_path: Path) -> None:
         bundle_id="com.apple.finder",
     )
 
-    apps = list_local_apps(roots=(tmp_path,), limit=10)
+    apps = list_local_apps(
+        roots=(tmp_path,),
+        app_bundles=(),
+        limit=10,
+        include_icon_data_url=True,
+    )
 
     assert len(apps) == 1
     assert apps[0].name == "Finder"
@@ -40,6 +45,28 @@ def test_list_local_apps_reads_bundle_metadata_and_icon(tmp_path: Path) -> None:
     assert apps[0].icon_token == "FI"
     assert apps[0].icon_data_url is not None
     assert apps[0].icon_data_url.startswith("data:image/png;base64,")
+
+
+def test_list_local_apps_includes_explicit_system_bundles_before_limit(
+    tmp_path: Path,
+) -> None:
+    """App catalog 应优先纳入 Finder 这类不在常规目录里的系统 App。
+
+    入参：`tmp_path` 提供 fake Finder bundle 和 fake Applications root。
+    返回：无返回值；断言通过代表 limit 很小时显式系统 App 不会被常规扫描挤掉。
+    错误处理：系统 bundle 未优先纳入时由 pytest 报告。
+    副作用：只写 pytest 临时目录中的 fake bundle。
+    """
+
+    finder = _fake_app(tmp_path, name="Finder", bundle_id="com.apple.finder")
+    _fake_app(tmp_path, name="Activity Monitor", bundle_id="com.apple.ActivityMonitor")
+
+    apps = list_local_apps(roots=(tmp_path,), app_bundles=(finder,), limit=1)
+
+    assert len(apps) == 1
+    assert apps[0].name == "Finder"
+    assert apps[0].app_path == str(finder)
+    assert apps[0].icon_data_url is None
 
 
 def test_open_or_focus_local_app_uses_structured_open_args() -> None:

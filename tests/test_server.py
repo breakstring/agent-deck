@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 from PIL import Image
 
+from agent_deck.actions.app_icon_cache import AppIconCache
 from agent_deck.actions.apps import LocalAppActionResult, LocalAppInfo
 from agent_deck.actions.focus import FocusActionResult
 from agent_deck.adapters.codex_app_state import CodexAppActiveSession
@@ -89,7 +90,7 @@ def test_web_asset_route_serves_only_whitelisted_assets() -> None:
     assert missing_web_response.status_code == 404
 
 
-def test_local_apps_api_returns_injected_catalog() -> None:
+def test_local_apps_api_returns_injected_catalog(tmp_path: Path) -> None:
     """Verify GUI can fetch local App catalog from the daemon.
 
     入参：无；测试内注入 fake app catalog reader。
@@ -98,34 +99,40 @@ def test_local_apps_api_returns_injected_catalog() -> None:
     副作用：只创建 TestClient，不扫描本机应用目录。
     """
 
+    finder_app = _fake_finder_app(tmp_path)
     app = create_app(
+        app_icon_cache_path=tmp_path / "icon-cache",
         local_app_catalog_reader=lambda: (
             LocalAppInfo(
                 name="Finder",
-                app_path="/System/Library/CoreServices/Finder.app",
+                app_path=str(finder_app),
                 bundle_id="com.apple.finder",
                 icon_token="FI",
-                icon_data_url="data:image/png;base64,abc",
             ),
         )
     )
     client = TestClient(app)
 
     response = client.get("/ui/apps")
+    body = response.json()
 
     assert response.status_code == 200
-    assert response.json() == {
-        "platform": "darwin",
-        "apps": [
-            {
-                "name": "Finder",
-                "app_path": "/System/Library/CoreServices/Finder.app",
-                "bundle_id": "com.apple.finder",
-                "icon_token": "FI",
-                "icon_data_url": "data:image/png;base64,abc",
-            }
-        ],
-    }
+    assert body["platform"] == "darwin"
+    assert len(body["apps"]) == 1
+    app_payload = body["apps"][0]
+    assert app_payload["name"] == "Finder"
+    assert app_payload["app_path"] == str(finder_app)
+    assert app_payload["bundle_id"] == "com.apple.finder"
+    assert app_payload["icon_token"] == "FI"
+    assert app_payload["icon_url"] == "/ui/app-icons/com.apple.finder/icon-96.png"
+    assert app_payload["key_icon_url"] == "/ui/app-icons/com.apple.finder/key-112.png"
+    assert app_payload["icon_cache_status"] == "ready"
+    icon_response = client.get(app_payload["icon_url"])
+    assert icon_response.status_code == 200
+    assert icon_response.headers["content-type"] == "image/png"
+    refresh_response = client.post("/ui/apps/refresh-icons")
+    assert refresh_response.status_code == 200
+    assert refresh_response.json()["refreshed_count"] == 1
 
 
 def test_key_layout_api_saves_runtime_layout_and_updates_status_projection() -> None:
@@ -900,9 +907,15 @@ def test_streamdock_n4pro_key_images_include_app_bindings(tmp_path: Path) -> Non
         key_layout=key_layout,
     )
 
-    key_images = server_app._key_images_from_layout(layout)
+    app_icon_cache = AppIconCache(tmp_path / "icon-cache")
+
+    key_images = server_app._key_images_from_layout(
+        layout,
+        app_icon_cache=app_icon_cache,
+    )
 
     assert sorted(key_images) == [1]
+    assert (tmp_path / "icon-cache/com.apple.finder/key-112.png").is_file()
     image = key_images[1]
     assert getattr(image, "size") == (112, 112)
     assert getattr(image, "mode") == "RGB"

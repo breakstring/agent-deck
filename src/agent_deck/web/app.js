@@ -461,7 +461,8 @@ async function loadAppCatalog() {
       token: app.icon_token || (app.name || "App").slice(0, 2),
       path: app.app_path || "",
       bundleId: app.bundle_id || "",
-      iconUrl: app.icon_data_url || "",
+      iconUrl: app.icon_url || app.icon_data_url || "",
+      keyIconUrl: app.key_icon_url || "",
       color: "linear-gradient(135deg, #5a6572, #202832)",
     }));
   } catch (error) {

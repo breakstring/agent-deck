@@ -12,6 +12,7 @@ __pycache__/
 !.env.example
 logs/
 tmp/
+rotated_key_image_*.png
 
 # Vendored package build artifacts
 vendor/**/build/
