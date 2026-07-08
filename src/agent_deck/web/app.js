@@ -21,6 +21,7 @@ const fallbackKeys = Array.from({ length: 10 }, (_, index) => {
 const state = {
   keys: fallbackKeys,
   selectedIndex: 0,
+  appQuery: "",
   dirty: false,
   status: null,
   saving: false,
@@ -44,6 +45,8 @@ const el = {
   panelHint: document.getElementById("panelHint"),
   toast: document.getElementById("toast"),
   appModal: document.getElementById("appModal"),
+  appSearch: document.getElementById("appSearch"),
+  appCount: document.getElementById("appCount"),
   appList: document.getElementById("appList"),
   closeAppModal: document.getElementById("closeAppModal"),
 };
@@ -324,8 +327,13 @@ function renumberAgentSlots() {
 }
 
 function openAppModal() {
+  state.appQuery = "";
+  if (el.appSearch) {
+    el.appSearch.value = "";
+  }
   renderAppList();
   el.appModal.classList.add("open");
+  window.requestAnimationFrame(() => el.appSearch?.focus());
 }
 
 function closeAppModal() {
@@ -333,8 +341,25 @@ function closeAppModal() {
 }
 
 function renderAppList() {
-  el.appList.innerHTML = appChoices
-    .map((app, index) => {
+  const query = state.appQuery.trim().toLocaleLowerCase();
+  const matches = appChoices
+    .map((app, index) => ({ app, index }))
+    .filter(({ app }) => {
+      if (!query) return true;
+      return [app.name, app.path, app.bundleId]
+        .filter(Boolean)
+        .some((value) => value.toLocaleLowerCase().includes(query));
+    });
+
+  el.appCount.textContent = `${matches.length} / ${appChoices.length} 个 App`;
+
+  if (!matches.length) {
+    el.appList.innerHTML = '<div class="app-empty">没有匹配的 App</div>';
+    return;
+  }
+
+  el.appList.innerHTML = matches
+    .map(({ app, index }) => {
       const textColor = app.darkText ? "#15191f" : "#ffffff";
       const icon = app.iconUrl
         ? `<img class="app-icon app-icon-img" src="${escapeAttr(app.iconUrl)}" alt="">`
@@ -482,6 +507,10 @@ el.saveButton.addEventListener("click", saveAndApply);
 el.closeAppModal.addEventListener("click", closeAppModal);
 el.appModal.addEventListener("click", (event) => {
   if (event.target === el.appModal) closeAppModal();
+});
+el.appSearch.addEventListener("input", () => {
+  state.appQuery = el.appSearch.value;
+  renderAppList();
 });
 
 async function boot() {

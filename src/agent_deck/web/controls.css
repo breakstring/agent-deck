@@ -154,11 +154,14 @@
 
 .modal {
   width: min(520px, 100%);
+  max-height: min(720px, calc(100vh - 48px));
   border: 1px solid var(--line-strong);
   border-radius: 10px;
   background: #11151a;
   box-shadow: var(--shadow);
   overflow: hidden;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
 }
 
 .modal-head {
@@ -174,6 +177,42 @@
   font-size: 18px;
 }
 
+.modal-tools {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.app-search {
+  width: 100%;
+  min-width: 0;
+  height: 36px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.045);
+  color: var(--text);
+  padding: 0 12px;
+  outline: none;
+}
+
+.app-search:focus {
+  border-color: rgba(111, 213, 255, 0.66);
+  box-shadow: 0 0 0 2px rgba(111, 213, 255, 0.12);
+}
+
+.app-search::placeholder {
+  color: var(--quiet);
+}
+
+.app-count {
+  color: var(--quiet);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .close-button {
   width: 30px;
   height: 30px;
@@ -187,7 +226,11 @@
 .app-list {
   padding: 10px;
   display: grid;
+  align-content: start;
   gap: 6px;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .app-option {
@@ -221,6 +264,18 @@
   margin-top: 3px;
   color: var(--quiet);
   font-size: 12px;
+  max-width: 390px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-empty {
+  min-height: 92px;
+  display: grid;
+  place-items: center;
+  color: var(--quiet);
+  font-size: 13px;
 }
 
 @media (max-width: 980px) {

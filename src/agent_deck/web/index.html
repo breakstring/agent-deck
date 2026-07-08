@@ -11,7 +11,7 @@ Assumptions:
 Reasoning:
 - 用户需要先看到真实硬件布局，再理解每个键的用途。
 - 未配置快捷动作、Agent 空槽和关闭键必须在视觉上分开。
-- 当前页面仍不做持久化配置和真实 App 图标提取；这些属于后续切片。
+- 当前页面读取 daemon 提供的本机 App 目录和图标，只在点击保存并应用后写入配置。
 -->
 <html lang="zh-CN">
   <head>
@@ -89,6 +89,10 @@ Reasoning:
         <div class="modal-head">
           <h2 id="appModalTitle" class="modal-title">选择 App</h2>
           <button id="closeAppModal" class="close-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="modal-tools">
+          <input id="appSearch" class="app-search" type="search" autocomplete="off" placeholder="搜索 App" aria-label="搜索 App" />
+          <span id="appCount" class="app-count">0 个 App</span>
         </div>
         <div id="appList" class="app-list"></div>
       </div>
