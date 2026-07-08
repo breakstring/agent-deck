@@ -1,0 +1,99 @@
+<!doctype html>
+<!--
+Agent Deck N4 Pro configuration GUI prototype.
+
+Assumptions:
+- 第一版只配置 N4 Pro 的 10 个主按键。
+- N4 Pro 的 touch bar 在主键下方，4 个旋钮/LED 在 touch bar 下方横排。
+- Touch bar 只作为全局虚拟面板预览，不承载按键详情。
+- GUI 修改先停留在本地预览，点击保存并应用后写入 daemon runtime。
+
+Reasoning:
+- 用户需要先看到真实硬件布局，再理解每个键的用途。
+- 未配置快捷动作、Agent 空槽和关闭键必须在视觉上分开。
+- 当前页面仍不做持久化配置和真实 App 图标提取；这些属于后续切片。
+-->
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0b0d10" />
+    <title>Agent Deck · N4 Pro</title>
+    <link rel="stylesheet" href="/web/app.css" />
+    <link rel="stylesheet" href="/web/device.css" />
+    <link rel="stylesheet" href="/web/controls.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#mainWorkspace">跳到布局编辑器</a>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-lockup">
+          <img class="brand-mark" src="/assets/logo_command_core.png" alt="Agent Deck" width="30" height="30" fetchpriority="high" />
+          <div class="brand-name">Agent Deck</div>
+        </div>
+        <div class="device-pill" aria-live="polite">
+          <span id="deviceDot" class="status-dot"></span>
+          <span id="deviceState">N4 Pro · 检查中</span>
+        </div>
+        <div class="top-actions">
+          <span id="saveState" class="save-state">配置已保存</span>
+          <button id="saveButton" class="primary-button" type="button" disabled>保存并应用</button>
+        </div>
+      </header>
+
+      <main id="mainWorkspace" class="workspace">
+        <section class="stage" aria-label="N4 Pro 布局预览">
+          <div class="device-wrap">
+            <div class="n4-pro" data-device-profile="mirabox.n4pro">
+              <div class="device-label">N4 Pro</div>
+              <div id="keyGrid" class="key-grid"></div>
+              <div class="touchbar">
+                <img src="/assets/n4pro_splash_command_core.png" alt="Agent Deck touch bar brand panel" width="800" height="480" fetchpriority="high" />
+                <div class="touchbar-overlay">
+                  <span id="panelKind">brand</span>
+                  <span id="panelHint">global panel</span>
+                </div>
+              </div>
+              <div class="knob-strip" aria-hidden="true">
+                <div class="knob-cell"><div class="knob"></div><div class="led"></div></div>
+                <div class="knob-cell"><div class="knob"></div><div class="led"></div></div>
+                <div class="knob-cell"><div class="knob"></div><div class="led"></div></div>
+                <div class="knob-cell"><div class="knob"></div><div class="led"></div></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <aside class="inspector" aria-label="按键配置">
+          <div class="inspector-head">
+            <p id="selectedEyebrow" class="eyebrow">Key 1</p>
+            <h1 id="selectedTitle" class="inspector-title">未设置快捷动作</h1>
+            <p id="selectedSubtitle" class="inspector-subtitle">选择这个键的用途。修改只会更新预览。</p>
+          </div>
+          <div id="inspectorBody" class="inspector-body"></div>
+        </aside>
+      </main>
+
+      <footer class="bottom-bar">
+        <div class="runtime-line">
+          <span id="rendererState">renderer: unknown</span>
+          <span id="agentState">agents: 0</span>
+          <span id="panelState">panel: brand</span>
+        </div>
+        <div id="toast" class="toast" aria-live="polite"></div>
+      </footer>
+    </div>
+
+    <div id="appModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="appModalTitle">
+      <div class="modal">
+        <div class="modal-head">
+          <h2 id="appModalTitle" class="modal-title">选择 App</h2>
+          <button id="closeAppModal" class="close-button" type="button" aria-label="关闭">×</button>
+        </div>
+        <div id="appList" class="app-list"></div>
+      </div>
+    </div>
+
+    <script src="/web/app.js"></script>
+  </body>
+</html>

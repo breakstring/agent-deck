@@ -1,0 +1,348 @@
+/*
+ * Agent Deck N4 Pro 设备预览样式。
+ * 边界：只描述 mirabox.n4pro 的硬件外观、10 个主键、touch bar 和底部横排旋钮/LED。
+ */
+
+.device-wrap {
+  position: relative;
+  width: min(96%, 920px);
+  max-height: calc(100vh - 158px);
+  aspect-ratio: 1.34 / 1;
+  display: grid;
+  place-items: center;
+}
+
+.n4-pro {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border-radius: 30px;
+  background:
+    linear-gradient(145deg, #1b2027, #0a0c0f 58%, #050607),
+    #0b0d10;
+  box-shadow:
+    var(--shadow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.09),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 5.2% 5.8% 5%;
+}
+
+.n4-pro[data-device-profile="mirabox.n4pro"] {
+  --n4pro-rail-left: 6.2%;
+  --n4pro-rail-right: 7.2%;
+  --n4pro-led-color: 111, 213, 255;
+}
+
+.n4-pro::before {
+  content: "";
+  position: absolute;
+  inset: 2.4%;
+  border-radius: 24px;
+  border: 1px solid rgba(255, 255, 255, 0.045);
+  pointer-events: none;
+}
+
+.device-label {
+  position: absolute;
+  left: 6%;
+  top: 4.5%;
+  color: rgba(255, 255, 255, 0.38);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.key-grid {
+  position: absolute;
+  left: var(--n4pro-rail-left);
+  right: var(--n4pro-rail-right);
+  top: 10.8%;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 3.7%;
+}
+
+.deck-key {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: linear-gradient(150deg, #181d23, #07090b);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.09),
+    inset 0 -12px 24px rgba(0, 0, 0, 0.36),
+    0 10px 24px rgba(0, 0, 0, 0.33);
+  overflow: hidden;
+  transition:
+    transform 160ms ease,
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    background 160ms ease;
+}
+
+.deck-key:hover {
+  transform: translateY(-1px);
+  border-color: rgba(111, 213, 255, 0.34);
+}
+
+.deck-key.selected {
+  border-color: rgba(111, 213, 255, 0.9);
+  box-shadow:
+    0 0 0 2px rgba(111, 213, 255, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    0 14px 32px rgba(0, 0, 0, 0.42);
+}
+
+.deck-key.dirty::after {
+  content: "";
+  position: absolute;
+  right: 8%;
+  top: 8%;
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--warn);
+  box-shadow: 0 0 12px rgba(255, 200, 87, 0.72);
+}
+
+.key-inner {
+  position: absolute;
+  inset: 12%;
+  display: grid;
+  place-items: center;
+}
+
+.unassigned-mark {
+  width: 46%;
+  aspect-ratio: 1;
+  display: grid;
+  place-items: center;
+  color: rgba(238, 243, 246, 0.34);
+  font-size: clamp(20px, 3.1vw, 34px);
+  line-height: 1;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.app-icon {
+  width: 72%;
+  height: 72%;
+  display: grid;
+  place-items: center;
+  border-radius: 16%;
+  color: white;
+  font-weight: 760;
+  font-size: clamp(18px, 2.5vw, 29px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    0 10px 26px rgba(0, 0, 0, 0.36);
+}
+
+.folder-icon {
+  width: 70%;
+  height: 52%;
+  border-radius: 5px;
+  background: linear-gradient(180deg, #71b4ff, #2f6fb8);
+  position: relative;
+  box-shadow: 0 12px 24px rgba(0, 0, 0, 0.34);
+}
+
+.folder-icon::before {
+  content: "";
+  position: absolute;
+  width: 42%;
+  height: 22%;
+  left: 0;
+  top: -16%;
+  border-radius: 5px 5px 0 0;
+  background: #8bc6ff;
+}
+
+.url-icon {
+  width: 68%;
+  height: 68%;
+  border-radius: 50%;
+  border: 2px solid rgba(111, 213, 255, 0.76);
+  display: grid;
+  place-items: center;
+  color: var(--accent);
+  font-weight: 760;
+}
+
+.agent-visual {
+  width: 72%;
+  height: 72%;
+  border-radius: 50%;
+  position: relative;
+  display: grid;
+  place-items: center;
+  background: radial-gradient(circle, rgba(111, 213, 255, 0.32), rgba(111, 213, 255, 0.04) 62%, transparent 63%);
+}
+
+.agent-visual::before,
+.agent-visual::after {
+  content: "";
+  position: absolute;
+  border-radius: 50%;
+  border: 1px solid rgba(111, 213, 255, 0.68);
+}
+
+.agent-visual::before {
+  inset: 18%;
+}
+
+.agent-visual::after {
+  inset: 34%;
+  background: rgba(111, 213, 255, 0.8);
+  box-shadow: 0 0 22px rgba(111, 213, 255, 0.7);
+}
+
+.agent-visual.empty {
+  opacity: 0.32;
+  background: radial-gradient(circle, rgba(255, 255, 255, 0.08), transparent 64%);
+}
+
+.agent-visual.needs-user {
+  background: radial-gradient(circle, rgba(255, 200, 87, 0.36), rgba(255, 200, 87, 0.04) 62%, transparent 63%);
+}
+
+.agent-visual.needs-user::before {
+  border-color: rgba(255, 200, 87, 0.85);
+}
+
+.agent-visual.needs-user::after {
+  background: var(--warn);
+  box-shadow: 0 0 24px rgba(255, 200, 87, 0.75);
+}
+
+.agent-visual.error {
+  background: radial-gradient(circle, rgba(255, 107, 107, 0.34), rgba(255, 107, 107, 0.04) 62%, transparent 63%);
+}
+
+.agent-visual.error::before {
+  border-color: rgba(255, 107, 107, 0.86);
+}
+
+.agent-visual.error::after {
+  background: var(--error);
+  box-shadow: 0 0 24px rgba(255, 107, 107, 0.75);
+}
+
+.agent-visual.completed {
+  background: radial-gradient(circle, rgba(123, 216, 143, 0.34), rgba(123, 216, 143, 0.04) 62%, transparent 63%);
+}
+
+.agent-visual.completed::before {
+  border-color: rgba(123, 216, 143, 0.82);
+}
+
+.agent-visual.completed::after {
+  background: var(--accent-2);
+  box-shadow: 0 0 24px rgba(123, 216, 143, 0.7);
+}
+
+.disabled-key {
+  width: 72%;
+  height: 72%;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.38);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.035);
+}
+
+.knob {
+  position: relative;
+  z-index: 1;
+  width: 58px;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 38% 34%, rgba(255, 255, 255, 0.2), transparent 21%),
+    radial-gradient(circle, #262e38 0%, #11161c 62%, #050607 100%);
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    0 12px 22px rgba(0, 0, 0, 0.42);
+  opacity: 0.72;
+}
+
+.led {
+  position: absolute;
+  z-index: 0;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 82px;
+  max-width: 76%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle, transparent 0 48%, rgba(var(--n4pro-led-color), 0.62) 49% 56%, rgba(var(--n4pro-led-color), 0.2) 57% 68%, transparent 69%),
+    radial-gradient(circle, rgba(var(--n4pro-led-color), 0.2), transparent 72%);
+  box-shadow:
+    0 0 0 1px rgba(var(--n4pro-led-color), 0.18),
+    0 0 14px rgba(var(--n4pro-led-color), 0.48),
+    0 0 34px rgba(var(--n4pro-led-color), 0.34);
+  opacity: 0.9;
+  pointer-events: none;
+}
+
+.touchbar {
+  position: absolute;
+  left: var(--n4pro-rail-left);
+  right: var(--n4pro-rail-right);
+  top: 55%;
+  height: 17.5%;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #080a0d;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 18px 38px rgba(0, 0, 0, 0.35);
+}
+
+.touchbar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0.94;
+}
+
+.touchbar-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  padding: 11px 16px;
+  background: linear-gradient(180deg, transparent 20%, rgba(0, 0, 0, 0.28));
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 12px;
+}
+
+.knob-strip {
+  position: absolute;
+  left: var(--n4pro-rail-left);
+  right: var(--n4pro-rail-right);
+  bottom: 7.5%;
+  height: 15%;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4%;
+  align-items: center;
+}
+
+.knob-cell {
+  position: relative;
+  display: grid;
+  align-items: center;
+  justify-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+}

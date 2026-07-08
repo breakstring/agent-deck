@@ -9,12 +9,17 @@ I/O; callers can pass the returned frozen models to any later renderer.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from typing import TYPE_CHECKING
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from agent_deck.core.decisions import DecisionStatus, PendingDecision
 from agent_deck.core.modes import DeckMode, DeckSelection
 from agent_deck.core.state import AgentState, AgentStatus
 from agent_deck.rendering.visuals import VisualIconSpec, resolve_visual_icon_spec
+
+if TYPE_CHECKING:
+    from agent_deck.rendering.key_surface import N4ProKeyLayout
 
 _KEY_COUNT = 15
 _AGENT_SLOT_COUNT = 10
@@ -35,7 +40,8 @@ class KeyPlan(BaseModel):
 
     入参：`index` 是 0-14 的物理键位；`label` 是短文本标签；`status` 是绑定 agent
     的展示状态，可空；`visual` 是 renderer 可消费的按钮视觉规格，可空；
-    `agent_key`、`intent` 和 `decision_id` 描述按键行为上下文。
+    `agent_key`、`intent` 和 `decision_id` 描述按键行为上下文；`role`、`kind`、`action`
+    与 `payload` 是 key surface 配置投影的可选诊断/执行上下文，旧布局可留空。
     返回：frozen Pydantic model，后续 renderer 可只读消费。
     错误处理：字段类型非法由 Pydantic 校验异常报告；键位范围由调用方生成保证。
     副作用：仅保存内存数据；实例化不访问网络、硬件或文件系统。
@@ -50,6 +56,10 @@ class KeyPlan(BaseModel):
     agent_key: str | None = None
     intent: str | None = None
     decision_id: str | None = None
+    role: str | None = None
+    kind: str | None = None
+    action: str | None = None
+    payload: dict[str, str] = Field(default_factory=dict)
 
 
 class TouchscreenPlan(BaseModel):
@@ -92,11 +102,13 @@ def build_layout_plan(
     states: list[AgentState] | tuple[AgentState, ...],
     decisions: list[PendingDecision] | tuple[PendingDecision, ...],
     selection: DeckSelection,
+    key_layout: "N4ProKeyLayout | None" = None,
 ) -> LayoutPlan:
     """Build a complete hardware-neutral layout from current memory snapshots.
 
     入参：`states` 是当前 agent 状态快照；`decisions` 是 decision broker 快照；
-    `selection` 是用户选择的 mode、agent 和 decision。
+    `selection` 是用户选择的 mode、agent 和 decision；`key_layout` 是可选 N4 Pro 主按键
+    用户布局，传入时只把 Agent 投影到配置为 Agent 状态的主按键上。
     返回：包含 15 个 key、触屏文案、effective mode 和 LED 颜色的 `LayoutPlan`。
     错误处理：输入模型若已非法会由各自 Pydantic 构造阶段拦截；本函数遇到未知选择 id
     会降级到排序后的第一个可用 agent 或 pending decision，不抛业务异常。
@@ -113,7 +125,7 @@ def build_layout_plan(
     visible_states = _visible_main_button_states(states)
     sorted_states = _sort_states_for_slots(visible_states, effective_selected_agent_key)
     selected_agent = _select_agent(sorted_states, effective_selected_agent_key)
-    keys = _build_base_keys(sorted_states)
+    keys = _build_base_keys(sorted_states, key_layout=key_layout)
 
     if effective_mode == DeckMode.DECISION and pending_decision is not None:
         keys = _apply_decision_actions(keys, pending_decision)
@@ -220,16 +232,29 @@ def _select_pending_decision(
     )[0]
 
 
-def _build_base_keys(sorted_states: list[AgentState]) -> list[KeyPlan]:
+def _build_base_keys(
+    sorted_states: list[AgentState],
+    *,
+    key_layout: "N4ProKeyLayout | None" = None,
+) -> list[KeyPlan]:
     """Create 15 key plans and fill the first ten with agent slots.
 
-    入参：`sorted_states` 是按 slot 优先级排序后的 agent 状态列表。
+    入参：`sorted_states` 是按 slot 优先级排序后的 agent 状态列表；`key_layout` 是可选
+    N4 Pro 主按键布局。
     返回：长度固定为 15 的 mutable `KeyPlan` 列表，供后续 mode action 覆盖。
     错误处理：`KeyPlan` 字段校验失败会按 Pydantic 异常传播。
     副作用：无；仅创建新的内存模型列表。
     """
 
     keys = [KeyPlan(index=index) for index in range(_KEY_COUNT)]
+    if key_layout is not None:
+        from agent_deck.rendering.key_surface import project_n4pro_key_layout
+
+        keys[:_AGENT_SLOT_COUNT] = project_n4pro_key_layout(
+            key_layout,
+            sorted_states,
+        )
+        return keys
     for index, state in enumerate(sorted_states[:_AGENT_SLOT_COUNT]):
         keys[index] = KeyPlan(
             index=index,

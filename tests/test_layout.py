@@ -14,6 +14,12 @@ from agent_deck.core.decisions import DecisionStatus, PendingDecision
 from agent_deck.core.events import AgentSource
 from agent_deck.core.modes import DeckMode, DeckSelection
 from agent_deck.core.state import AgentState, AgentStatus
+from agent_deck.rendering.key_surface import (
+    KeySurfaceKind,
+    N4ProKeyBinding,
+    N4ProKeyLayout,
+    default_n4pro_key_layout,
+)
 from agent_deck.rendering.layout import build_layout_plan
 from agent_deck.rendering.visuals import VisualAgentState
 
@@ -152,6 +158,81 @@ def test_no_agents_keeps_full_key_plan_and_empty_touchscreen() -> None:
     assert plan.touchscreen.lines == ("No agents online",)
     assert plan.touchscreen.selected_agent_key is None
     assert plan.led_color == "off"
+
+
+def test_n4pro_key_layout_projects_agents_only_into_agent_slots() -> None:
+    """Verify user key layout reserves quick-action keys ahead of agent slots.
+
+    入参：无；测试内使用 N4 Pro 默认 key surface 布局和一个 running agent。
+    返回：无返回值；断言通过代表 Key 1-5 不被 Agent 抢占，Key 6 才显示 Agent 状态。
+    错误处理：key role、intent 或 agent 投影位置不符合预期时由 pytest 报告。
+    副作用：仅创建内存模型和布局计划。
+    """
+
+    agent = _state(
+        "codex:active",
+        "Active Codex",
+        AgentStatus.RUNNING_TOOL,
+        active_tool="shell",
+    )
+
+    plan = build_layout_plan(
+        [agent],
+        [],
+        DeckSelection(mode=DeckMode.OVERVIEW),
+        key_layout=default_n4pro_key_layout(),
+    )
+
+    assert plan.keys[0].kind == KeySurfaceKind.UNASSIGNED.value
+    assert plan.keys[0].role == "user_action"
+    assert plan.keys[0].intent == "show_brand_feedback"
+    assert plan.keys[0].agent_key is None
+    assert plan.keys[5].kind == KeySurfaceKind.AGENT.value
+    assert plan.keys[5].role == "agent_slot"
+    assert plan.keys[5].intent == "select_agent"
+    assert plan.keys[5].agent_key == agent.agent_key
+    assert plan.keys[5].visual is not None
+    assert plan.keys[5].visual.visual_state == VisualAgentState.WORKING
+
+
+def test_n4pro_app_binding_projects_action_payload() -> None:
+    """Verify App bindings become low-risk action keys in layout projection.
+
+    入参：无；测试内把 Key 1 配置为 App，其余主键保留默认语义。
+    返回：无返回值；断言通过代表 layout 暴露 open/focus intent 和 App payload。
+    错误处理：App key 被误投影为 agent 或缺失 payload 时由 pytest 报告。
+    副作用：仅创建内存模型和布局计划。
+    """
+
+    layout = N4ProKeyLayout(
+        keys=(
+            N4ProKeyBinding(
+                index=0,
+                kind=KeySurfaceKind.APP,
+                label="Cursor",
+                app_name="Cursor",
+                app_path="/Applications/Cursor.app",
+                icon_token="Cu",
+            ),
+            *default_n4pro_key_layout().sorted_keys()[1:],
+        )
+    )
+
+    plan = build_layout_plan(
+        [],
+        [],
+        DeckSelection(mode=DeckMode.OVERVIEW),
+        key_layout=layout,
+    )
+
+    assert plan.keys[0].kind == KeySurfaceKind.APP.value
+    assert plan.keys[0].role == "user_action"
+    assert plan.keys[0].intent == "open_or_focus_app"
+    assert plan.keys[0].action == "open_or_focus_app"
+    assert plan.keys[0].label == "Cursor"
+    assert plan.keys[0].payload["app_name"] == "Cursor"
+    assert plan.keys[0].payload["app_path"] == "/Applications/Cursor.app"
+    assert plan.keys[0].payload["icon_token"] == "Cu"
 
 
 def test_overview_hides_offline_agents_from_main_button_slots() -> None:

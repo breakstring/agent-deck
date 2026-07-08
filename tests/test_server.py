@@ -34,6 +34,137 @@ from agent_deck.hardware.streamdock_touchscreen import StreamDockTouchscreenRend
 from agent_deck.server.app import DaemonPollerConfig, create_app
 
 
+def test_web_index_serves_n4pro_layout_editor() -> None:
+    """Verify daemon root serves the local N4 Pro layout editor shell.
+
+    入参：无；测试内创建 TestClient 并读取 `/`。
+    返回：无返回值；断言通过代表本地 GUI 入口可用且不会影响 API 路由。
+    错误处理：HTTP 状态、内容类型或核心 HTML 文案缺失时由 pytest 报告。
+    副作用：只读取包内静态 HTML，不访问真实硬件、用户配置或网络。
+    """
+
+    client = TestClient(create_app())
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Agent Deck · N4 Pro" in response.text
+    assert 'data-device-profile="mirabox.n4pro"' in response.text
+    assert "keyGrid" in response.text
+    assert "knob-strip" in response.text
+
+
+def test_web_asset_route_serves_only_whitelisted_assets() -> None:
+    """Verify packaged web assets are served through a narrow allowlist.
+
+    入参：无；测试内读取允许和不允许的 `/assets/{name}`。
+    返回：无返回值；断言通过代表 GUI 所需品牌图可用，任意文件名不会被暴露。
+    错误处理：允许资源缺失或未知资源未返回 404 时由 pytest 报告。
+    副作用：只读取包内静态 PNG，不访问真实硬件、用户配置或网络。
+    """
+
+    client = TestClient(create_app())
+
+    logo_response = client.get("/assets/logo_command_core.png")
+    css_response = client.get("/web/app.css")
+    missing_response = client.get("/assets/../config.py")
+    missing_web_response = client.get("/web/../server/app.py")
+
+    assert logo_response.status_code == 200
+    assert logo_response.headers["content-type"] == "image/png"
+    assert css_response.status_code == 200
+    assert css_response.headers["content-type"].startswith("text/css")
+    assert missing_response.status_code == 404
+    assert missing_web_response.status_code == 404
+
+
+def test_key_layout_api_saves_runtime_layout_and_updates_status_projection() -> None:
+    """Verify GUI key layout API updates daemon runtime layout projection.
+
+    入参：无；测试内保存一份 N4 Pro 10 键布局，并创建一个 agent session。
+    返回：无返回值；断言通过代表 `/status` 暴露 runtime key layout，且 Agent 只进入 Agent 槽。
+    错误处理：API 状态码、布局来源或 key projection 不符合预期时由 pytest 报告。
+    副作用：只修改测试 app 内存 runtime，不写用户配置文件或访问真实硬件。
+    """
+
+    client = TestClient(create_app())
+    layout_body = {
+        "keys": [
+            {
+                "index": 0,
+                "kind": "app",
+                "label": "Cursor",
+                "app_name": "Cursor",
+                "app_path": "/Applications/Cursor.app",
+                "icon_token": "Cu",
+            },
+            {"index": 1, "kind": "unassigned"},
+            {"index": 2, "kind": "unassigned"},
+            {"index": 3, "kind": "unassigned"},
+            {"index": 4, "kind": "unassigned"},
+            {"index": 5, "kind": "agent"},
+            {"index": 6, "kind": "agent"},
+            {"index": 7, "kind": "agent"},
+            {"index": 8, "kind": "agent"},
+            {"index": 9, "kind": "agent"},
+        ]
+    }
+
+    save_response = client.put("/ui/key-layout", json=layout_body)
+    client.post("/events", json=_event("session-1").model_dump(mode="json"))
+    status = client.get("/status").json()
+
+    assert save_response.status_code == 200
+    assert save_response.json()["key_layout"]["source"] == "runtime"
+    assert status["key_layout"]["source"] == "runtime"
+    assert status["layout"]["keys"][0]["kind"] == "app"
+    assert status["layout"]["keys"][0]["intent"] == "open_or_focus_app"
+    assert status["layout"]["keys"][0]["payload"]["app_name"] == "Cursor"
+    assert status["layout"]["keys"][1]["kind"] == "unassigned"
+    assert status["layout"]["keys"][1]["intent"] == "show_brand_feedback"
+    assert status["layout"]["keys"][5]["kind"] == "agent"
+    assert status["layout"]["keys"][5]["intent"] == "select_agent"
+    assert status["layout"]["keys"][5]["agent_key"] == "codex:session-1"
+
+
+def test_key_layout_api_rejects_incomplete_or_high_risk_shape() -> None:
+    """Verify key layout API rejects incomplete or invalid action definitions.
+
+    入参：无；测试内提交缺少 App 定位字段和不完整 key 集合的布局。
+    返回：无返回值；断言通过代表校验在 handler 业务逻辑前 fail-closed。
+    错误处理：非法布局被接受时由 pytest 报告。
+    副作用：只创建测试 app，不写配置或访问硬件。
+    """
+
+    client = TestClient(create_app())
+
+    incomplete = client.put(
+        "/ui/key-layout",
+        json={"keys": [{"index": 0, "kind": "unassigned"}]},
+    )
+    bad_app = client.put(
+        "/ui/key-layout",
+        json={
+            "keys": [
+                {"index": 0, "kind": "app", "app_name": "Cursor"},
+                {"index": 1, "kind": "unassigned"},
+                {"index": 2, "kind": "unassigned"},
+                {"index": 3, "kind": "unassigned"},
+                {"index": 4, "kind": "unassigned"},
+                {"index": 5, "kind": "agent"},
+                {"index": 6, "kind": "agent"},
+                {"index": 7, "kind": "agent"},
+                {"index": 8, "kind": "agent"},
+                {"index": 9, "kind": "agent"},
+            ]
+        },
+    )
+
+    assert incomplete.status_code == 422
+    assert bad_app.status_code == 422
+
+
 def test_events_start_session_renders_status_and_layout() -> None:
     """Verify POST /events stores a session and GET /status renders it.
 

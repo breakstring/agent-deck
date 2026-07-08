@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_deck.actions.focus import FocusActionResult, focus_agent_target
@@ -63,6 +64,10 @@ from agent_deck.input.interactions import (
 )
 from agent_deck.rendering.brand import render_agent_deck_splash_touchscreen
 from agent_deck.rendering.codex_key_frames import codex_key_frame_paths_for_key_variants
+from agent_deck.rendering.key_surface import (
+    N4ProKeyLayout,
+    default_n4pro_key_layout,
+)
 from agent_deck.rendering.layout import LayoutPlan, build_layout_plan
 from agent_deck.rendering.logical_panel import (
     LogicalPanelPlan,
@@ -98,6 +103,18 @@ _RECENT_STREAMDOCK_INPUT_LIMIT = 30
 
 _RECENT_INTERACTION_LIMIT = 30
 """status 中保留多少条最近业务 interaction 诊断。"""
+
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+"""agent_deck 包根目录，用于定位随包分发的 Web GUI 和品牌资源。"""
+
+_WEB_INDEX_PATH = _PACKAGE_ROOT / "web" / "index.html"
+"""本地 daemon 根路径返回的 N4 Pro 配置 GUI 原型文件。"""
+
+_WEB_ASSET_ROOT = _PACKAGE_ROOT / "web"
+"""本地 daemon GUI 的随包 CSS/JS 资源目录。"""
+
+_ASSET_ROOT = _PACKAGE_ROOT / "assets"
+"""随包分发的 Agent Deck 品牌图和 N4 Pro splash 资源目录。"""
 
 
 class DaemonPollerConfig(BaseModel):
@@ -192,6 +209,23 @@ class LogicalPanelInputBody(BaseModel):
     event: PanelInputEvent
 
 
+class KeyLayoutResponse(BaseModel):
+    """Return the current or default N4 Pro key layout to the GUI.
+
+    入参：`device_profile` 是设备 profile 标识；`source` 描述布局来自 runtime 还是内置默认；
+    `layout` 是完整 10 键布局。
+    返回：frozen Pydantic model，可由 FastAPI 序列化。
+    错误处理：字段非法由 Pydantic 报告。
+    副作用：模型自身不读取文件、硬件或网络。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    device_profile: str
+    source: str
+    layout: N4ProKeyLayout
+
+
 @dataclass
 class _DaemonRuntime:
     """Hold all process-local daemon state used by the HTTP handlers.
@@ -234,6 +268,7 @@ class _DaemonRuntime:
     streamdock_n4pro_renderer_result: StreamDockN4ProAnimationResult | None
     streamdock_n4pro_renderer_updated_at: datetime | None
     streamdock_n4pro_renderer_last_error: str | None
+    key_layout: N4ProKeyLayout | None
 
     def apply_event(self, event: NormalizedEvent) -> dict[str, Any]:
         """Apply an event, render the latest layout, and return response data.
@@ -251,6 +286,46 @@ class _DaemonRuntime:
         return {
             "state": _dump_model(state),
             "layout": _dump_model(layout),
+            "key_layout": _dump_model(self.current_key_layout_response()),
+            "render_count": self.surface.render_count,
+        }
+
+    def current_key_layout_response(self) -> KeyLayoutResponse:
+        """返回 GUI 当前应编辑的 N4 Pro 主键布局。
+
+        入参：无。
+        返回：若 runtime 已保存用户布局则返回该布局和 `runtime` source，否则返回内置默认布局和
+        `default` source。
+        错误处理：内置默认布局构造失败会按 Pydantic 异常传播。
+        副作用：只读取 runtime 内存，不写配置、不访问硬件。
+        """
+
+        if self.key_layout is None:
+            return KeyLayoutResponse(
+                device_profile="mirabox.n4pro",
+                source="default",
+                layout=default_n4pro_key_layout(),
+            )
+        return KeyLayoutResponse(
+            device_profile="mirabox.n4pro",
+            source="runtime",
+            layout=self.key_layout,
+        )
+
+    def update_key_layout(self, layout: N4ProKeyLayout) -> dict[str, Any]:
+        """保存一份 daemon 进程内 N4 Pro 主键布局并重算当前投影。
+
+        入参：`layout` 是 FastAPI/Pydantic 已校验的 10 键布局。
+        返回：JSON-safe key layout response 和当前 layout projection。
+        错误处理：layout 校验失败在 handler 业务逻辑前返回 422；投影异常按原语义传播。
+        副作用：更新 runtime 内存布局并 render fake surface；不写用户配置文件。
+        """
+
+        self.key_layout = layout
+        rendered_layout = self.render_current()
+        return {
+            "key_layout": _dump_model(self.current_key_layout_response()),
+            "layout": _dump_model(rendered_layout),
             "render_count": self.surface.render_count,
         }
 
@@ -935,6 +1010,7 @@ class _DaemonRuntime:
             "agents": [_dump_model(state) for state in self.store.snapshot()],
             "decisions": [_dump_model(decision) for decision in self.broker.pending()],
             "layout": _dump_model(layout),
+            "key_layout": _dump_model(self.current_key_layout_response()),
             "render_count": self.surface.render_count,
             "pollers": {
                 "codex_app_state": {
@@ -1004,7 +1080,12 @@ class _DaemonRuntime:
         states = self.store.snapshot()
         self._ensure_first_agent_selected(states)
         decisions = self.broker.pending()
-        layout = build_layout_plan(states, decisions, self.selection)
+        layout = build_layout_plan(
+            states,
+            decisions,
+            self.selection,
+            key_layout=self.key_layout,
+        )
         self.surface.render(layout)
         return layout
 
@@ -1189,6 +1270,7 @@ def create_app(
         streamdock_n4pro_renderer_result=None,
         streamdock_n4pro_renderer_updated_at=None,
         streamdock_n4pro_renderer_last_error=None,
+        key_layout=None,
     )
     resolved_streamdock_n4pro_renderer_sink: StreamDockN4ProRendererSink = (
         streamdock_n4pro_renderer_sink
@@ -1308,6 +1390,84 @@ def create_app(
 
     app = FastAPI(title="Agent Deck Daemon API", lifespan=lifespan)
     app.state.runtime = runtime
+
+    @app.get("/", response_class=HTMLResponse)
+    async def get_web_index() -> HTMLResponse:
+        """Return the local N4 Pro configuration GUI shell.
+
+        入参：无。
+        返回：随包分发的单页 HTML，作为本地 daemon 的默认浏览器入口。
+        错误处理：若打包缺失 HTML 文件则返回 404，避免暴露文件系统细节。
+        副作用：只读取包内静态 HTML，不访问真实硬件、用户配置或网络。
+        """
+
+        if not _WEB_INDEX_PATH.is_file():
+            raise HTTPException(status_code=404, detail="web UI is not packaged")
+        return HTMLResponse(_WEB_INDEX_PATH.read_text(encoding="utf-8"))
+
+    @app.get("/assets/{asset_name}")
+    async def get_packaged_asset(asset_name: str) -> FileResponse:
+        """Return a whitelisted Agent Deck web asset.
+
+        入参：`asset_name` 是 URL path 中的资源名；只允许本地 GUI 需要的品牌 PNG。
+        返回：`FileResponse`，由 FastAPI/Starlette 流式读取包内文件。
+        错误处理：未知文件名、路径穿越或文件缺失返回 404。
+        副作用：只读取包内静态图片，不读取用户目录、不访问网络或硬件。
+        """
+
+        allowed_assets = {
+            "logo_command_core.png",
+            "n4pro_splash_command_core.png",
+        }
+        if asset_name not in allowed_assets:
+            raise HTTPException(status_code=404, detail="unknown asset")
+        asset_path = _ASSET_ROOT / asset_name
+        if not asset_path.is_file():
+            raise HTTPException(status_code=404, detail="asset is not packaged")
+        return FileResponse(asset_path)
+
+    @app.get("/web/{asset_name}")
+    async def get_web_asset(asset_name: str) -> FileResponse:
+        """Return a whitelisted CSS/JS asset for the local GUI.
+
+        入参：`asset_name` 是 URL path 中的资源名；只允许 `index.html` 引用的
+        `app.css`、`device.css`、`controls.css` 和 `app.js`。
+        返回：`FileResponse`，由 FastAPI/Starlette 按扩展名设置内容类型。
+        错误处理：未知文件名、路径穿越或文件缺失返回 404。
+        副作用：只读取包内静态前端资源，不读取用户目录、不访问网络或硬件。
+        """
+
+        allowed_assets = {"app.css", "device.css", "controls.css", "app.js"}
+        if asset_name not in allowed_assets:
+            raise HTTPException(status_code=404, detail="unknown web asset")
+        asset_path = _WEB_ASSET_ROOT / asset_name
+        if not asset_path.is_file():
+            raise HTTPException(status_code=404, detail="web asset is not packaged")
+        return FileResponse(asset_path)
+
+    @app.get("/ui/key-layout")
+    async def get_key_layout() -> dict[str, Any]:
+        """Return the N4 Pro key layout currently edited by the local GUI.
+
+        入参：无。
+        返回：JSON-safe `KeyLayoutResponse`，包含默认或 runtime 布局及来源。
+        错误处理：默认布局构造异常按 500 暴露；正常路径不访问外部资源。
+        副作用：只读取 daemon 内存，不写配置文件、不访问硬件。
+        """
+
+        return _dump_model(runtime.current_key_layout_response())
+
+    @app.put("/ui/key-layout")
+    async def put_key_layout(layout: N4ProKeyLayout) -> dict[str, Any]:
+        """Save the N4 Pro key layout in the current daemon runtime.
+
+        入参：`layout` 是请求体中的完整 10 键布局，由 Pydantic 校验。
+        返回：JSON-safe key layout response、当前 layout projection 和 render_count。
+        错误处理：请求体校验失败返回 422；render 异常由 FastAPI 处理。
+        副作用：更新 daemon 内存布局并重新 render fake surface；暂不写用户配置文件。
+        """
+
+        return runtime.update_key_layout(layout)
 
     @app.post("/events")
     async def post_event(event: NormalizedEvent) -> dict[str, Any]:

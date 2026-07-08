@@ -1,0 +1,223 @@
+/*
+ * Agent Deck N4 Pro 配置 GUI 样式。
+ * 边界：只负责本地 daemon Web 页面视觉，不访问硬件、不定义运行时行为。
+ */
+
+:root {
+  color-scheme: dark;
+  --bg: #0b0d10;
+  --surface: #11151a;
+  --surface-2: #171d23;
+  --surface-3: #202832;
+  --line: rgba(255, 255, 255, 0.1);
+  --line-strong: rgba(255, 255, 255, 0.18);
+  --text: #eef3f6;
+  --muted: #94a0aa;
+  --quiet: #5e6872;
+  --accent: #6fd5ff;
+  --accent-2: #7bd88f;
+  --warn: #ffc857;
+  --error: #ff6b6b;
+  --shadow: 0 24px 70px rgba(0, 0, 0, 0.38);
+  --radius: 8px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  background:
+    radial-gradient(circle at 50% 0%, rgba(111, 213, 255, 0.12), transparent 34rem),
+    linear-gradient(180deg, #0d1014 0%, var(--bg) 56%, #07090c 100%);
+  color: var(--text);
+  font-family:
+    ui-sans-serif,
+    -apple-system,
+    BlinkMacSystemFont,
+    "SF Pro Text",
+    "PingFang SC",
+    "Hiragino Sans GB",
+    "Microsoft YaHei",
+    sans-serif;
+  letter-spacing: 0;
+  overflow-x: hidden;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  color: inherit;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button:focus-visible,
+.deck-key:focus-visible,
+.close-button:focus-visible {
+  outline: 2px solid rgba(111, 213, 255, 0.88);
+  outline-offset: 3px;
+}
+
+.skip-link {
+  position: fixed;
+  left: 16px;
+  top: 12px;
+  z-index: 20;
+  transform: translateY(-72px);
+  padding: 9px 12px;
+  border-radius: var(--radius);
+  background: var(--text);
+  color: #0b0d10;
+  font-weight: 700;
+  text-decoration: none;
+  transition: transform 140ms ease;
+}
+
+.skip-link:focus-visible {
+  transform: translateY(0);
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: 58px minmax(0, 1fr) 42px;
+}
+
+.topbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto minmax(220px, 1fr);
+  align-items: center;
+  gap: 18px;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(11, 13, 16, 0.78);
+  backdrop-filter: blur(18px);
+}
+
+.brand-lockup {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.brand-mark {
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  object-fit: cover;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.16);
+}
+
+.brand-name {
+  font-size: 15px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.device-pill {
+  justify-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.045);
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--quiet);
+}
+
+.status-dot.connected {
+  background: var(--accent-2);
+  box-shadow: 0 0 14px rgba(123, 216, 143, 0.66);
+}
+
+.top-actions {
+  justify-self: end;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.save-state {
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.primary-button,
+.ghost-button,
+.choice-button,
+.app-option {
+  border: 0;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.primary-button {
+  height: 34px;
+  padding: 0 14px;
+  background: var(--text);
+  color: #11151a;
+  font-weight: 650;
+}
+
+.primary-button:disabled {
+  cursor: default;
+  opacity: 0.42;
+}
+
+.ghost-button {
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+}
+
+.workspace {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(640px, 1fr) 360px;
+  gap: 0;
+}
+
+.stage {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-width: 0;
+  padding: 34px 36px 28px;
+  overflow: hidden;
+}
+
+.stage::before {
+  content: "";
+  position: absolute;
+  inset: auto 8% 7% 8%;
+  height: 26%;
+  border-radius: 50%;
+  background: rgba(111, 213, 255, 0.08);
+  filter: blur(38px);
+  pointer-events: none;
+}
