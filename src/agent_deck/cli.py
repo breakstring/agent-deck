@@ -61,6 +61,7 @@ from agent_deck.rendering.codex_key_frames import (
 from agent_deck.rendering.quota_touchscreen import render_quota_touchscreen
 from agent_deck.rendering.visuals import resolve_visual_icon_spec
 from agent_deck.server.app import DaemonPollerConfig, create_app
+from agent_deck.server.key_layout_store import resolve_n4pro_key_layout_path
 
 DEFAULT_DAEMON_URL = "http://127.0.0.1:8765"
 _DEFAULT_HTTP_TIMEOUT_SECONDS = 5.0
@@ -326,7 +327,14 @@ def daemon_callback(
         streamdock_n4pro_frame_root=hardware_renderer.frame_root,
         focus_actions_enabled=local_config.actions.focus.enabled,
     )
-    uvicorn.run(create_app(poller_config=poller_config), host=host, port=port)
+    uvicorn.run(
+        create_app(
+            poller_config=poller_config,
+            key_layout_path=resolve_n4pro_key_layout_path(),
+        ),
+        host=host,
+        port=port,
+    )
 
 
 @ctl_app.callback()

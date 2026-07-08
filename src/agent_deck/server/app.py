@@ -82,6 +82,11 @@ from agent_deck.rendering.logical_panel_touchscreen import (
     render_logical_panel_touchscreen,
 )
 from agent_deck.rendering.quota_touchscreen import render_quota_touchscreen
+from agent_deck.server.key_layout_store import (
+    KeyLayoutStoreError,
+    load_n4pro_key_layout,
+    save_n4pro_key_layout,
+)
 
 CodexAppStateEventReader = Callable[[], tuple[NormalizedEvent, ...]]
 CodexAppActiveSessionsReader = Callable[..., tuple[CodexAppActiveSession, ...]]
@@ -212,8 +217,8 @@ class LogicalPanelInputBody(BaseModel):
 class KeyLayoutResponse(BaseModel):
     """Return the current or default N4 Pro key layout to the GUI.
 
-    入参：`device_profile` 是设备 profile 标识；`source` 描述布局来自 runtime 还是内置默认；
-    `layout` 是完整 10 键布局。
+    入参：`device_profile` 是设备 profile 标识；`source` 描述布局来自 runtime、persisted
+    还是内置默认；`path` 是可选持久化文件路径；`layout` 是完整 10 键布局。
     返回：frozen Pydantic model，可由 FastAPI 序列化。
     错误处理：字段非法由 Pydantic 报告。
     副作用：模型自身不读取文件、硬件或网络。
@@ -223,6 +228,7 @@ class KeyLayoutResponse(BaseModel):
 
     device_profile: str
     source: str
+    path: str | None = None
     layout: N4ProKeyLayout
 
 
@@ -269,6 +275,9 @@ class _DaemonRuntime:
     streamdock_n4pro_renderer_updated_at: datetime | None
     streamdock_n4pro_renderer_last_error: str | None
     key_layout: N4ProKeyLayout | None
+    key_layout_source: str | None
+    key_layout_path: Path | None
+    key_layout_last_error: str | None
 
     def apply_event(self, event: NormalizedEvent) -> dict[str, Any]:
         """Apply an event, render the latest layout, and return response data.
@@ -304,11 +313,13 @@ class _DaemonRuntime:
             return KeyLayoutResponse(
                 device_profile="mirabox.n4pro",
                 source="default",
+                path=str(self.key_layout_path) if self.key_layout_path else None,
                 layout=default_n4pro_key_layout(),
             )
         return KeyLayoutResponse(
             device_profile="mirabox.n4pro",
-            source="runtime",
+            source=self.key_layout_source or "runtime",
+            path=str(self.key_layout_path) if self.key_layout_path else None,
             layout=self.key_layout,
         )
 
@@ -318,9 +329,16 @@ class _DaemonRuntime:
         入参：`layout` 是 FastAPI/Pydantic 已校验的 10 键布局。
         返回：JSON-safe key layout response 和当前 layout projection。
         错误处理：layout 校验失败在 handler 业务逻辑前返回 422；投影异常按原语义传播。
-        副作用：更新 runtime 内存布局并 render fake surface；不写用户配置文件。
+        副作用：更新 runtime 内存布局并 render fake surface；若启用了 key layout path，会原子写入
+        用户级 JSON 配置。
         """
 
+        if self.key_layout_path is not None:
+            save_n4pro_key_layout(layout, self.key_layout_path)
+            self.key_layout_source = "persisted"
+            self.key_layout_last_error = None
+        else:
+            self.key_layout_source = "runtime"
         self.key_layout = layout
         rendered_layout = self.render_current()
         return {
@@ -1011,6 +1029,7 @@ class _DaemonRuntime:
             "decisions": [_dump_model(decision) for decision in self.broker.pending()],
             "layout": _dump_model(layout),
             "key_layout": _dump_model(self.current_key_layout_response()),
+            "key_layout_last_error": self.key_layout_last_error,
             "render_count": self.surface.render_count,
             "pollers": {
                 "codex_app_state": {
@@ -1218,6 +1237,7 @@ def create_app(
     streamdock_n4pro_renderer_sink: StreamDockN4ProRendererSink | None = None,
     visible_splash_touchscreen_sink: VisibleSplashTouchscreenSink = render_dual_device_touchscreen_image_to_n4pro,
     focus_action_executor: FocusActionExecutor = focus_agent_target,
+    key_layout_path: Path | None = None,
 ) -> FastAPI:
     """Create the local daemon FastAPI app without binding sockets.
 
@@ -1232,7 +1252,8 @@ def create_app(
     `visible_splash_touchscreen_sink` 专门写 N4 Pro dual-device 可见触屏层，用于启动/退出时
     清掉旧 quota 残留；不参与常规按键动画渲染；
     `focus_action_executor` 是 `focus_agent` 的真实动作执行器，poller config 未禁用
-    `focus_actions_enabled` 且目标 agent 有 focus target 时会被调用。
+    `focus_actions_enabled` 且目标 agent 有 focus target 时会被调用；`key_layout_path`
+    为 None 时 GUI 布局只保存在进程内，传入路径时启动会读该 JSON，保存会写回该 JSON。
     返回：配置好路由且持有 in-memory runtime 的 `FastAPI` ASGI app。
     错误处理：对象构造失败会直接抛出；poller 单次失败会记录到 status，不让 app 启动失败。
     副作用：总是分配内存对象并注册路由；只有显式启用 poller 时，lifespan startup 才会只读访问
@@ -1240,6 +1261,16 @@ def create_app(
     """
 
     resolved_poller_config = poller_config or DaemonPollerConfig()
+    initial_key_layout: N4ProKeyLayout | None = None
+    initial_key_layout_source: str | None = None
+    key_layout_last_error: str | None = None
+    if key_layout_path is not None:
+        try:
+            initial_key_layout = load_n4pro_key_layout(key_layout_path)
+            if initial_key_layout is not None:
+                initial_key_layout_source = "persisted"
+        except KeyLayoutStoreError as exc:
+            key_layout_last_error = str(exc)
     runtime = _DaemonRuntime(
         store=AgentStateStore(),
         broker=DecisionBroker(),
@@ -1270,7 +1301,10 @@ def create_app(
         streamdock_n4pro_renderer_result=None,
         streamdock_n4pro_renderer_updated_at=None,
         streamdock_n4pro_renderer_last_error=None,
-        key_layout=None,
+        key_layout=initial_key_layout,
+        key_layout_source=initial_key_layout_source,
+        key_layout_path=key_layout_path,
+        key_layout_last_error=key_layout_last_error,
     )
     resolved_streamdock_n4pro_renderer_sink: StreamDockN4ProRendererSink = (
         streamdock_n4pro_renderer_sink
@@ -1463,11 +1497,15 @@ def create_app(
 
         入参：`layout` 是请求体中的完整 10 键布局，由 Pydantic 校验。
         返回：JSON-safe key layout response、当前 layout projection 和 render_count。
-        错误处理：请求体校验失败返回 422；render 异常由 FastAPI 处理。
-        副作用：更新 daemon 内存布局并重新 render fake surface；暂不写用户配置文件。
+        错误处理：请求体校验失败返回 422；持久化写入失败返回 500；render 异常由 FastAPI 处理。
+        副作用：更新 daemon 内存布局并重新 render fake surface；启用持久化路径时会写 JSON 文件。
         """
 
-        return runtime.update_key_layout(layout)
+        try:
+            return runtime.update_key_layout(layout)
+        except KeyLayoutStoreError as exc:
+            runtime.key_layout_last_error = str(exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/events")
     async def post_event(event: NormalizedEvent) -> dict[str, Any]:

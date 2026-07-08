@@ -128,6 +128,77 @@ def test_key_layout_api_saves_runtime_layout_and_updates_status_projection() -> 
     assert status["layout"]["keys"][5]["agent_key"] == "codex:session-1"
 
 
+def test_key_layout_api_persists_layout_when_store_path_is_configured(
+    tmp_path: Path,
+) -> None:
+    """Verify configured key layout path survives daemon app recreation.
+
+    入参：`tmp_path` 提供隔离 JSON 存储路径。
+    返回：无返回值；断言通过代表 PUT 会写 JSON，新 app 会从同一路径读回布局。
+    错误处理：未写文件、source 不正确或重建后布局丢失时由 pytest 报告。
+    副作用：只写 pytest 临时目录，不访问用户配置目录或真实硬件。
+    """
+
+    layout_path = tmp_path / "n4pro-key-layout.json"
+    layout_body = {
+        "keys": [
+            {
+                "index": 0,
+                "kind": "app",
+                "label": "Cursor",
+                "app_name": "Cursor",
+                "app_path": "/Applications/Cursor.app",
+                "icon_token": "Cu",
+            },
+            {"index": 1, "kind": "unassigned"},
+            {"index": 2, "kind": "unassigned"},
+            {"index": 3, "kind": "unassigned"},
+            {"index": 4, "kind": "unassigned"},
+            {"index": 5, "kind": "agent"},
+            {"index": 6, "kind": "agent"},
+            {"index": 7, "kind": "agent"},
+            {"index": 8, "kind": "agent"},
+            {"index": 9, "kind": "agent"},
+        ]
+    }
+    client = TestClient(create_app(key_layout_path=layout_path))
+
+    save_response = client.put("/ui/key-layout", json=layout_body)
+    restored = TestClient(create_app(key_layout_path=layout_path)).get(
+        "/ui/key-layout"
+    )
+
+    assert save_response.status_code == 200
+    assert save_response.json()["key_layout"]["source"] == "persisted"
+    assert save_response.json()["key_layout"]["path"] == str(layout_path)
+    assert layout_path.is_file()
+    assert restored.status_code == 200
+    assert restored.json()["source"] == "persisted"
+    assert restored.json()["path"] == str(layout_path)
+    assert restored.json()["layout"]["keys"][0]["kind"] == "app"
+    assert restored.json()["layout"]["keys"][0]["app_name"] == "Cursor"
+
+
+def test_key_layout_store_error_falls_back_to_default_layout(tmp_path: Path) -> None:
+    """Verify invalid persisted key layout does not prevent daemon startup.
+
+    入参：`tmp_path` 提供坏 JSON 文件路径。
+    返回：无返回值；断言通过代表 daemon 回退默认布局并暴露 last_error。
+    错误处理：坏配置导致 app 创建失败或错误未出现在 status 时由 pytest 报告。
+    副作用：只写 pytest 临时目录，不访问用户配置目录或真实硬件。
+    """
+
+    layout_path = tmp_path / "n4pro-key-layout.json"
+    layout_path.write_text("{bad json", encoding="utf-8")
+    client = TestClient(create_app(key_layout_path=layout_path))
+
+    status = client.get("/status").json()
+
+    assert status["key_layout"]["source"] == "default"
+    assert status["key_layout"]["path"] == str(layout_path)
+    assert "不是合法 JSON" in status["key_layout_last_error"]
+
+
 def test_key_layout_api_rejects_incomplete_or_high_risk_shape() -> None:
     """Verify key layout API rejects incomplete or invalid action definitions.
 
