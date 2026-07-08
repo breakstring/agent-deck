@@ -120,6 +120,37 @@
   color: var(--accent);
 }
 
+.text-field {
+  display: grid;
+  gap: 8px;
+}
+
+.text-field span {
+  color: var(--quiet);
+  font-size: 12px;
+}
+
+.text-input {
+  width: 100%;
+  min-width: 0;
+  height: 40px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.045);
+  color: var(--text);
+  padding: 0 12px;
+  outline: none;
+}
+
+.text-input:focus {
+  border-color: rgba(111, 213, 255, 0.66);
+  box-shadow: 0 0 0 2px rgba(111, 213, 255, 0.12);
+}
+
+.text-input::placeholder {
+  color: var(--quiet);
+}
+
 .detail-row {
   display: grid;
   grid-template-columns: 84px 1fr;

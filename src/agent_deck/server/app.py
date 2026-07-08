@@ -34,6 +34,10 @@ from agent_deck.actions.apps import (
     open_or_focus_local_app,
 )
 from agent_deck.actions.focus import FocusActionResult, focus_agent_target
+from agent_deck.actions.local_targets import (
+    LocalTargetActionResult,
+    open_local_url,
+)
 from agent_deck.adapters.codex_app_state import (
     CodexAppActiveSession,
     build_codex_app_state_events,
@@ -109,6 +113,7 @@ FocusActionExecutor = Callable[[str], FocusActionResult]
 VisibleSplashTouchscreenSink = Callable[[Any], StreamDockTouchscreenRenderResult]
 LocalAppCatalogReader = Callable[[], tuple[LocalAppInfo, ...]]
 LocalAppActionExecutor = Callable[..., LocalAppActionResult]
+LocalUrlActionExecutor = Callable[..., LocalTargetActionResult]
 
 _STREAMDOCK_TOUCH_TAP_DEBOUNCE_SECONDS = 0.45
 """真实 StreamDock touch bar 连续 touch_point 归并为一次 tap 的最短间隔。"""
@@ -121,6 +126,9 @@ _RECENT_STREAMDOCK_INPUT_LIMIT = 30
 
 _RECENT_INTERACTION_LIMIT = 30
 """status 中保留多少条最近业务 interaction 诊断。"""
+
+_BRAND_FEEDBACK_DURATION_SECONDS = 4.0
+"""未配置主按键触发默认品牌反馈面板的持续秒数。"""
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 """agent_deck 包根目录，用于定位随包分发的 Web GUI 和品牌资源。"""
@@ -150,6 +158,7 @@ class DaemonPollerConfig(BaseModel):
     应替代 quota-only 真实触屏下发；`streamdock_n4pro_frame_root` 指向 generated 按键帧；
     `streamdock_n4pro_render_interval_seconds` 和 `streamdock_n4pro_renderer_fps` 控制真机刷新节奏；
     `focus_actions_enabled` 控制是否允许 `focus_agent` 调用真实 action executor，默认开启；
+    `local_actions_enabled` 控制是否允许 App/URL/Folder 本机快捷动作调用真实 executor；
     `poll_on_start` 控制启动时是否先同步一次，便于 daemon 刚启动就有状态。
     返回：frozen Pydantic model，供 `create_app` lifespan 使用。
     错误处理：非正间隔或 timeout 由 Pydantic 校验为 422/ValidationError。
@@ -175,6 +184,7 @@ class DaemonPollerConfig(BaseModel):
     streamdock_n4pro_render_interval_seconds: float = Field(default=3.0, gt=0)
     streamdock_n4pro_renderer_fps: int = Field(default=10, gt=0)
     focus_actions_enabled: bool = True
+    local_actions_enabled: bool = True
     poll_on_start: bool = True
 
 
@@ -252,7 +262,8 @@ class _DaemonRuntime:
     入参：`store` 是 normalized event reducer；`broker` 管理 pending approval；
     `surface` 记录 fake render 帧；`selection` 保存当前 deck 选择；两个 id 集合分别
     记录已反映到 store 的 pending decision 和已同步终态的 decision；poller 字段保存
-    Codex App state、quota 与真实 N4 Pro renderer 的最近一次同步状态。
+    Codex App state、quota 与真实 N4 Pro renderer 的最近一次同步状态；
+    `brand_feedback_until_monotonic` 保存未配置键触发的短暂 touch bar 品牌反馈截止时间。
     返回：dataclass 实例，供 app.state 持有并在路由间共享。
     错误处理：本类不主动校验依赖类型；handler 调用时底层异常按原语义传播。
     副作用：后续方法会修改这些内存对象；不会访问真实硬件、文件或网络。
@@ -281,10 +292,13 @@ class _DaemonRuntime:
     last_interaction_intent: InteractionIntent | None
     last_interaction_action: dict[str, Any] | None
     recent_interactions: list[dict[str, Any]]
+    brand_feedback_until_monotonic: float | None
     focus_actions_enabled: bool
+    local_actions_enabled: bool
     focus_action_executor: FocusActionExecutor
     local_app_catalog_reader: LocalAppCatalogReader
     local_app_action_executor: LocalAppActionExecutor
+    local_url_action_executor: LocalUrlActionExecutor
     app_icon_cache: AppIconCache
     streamdock_quota_touchscreen_result: StreamDockTouchscreenRenderResult | None
     streamdock_n4pro_renderer_result: StreamDockN4ProAnimationResult | None
@@ -676,13 +690,28 @@ class _DaemonRuntime:
         elif intent.intent in {"approve_request", "deny_request"}:
             action = self._apply_decision_intent(intent)
         elif intent.intent == "open_or_focus_app":
-            if self.focus_actions_enabled:
+            if self.local_actions_enabled:
                 action = _execute_local_app_action(
                     intent,
                     self.local_app_action_executor,
                 )
             else:
                 action = _dry_run_action(intent, state=None)
+        elif intent.intent == "open_url":
+            if self.local_actions_enabled:
+                action = _execute_local_url_action(
+                    intent,
+                    self.local_url_action_executor,
+                )
+            else:
+                action = _dry_run_action(intent, state=None)
+        elif intent.intent == "open_path":
+            action = _unsupported_local_action(
+                intent,
+                message="open_path ignored; folder quick actions are disabled",
+            )
+        elif intent.intent == "show_brand_feedback":
+            action = self.show_brand_feedback_panel(intent)
         else:
             state = self.store.get(intent.agent_key) if intent.agent_key else None
             if intent.intent == "focus_agent" and self.focus_actions_enabled:
@@ -706,6 +735,32 @@ class _DaemonRuntime:
             "interaction_intent": _dump_model(intent),
             "deck_selection": _dump_model(self.selection),
             "action": action,
+        }
+
+    def show_brand_feedback_panel(self, intent: InteractionIntent) -> dict[str, Any]:
+        """短暂显示 Agent Deck 默认品牌面板。
+
+        入参：`intent` 是未配置主按键产生的 `show_brand_feedback` 意图。
+        返回：JSON-safe action 诊断，包含触屏图来源、尺寸和持续时间。
+        错误处理：Pillow 渲染异常按原异常传播，由 FastAPI 或 renderer loop 记录。
+        副作用：设置 runtime transient override，并把品牌图记录到 fake touchscreen surface；
+        真实硬件会在下一轮 N4 Pro renderer loop 读取该 override。
+        """
+
+        self.brand_feedback_until_monotonic = (
+            time.monotonic() + _BRAND_FEEDBACK_DURATION_SECONDS
+        )
+        image = self.render_current_logical_panel_image()
+        return {
+            "intent": intent.intent,
+            "agent_key": intent.agent_key,
+            "decision_id": intent.decision_id,
+            "status": "shown",
+            "ok": True,
+            "duration_seconds": _BRAND_FEEDBACK_DURATION_SECONDS,
+            "touchscreen_image_source": self.surface.last_touchscreen_image_source,
+            "touchscreen_image_size": _image_size(image),
+            "message": "brand feedback panel shown",
         }
 
     def _apply_decision_intent(self, intent: InteractionIntent) -> dict[str, Any]:
@@ -844,6 +899,9 @@ class _DaemonRuntime:
         副作用：只创建内存图像，不修改 fake surface。
         """
 
+        if self._is_brand_feedback_active():
+            return render_agent_deck_splash_touchscreen(), "agent_deck:brand_feedback"
+
         active_kind = self.logical_panel_selection.active_kind
         if active_kind == PanelKind.QUOTA and self.codex_quota_snapshot is not None:
             return render_quota_touchscreen(self.codex_quota_snapshot), "codex_quota"
@@ -878,6 +936,23 @@ class _DaemonRuntime:
         image, source = built
         self.surface.render_touchscreen_image(image, source=source)
         return image
+
+    def _is_brand_feedback_active(self) -> bool:
+        """判断 transient 品牌反馈面板是否仍在有效时间内。
+
+        入参：无；读取 runtime 中的 monotonic 截止时间。
+        返回：有效期内返回 True；过期或未设置返回 False，并清理过期字段。
+        错误处理：无。
+        副作用：过期时清空 `brand_feedback_until_monotonic`。
+        """
+
+        until = self.brand_feedback_until_monotonic
+        if until is None:
+            return False
+        if time.monotonic() < until:
+            return True
+        self.brand_feedback_until_monotonic = None
+        return False
 
     def update_streamdock_quota_touchscreen_result(
         self,
@@ -1127,7 +1202,7 @@ class _DaemonRuntime:
             states,
             decisions,
             self.selection,
-            key_layout=self.key_layout,
+            key_layout=self.current_key_layout_response().layout,
         )
         self.surface.render(layout)
         return layout
@@ -1263,6 +1338,7 @@ def create_app(
     focus_action_executor: FocusActionExecutor = focus_agent_target,
     local_app_catalog_reader: LocalAppCatalogReader = list_local_apps,
     local_app_action_executor: LocalAppActionExecutor = open_or_focus_local_app,
+    local_url_action_executor: LocalUrlActionExecutor = open_local_url,
     app_icon_cache_path: Path | None = None,
     key_layout_path: Path | None = None,
 ) -> FastAPI:
@@ -1280,7 +1356,8 @@ def create_app(
     清掉旧 quota 残留；不参与常规按键动画渲染；
     `focus_action_executor` 是 `focus_agent` 的真实动作执行器，poller config 未禁用
     `focus_actions_enabled` 且目标 agent 有 focus target 时会被调用；`local_app_catalog_reader`
-    和 `local_app_action_executor` 支撑 GUI App 选择和 App key 执行，测试可替换；
+    支撑 GUI App 选择；`local_app_action_executor` 和 `local_url_action_executor`
+    支撑本机快捷动作执行，测试可替换；
     `app_icon_cache_path` 是 App 图标缓存根目录，默认使用用户级 Application Support；
     `key_layout_path` 为 None 时 GUI 布局只保存在进程内，传入路径时启动会读该 JSON，
     保存会写回该 JSON。
@@ -1326,10 +1403,13 @@ def create_app(
         last_interaction_intent=None,
         last_interaction_action=None,
         recent_interactions=[],
+        brand_feedback_until_monotonic=None,
         focus_actions_enabled=resolved_poller_config.focus_actions_enabled,
+        local_actions_enabled=resolved_poller_config.local_actions_enabled,
         focus_action_executor=focus_action_executor,
         local_app_catalog_reader=local_app_catalog_reader,
         local_app_action_executor=local_app_action_executor,
+        local_url_action_executor=local_url_action_executor,
         app_icon_cache=app_icon_cache,
         streamdock_quota_touchscreen_result=None,
         streamdock_n4pro_renderer_result=None,
@@ -2295,12 +2375,51 @@ def _dry_run_action(
                 else "open_or_focus_app dry-run recorded; missing app target"
             ),
         }
+    if intent.intent == "open_url":
+        url = intent.payload.get("url")
+        return {
+            "intent": intent.intent,
+            "agent_key": intent.agent_key,
+            "decision_id": intent.decision_id,
+            "status": "dry_run",
+            "target_available": url is not None,
+            "target_type": "url",
+            "url": url,
+            "message": (
+                f"open_url dry-run recorded for {url}"
+                if url
+                else "open_url dry-run recorded; missing url"
+            ),
+        }
     return {
         "intent": intent.intent,
         "agent_key": intent.agent_key,
         "decision_id": intent.decision_id,
         "status": "dry_run",
         "message": f"{intent.intent} dry-run recorded; no external action executed",
+    }
+
+
+def _unsupported_local_action(
+    intent: InteractionIntent,
+    *,
+    message: str,
+) -> dict[str, Any]:
+    """返回已识别但当前产品不开放的本机动作诊断。
+
+    入参：`intent` 是硬件输入归一化后的交互意图；`message` 是稳定诊断文本。
+    返回：JSON-safe action 诊断，明确不会执行外部动作。
+    错误处理：无。
+    副作用：无。
+    """
+
+    return {
+        "intent": intent.intent,
+        "agent_key": intent.agent_key,
+        "decision_id": intent.decision_id,
+        "status": "unsupported",
+        "ok": False,
+        "message": message,
     }
 
 
@@ -2419,6 +2538,32 @@ def _execute_local_app_action(
         "app_name": result.app_name,
         "app_path": result.app_path,
         "bundle_id": result.bundle_id,
+        "message": result.message,
+    }
+
+
+def _execute_local_url_action(
+    intent: InteractionIntent,
+    local_url_action_executor: LocalUrlActionExecutor,
+) -> dict[str, Any]:
+    """执行 URL quick-action 并返回诊断。
+
+    入参：`intent` 是 `open_url` 交互意图；payload 中应包含 `url`；
+    `local_url_action_executor` 是受配置保护的真实动作执行器。
+    返回：JSON-safe action 诊断。
+    错误处理：executor 自己负责把系统异常转换为 `LocalTargetActionResult`，本函数只序列化结果。
+    副作用：生产 executor 会调用 macOS `open` 打开 http/https URL。
+    """
+
+    result = local_url_action_executor(url=intent.payload.get("url"))
+    return {
+        "intent": intent.intent,
+        "agent_key": intent.agent_key,
+        "decision_id": intent.decision_id,
+        "status": result.status,
+        "ok": result.ok,
+        "target_type": result.target_type,
+        "url": result.url,
         "message": result.message,
     }
 

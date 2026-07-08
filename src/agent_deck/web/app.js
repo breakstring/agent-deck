@@ -59,7 +59,6 @@ function keyLabel(key) {
   if (key.kind === "unassigned") return "未设置快捷动作";
   if (key.kind === "app") return "打开或切换 App";
   if (key.kind === "url") return "打开网址";
-  if (key.kind === "folder") return "打开文件夹";
   if (key.kind === "agent") return "Agent 状态槽位";
   if (key.kind === "disabled") return "已关闭";
   return "按键";
@@ -107,9 +106,6 @@ function uiKeyFromBinding(binding) {
   if (binding.kind === "url") {
     return { ...base, role: "quick", kind: "url", url: binding.url || "" };
   }
-  if (binding.kind === "folder") {
-    return { ...base, role: "quick", kind: "folder", path: binding.path || "" };
-  }
   if (binding.kind === "agent") {
     return { ...base, role: "agent", kind: "agent", slot: 1 };
   }
@@ -151,14 +147,6 @@ function bindingFromUiKey(key) {
       url: key.url || "https://agent.deck.local",
     };
   }
-  if (key.kind === "folder") {
-    return {
-      index: key.index,
-      kind: "folder",
-      label: key.path || "Folder",
-      path: key.path || "~/Projects",
-    };
-  }
   if (key.kind === "agent") {
     return { index: key.index, kind: "agent", label: "Agent" };
   }
@@ -182,9 +170,6 @@ function renderKeyFace(key) {
   }
   if (key.kind === "url") {
     return '<div class="url-icon">URL</div>';
-  }
-  if (key.kind === "folder") {
-    return '<div class="folder-icon"></div>';
   }
   if (key.kind === "agent") {
     const agent = agentForSlot(key.slot);
@@ -232,6 +217,15 @@ function detailRow(label, value) {
   return `<div class="detail-row"><span>${escapeHtml(label)}</span><span title="${escapeAttr(value)}">${escapeHtml(value)}</span></div>`;
 }
 
+function textField(id, label, value, placeholder) {
+  return `
+    <label class="text-field" for="${id}">
+      <span>${escapeHtml(label)}</span>
+      <input id="${id}" class="text-input" type="text" value="${escapeAttr(value)}" placeholder="${escapeAttr(placeholder)}" autocomplete="off" spellcheck="false">
+    </label>
+  `;
+}
+
 function renderInspector() {
   const key = state.keys[state.selectedIndex];
   el.selectedEyebrow.textContent = `Key ${key.index + 1}`;
@@ -257,8 +251,6 @@ function renderInspector() {
       detailRow("按下", "选择并聚焦");
   } else if (key.kind === "url") {
     details = detailRow("网址", key.url || "https://example.com") + detailRow("图标", "自动 favicon");
-  } else if (key.kind === "folder") {
-    details = detailRow("文件夹", key.path || "~/Projects") + detailRow("图标", "系统文件夹图标");
   }
 
   el.inspectorBody.innerHTML = `
@@ -267,11 +259,15 @@ function renderInspector() {
       <div class="choice-grid">
         ${choiceButton("app", "打开或切换 App", key.kind === "app" ? key.app.name : "")}
         ${choiceButton("url", "打开网址", "")}
-        ${choiceButton("folder", "打开文件夹", "")}
         ${choiceButton("agent", "Agent 状态", key.kind === "agent" ? `槽位 ${key.slot}` : "")}
         ${choiceButton("disabled", "关闭这个键", "")}
       </div>
     </div>
+    ${
+      key.kind === "url"
+        ? `<div class="field-group"><div class="field-label">目标</div>${textField("urlInput", "网址", key.url || "", "https://example.com")}</div>`
+        : ""
+    }
     ${details ? `<div class="field-group"><div class="field-label">当前配置</div>${details}</div>` : ""}
     ${
       key.kind === "app"
@@ -290,6 +286,15 @@ function renderInspector() {
   if (chooseApp) {
     chooseApp.addEventListener("click", openAppModal);
   }
+
+  const urlInput = document.getElementById("urlInput");
+  if (urlInput) {
+    urlInput.addEventListener("input", () => {
+      key.url = urlInput.value.trim();
+      markDirty(key);
+    });
+  }
+
 }
 
 /**
@@ -309,8 +314,6 @@ function updateKeyKind(kind) {
   }
   if (kind === "url") {
     Object.assign(key, { role: "quick", kind: "url", url: "https://agent.deck.local" });
-  } else if (kind === "folder") {
-    Object.assign(key, { role: "quick", kind: "folder", path: "~/Projects" });
   } else if (kind === "agent") {
     const agentCountBefore = state.keys.filter((item) => item.kind === "agent" && item.index < key.index).length;
     Object.assign(key, { role: "agent", kind: "agent", slot: agentCountBefore + 1 });

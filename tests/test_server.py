@@ -22,6 +22,7 @@ from PIL import Image
 from agent_deck.actions.app_icon_cache import AppIconCache
 from agent_deck.actions.apps import LocalAppActionResult, LocalAppInfo
 from agent_deck.actions.focus import FocusActionResult
+from agent_deck.actions.local_targets import LocalTargetActionResult
 from agent_deck.adapters.codex_app_state import CodexAppActiveSession
 from agent_deck.adapters.codex_quota import CodexQuotaSnapshot
 from agent_deck.adapters.codex_tokens import (
@@ -425,7 +426,7 @@ def test_codex_app_state_poller_applies_active_sessions() -> None:
     assert status["agents"][0]["status"] == "running_tool"
     assert status["agents"][0]["active_tool"] == "shell"
     assert status["agents"][0]["focus_target"] == "codex-app:thread-1"
-    assert status["layout"]["keys"][0]["visual"]["variant_id"] == "working"
+    assert status["layout"]["keys"][5]["visual"]["variant_id"] == "working"
 
 
 def test_codex_quota_poller_updates_status_and_touchscreen_frame() -> None:
@@ -710,12 +711,13 @@ def test_agent_key_focus_uses_state_focus_target_by_default() -> None:
                 payload={"focus_target": "app:Codex"},
             ).model_dump(mode="json"),
         )
-        client.get("/status")
+        status_before = client.get("/status").json()
+        agent_key = _key_index_for_agent(status_before, "codex:session-1")
         response = client.post(
             "/hardware/input",
             json=_hardware_input(
                 kind="key",
-                index=0,
+                index=agent_key,
                 value={"state": 1},
             ),
         )
@@ -771,12 +773,13 @@ def test_focus_action_can_be_disabled_for_diagnostics() -> None:
                 payload={"focus_target": "app:Codex"},
             ).model_dump(mode="json"),
         )
-        client.get("/status")
+        status_before = client.get("/status").json()
+        agent_key = _key_index_for_agent(status_before, "codex:session-1")
         response = client.post(
             "/hardware/input",
             json=_hardware_input(
                 kind="key",
-                index=0,
+                index=agent_key,
                 value={"state": 1},
             ),
         )
@@ -874,6 +877,178 @@ def test_app_key_input_executes_local_app_action() -> None:
     assert response.json()["action"]["status"] == "succeeded"
     assert response.json()["action"]["bundle_id"] == "com.apple.finder"
     assert status["interaction"]["last_action"]["message"] == "opened Finder"
+
+
+def test_url_key_executes_local_target_action() -> None:
+    """URL key press 应执行受控本机 target action。
+
+    入参：无。
+    返回：无返回值；断言通过代表硬件按键会把 URL payload 交给 action 层。
+    错误处理：executor 未调用、payload 丢失或 action 诊断错误时由 pytest 报告。
+    副作用：只修改测试 app 内存 runtime，不打开浏览器。
+    """
+
+    calls: list[dict[str, str | None]] = []
+
+    def fake_url_executor(url: str | None = None) -> LocalTargetActionResult:
+        """记录 URL action payload 并返回成功。
+
+        入参：`url` 是 runtime 解析出的 URL。
+        返回：成功结果。
+        错误处理：无。
+        副作用：写入 `calls`。
+        """
+
+        calls.append({"kind": "url", "value": url})
+        return LocalTargetActionResult(
+            ok=True,
+            status="succeeded",
+            target_type="url",
+            url=url,
+            message=f"opened {url}",
+        )
+
+    app = create_app(local_url_action_executor=fake_url_executor)
+    with TestClient(app) as client:
+        client.put(
+            "/ui/key-layout",
+            json={
+                "keys": [
+                    {
+                        "index": 0,
+                        "kind": "url",
+                        "url": "https://agent.deck.local",
+                    },
+                    {"index": 1, "kind": "unassigned"},
+                    {"index": 2, "kind": "unassigned"},
+                    {"index": 3, "kind": "unassigned"},
+                    {"index": 4, "kind": "unassigned"},
+                    {"index": 5, "kind": "agent"},
+                    {"index": 6, "kind": "agent"},
+                    {"index": 7, "kind": "agent"},
+                    {"index": 8, "kind": "agent"},
+                    {"index": 9, "kind": "agent"},
+                ]
+            },
+        )
+        url_response = client.post(
+            "/hardware/input",
+            json=_hardware_input(kind="key", index=0, value={"state": 1}),
+        )
+        status = client.get("/status").json()
+
+    assert calls == [{"kind": "url", "value": "https://agent.deck.local"}]
+    assert url_response.json()["interaction_intent"]["intent"] == "open_url"
+    assert url_response.json()["action"]["status"] == "succeeded"
+    assert url_response.json()["action"]["url"] == "https://agent.deck.local"
+    assert status["interaction"]["last_action"]["target_type"] == "url"
+
+
+def test_legacy_folder_key_is_not_executed() -> None:
+    """旧配置里的 folder key 不应再执行本机目录打开。
+
+    入参：无；测试内直接提交兼容 schema 仍接受的旧 folder binding。
+    返回：无返回值；断言通过代表 `open_path` 会被识别但返回 unsupported。
+    错误处理：动作被执行或状态不是 unsupported 时由 pytest 报告。
+    副作用：只修改测试 app 内存 runtime，不打开 Finder。
+    """
+
+    with TestClient(create_app()) as client:
+        client.put(
+            "/ui/key-layout",
+            json={
+                "keys": [
+                    {"index": 0, "kind": "folder", "path": "~/Projects"},
+                    {"index": 1, "kind": "unassigned"},
+                    {"index": 2, "kind": "unassigned"},
+                    {"index": 3, "kind": "unassigned"},
+                    {"index": 4, "kind": "unassigned"},
+                    {"index": 5, "kind": "agent"},
+                    {"index": 6, "kind": "agent"},
+                    {"index": 7, "kind": "agent"},
+                    {"index": 8, "kind": "agent"},
+                    {"index": 9, "kind": "agent"},
+                ]
+            },
+        )
+        response = client.post(
+            "/hardware/input",
+            json=_hardware_input(kind="key", index=0, value={"state": 1}),
+        )
+
+    assert response.json()["interaction_intent"]["intent"] == "open_path"
+    assert response.json()["action"]["status"] == "unsupported"
+    assert response.json()["action"]["ok"] is False
+
+
+def test_unassigned_key_input_shows_brand_feedback_panel() -> None:
+    """未配置按键应短暂显示 Agent Deck 默认品牌面板。
+
+    入参：无；测试内按默认布局的第一个未配置键。
+    返回：无返回值；断言通过代表未配置键不会只是 dry-run，而会触发 touch bar 反馈图。
+    错误处理：intent、action 或 fake 触屏图诊断不符合预期时由 pytest 报告。
+    副作用：只修改测试 app 内存 runtime，不访问真实硬件。
+    """
+
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/hardware/input",
+        json=_hardware_input(kind="key", index=0, value={"state": 1}),
+    )
+    status = client.get("/status").json()
+
+    assert response.status_code == 200
+    assert response.json()["handled"] is True
+    assert response.json()["interaction_intent"]["intent"] == "show_brand_feedback"
+    assert response.json()["action"] == {
+        "intent": "show_brand_feedback",
+        "agent_key": None,
+        "decision_id": None,
+        "status": "shown",
+        "ok": True,
+        "duration_seconds": 4.0,
+        "touchscreen_image_source": "agent_deck:brand_feedback",
+        "touchscreen_image_size": [800, 480],
+        "message": "brand feedback panel shown",
+    }
+    assert status["interaction"]["last_action"]["status"] == "shown"
+    assert status["logical_panel"]["touchscreen_image_source"] == (
+        "agent_deck:brand_feedback"
+    )
+
+
+def test_brand_feedback_panel_expires_back_to_current_logical_panel(
+    monkeypatch: object,
+) -> None:
+    """品牌反馈过期后后台 renderer 应恢复当前 logical panel。
+
+    入参：`monkeypatch` 固定 monotonic 时间；测试内先准备 quota panel，再触发品牌反馈。
+    返回：无返回值；断言通过代表 transient override 不会永久覆盖原面板。
+    错误处理：反馈源或过期恢复源错误时由 pytest 报告。
+    副作用：只修改测试 app 内存 runtime，不访问真实硬件。
+    """
+
+    now = 100.0
+    monkeypatch.setattr(server_app.time, "monotonic", lambda: now)
+    app = create_app()
+    runtime = app.state.runtime
+    runtime.update_codex_quota(_quota_snapshot(), updated_at=datetime.now(UTC))
+
+    client = TestClient(app)
+    client.post(
+        "/hardware/input",
+        json=_hardware_input(kind="key", index=0, value={"state": 1}),
+    )
+    feedback_image, feedback_source = runtime.build_current_logical_panel_background()
+
+    now = 105.0
+    restored_image, restored_source = runtime.build_current_logical_panel_background()
+
+    assert getattr(feedback_image, "size") == (800, 480)
+    assert feedback_source == "agent_deck:brand_feedback"
+    assert getattr(restored_image, "size") == (800, 480)
+    assert restored_source == "codex_quota"
 
 
 def test_streamdock_n4pro_key_images_include_app_bindings(tmp_path: Path) -> None:
@@ -1053,7 +1228,7 @@ def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
     assert renderer_calls
     call = renderer_calls[0]
     assert getattr(call["background_image"], "size") == (800, 480)
-    assert call["key_frame_paths"] == {1: (frame_path.resolve(),)}
+    assert call["key_frame_paths"] == {6: (frame_path.resolve(),)}
     assert call["key_images"] == {}
     assert call["duration_seconds"] == 0.5
     assert call["fps"] == 4
@@ -1338,11 +1513,11 @@ def test_default_n4pro_renderer_input_callback_routes_button_intents(
         assert callable(input_callback)
         response = input_callback(
             object(),
-            _sdk_event(event_type="button", key=11, state=1),
+            _sdk_event(event_type="button", key=16, state=1),
         )
         release_response = input_callback(
             object(),
-            _sdk_event(event_type="button", key=11, state=0),
+            _sdk_event(event_type="button", key=16, state=0),
         )
         status = client.get("/status").json()
 
@@ -1352,10 +1527,10 @@ def test_default_n4pro_renderer_input_callback_routes_button_intents(
     assert release_response["handled"] is False
     assert status["interaction"]["last_intent"]["source"] == "streamdock_button"
     assert status["interaction"]["last_action"]["intent"] == "focus_agent"
-    assert status["streamdock_input"]["recent_events"][-2]["key"] == 11
+    assert status["streamdock_input"]["recent_events"][-2]["key"] == 16
     assert status["streamdock_input"]["recent_events"][-2]["state"] == 1
     assert status["streamdock_input"]["recent_events"][-2]["handled"] is True
-    assert status["streamdock_input"]["recent_events"][-1]["key"] == 11
+    assert status["streamdock_input"]["recent_events"][-1]["key"] == 16
     assert status["streamdock_input"]["recent_events"][-1]["state"] == 0
     assert status["streamdock_input"]["recent_events"][-1]["handled"] is False
     assert status["interaction"]["recent"][-1]["intent"]["intent"] == "select_agent"
