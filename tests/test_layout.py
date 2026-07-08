@@ -209,10 +209,11 @@ def test_n4pro_app_binding_projects_action_payload() -> None:
             N4ProKeyBinding(
                 index=0,
                 kind=KeySurfaceKind.APP,
-                label="Cursor",
-                app_name="Cursor",
-                app_path="/Applications/Cursor.app",
-                icon_token="Cu",
+                label="Finder",
+                app_name="Finder",
+                app_path="/System/Library/CoreServices/Finder.app",
+                bundle_id="com.apple.finder",
+                icon_token="FI",
             ),
             *default_n4pro_key_layout().sorted_keys()[1:],
         )
@@ -229,10 +230,11 @@ def test_n4pro_app_binding_projects_action_payload() -> None:
     assert plan.keys[0].role == "user_action"
     assert plan.keys[0].intent == "open_or_focus_app"
     assert plan.keys[0].action == "open_or_focus_app"
-    assert plan.keys[0].label == "Cursor"
-    assert plan.keys[0].payload["app_name"] == "Cursor"
-    assert plan.keys[0].payload["app_path"] == "/Applications/Cursor.app"
-    assert plan.keys[0].payload["icon_token"] == "Cu"
+    assert plan.keys[0].label == "Finder"
+    assert plan.keys[0].payload["app_name"] == "Finder"
+    assert plan.keys[0].payload["app_path"] == "/System/Library/CoreServices/Finder.app"
+    assert plan.keys[0].payload["bundle_id"] == "com.apple.finder"
+    assert plan.keys[0].payload["icon_token"] == "FI"
 
 
 def test_overview_hides_offline_agents_from_main_button_slots() -> None:

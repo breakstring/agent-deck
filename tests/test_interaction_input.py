@@ -140,13 +140,13 @@ def test_app_key_press_carries_action_payload() -> None:
     layout = _layout(
         second_key=KeyPlan(
             index=1,
-            label="Cursor",
+            label="Finder",
             intent="open_or_focus_app",
             action="open_or_focus_app",
             payload={
-                "app_name": "Cursor",
-                "app_path": "/Applications/Cursor.app",
-                "bundle_id": "com.todesktop.230313mzl4w4u92",
+                "app_name": "Finder",
+                "app_path": "/System/Library/CoreServices/Finder.app",
+                "bundle_id": "com.apple.finder",
             },
         )
     )
@@ -162,9 +162,9 @@ def test_app_key_press_carries_action_payload() -> None:
     assert intent is not None
     assert intent.intent == "open_or_focus_app"
     assert intent.action == "open_or_focus_app"
-    assert intent.payload["app_name"] == "Cursor"
-    assert intent.payload["app_path"] == "/Applications/Cursor.app"
-    assert intent.payload["bundle_id"] == "com.todesktop.230313mzl4w4u92"
+    assert intent.payload["app_name"] == "Finder"
+    assert intent.payload["app_path"] == "/System/Library/CoreServices/Finder.app"
+    assert intent.payload["bundle_id"] == "com.apple.finder"
     assert intent.dry_run is False
 
 

@@ -27,17 +27,17 @@ def test_list_local_apps_reads_bundle_metadata_and_icon(tmp_path: Path) -> None:
 
     app = _fake_app(
         tmp_path,
-        name="Cursor",
-        bundle_id="com.todesktop.230313mzl4w4u92",
+        name="Finder",
+        bundle_id="com.apple.finder",
     )
 
     apps = list_local_apps(roots=(tmp_path,), limit=10)
 
     assert len(apps) == 1
-    assert apps[0].name == "Cursor"
-    assert apps[0].bundle_id == "com.todesktop.230313mzl4w4u92"
+    assert apps[0].name == "Finder"
+    assert apps[0].bundle_id == "com.apple.finder"
     assert apps[0].app_path == str(app)
-    assert apps[0].icon_token == "CU"
+    assert apps[0].icon_token == "FI"
     assert apps[0].icon_data_url is not None
     assert apps[0].icon_data_url.startswith("data:image/png;base64,")
 
@@ -60,15 +60,15 @@ def test_open_or_focus_local_app_uses_structured_open_args() -> None:
         return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
 
     result = open_or_focus_local_app(
-        app_name="Cursor",
-        app_path="/Applications/Cursor.app",
-        bundle_id="com.todesktop.230313mzl4w4u92",
+        app_name="Finder",
+        app_path="/System/Library/CoreServices/Finder.app",
+        bundle_id="com.apple.finder",
         runner=fake_runner,
     )
 
     assert result.ok is True
     assert result.status == "succeeded"
-    assert calls == [["open", "-b", "com.todesktop.230313mzl4w4u92"]]
+    assert calls == [["open", "-b", "com.apple.finder"]]
 
 
 def _fake_app(tmp_path: Path, *, name: str, bundle_id: str) -> Path:

@@ -87,6 +87,55 @@ def list_local_apps(
     return tuple(sorted(apps.values(), key=lambda app: app.name.casefold()))
 
 
+def load_local_app_icon(
+    app_path: str | Path,
+    *,
+    max_size: tuple[int, int] = (96, 96),
+) -> Image.Image | None:
+    """读取单个 `.app` bundle 的图标并转换成 RGBA 图像。
+
+    入参：`app_path` 是 `.app` bundle 路径；`max_size` 是返回图像的最大尺寸。
+    返回：成功时返回独立的 RGBA `Image`；缺少 plist、缺少图标或解析失败时返回 None。
+    错误处理：图标读取异常被吞掉，避免坏 App 图标影响硬件渲染。
+    副作用：只读访问 bundle 内 `Info.plist` 和图标资源；不启动 App、不访问网络。
+    """
+
+    bundle_path = Path(app_path).expanduser()
+    plist_path = bundle_path / "Contents" / "Info.plist"
+    try:
+        with plist_path.open("rb") as handle:
+            info = plistlib.load(handle)
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    icon_path = _icon_path(info, bundle_path)
+    if icon_path is None:
+        return None
+    return load_image_icon(icon_path, max_size=max_size)
+
+
+def load_image_icon(
+    path: str | Path,
+    *,
+    max_size: tuple[int, int] = (96, 96),
+) -> Image.Image | None:
+    """读取 Pillow 支持的图标文件并缩放到最大尺寸内。
+
+    入参：`path` 是 `.icns`、PNG 等图标文件路径；`max_size` 是返回图像的最大尺寸。
+    返回：成功时返回独立 RGBA 图像；读取或转换失败返回 None。
+    错误处理：吞掉图标解析异常，调用方用文字 fallback。
+    副作用：只读图片文件。
+    """
+
+    try:
+        with Image.open(path) as image:
+            image.load()
+            converted = image.convert("RGBA")
+            converted.thumbnail(max_size, Image.Resampling.LANCZOS)
+            return converted.copy()
+    except Exception:
+        return None
+
+
 def open_or_focus_local_app(
     *,
     app_name: str | None = None,
@@ -261,15 +310,11 @@ def _icon_data_url(path: Path) -> str | None:
     副作用：只读图片文件并在内存中编码。
     """
 
-    try:
-        with Image.open(path) as image:
-            image.load()
-            converted = image.convert("RGBA")
-            converted.thumbnail((96, 96), Image.Resampling.LANCZOS)
-            buffer = io.BytesIO()
-            converted.save(buffer, format="PNG")
-    except Exception:
+    converted = load_image_icon(path)
+    if converted is None:
         return None
+    buffer = io.BytesIO()
+    converted.save(buffer, format="PNG")
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
 

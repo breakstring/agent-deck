@@ -9,6 +9,7 @@ pytest temp files, and pytest assertion reporting.
 from __future__ import annotations
 
 import asyncio
+import plistlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -28,10 +29,18 @@ from agent_deck.adapters.codex_tokens import (
     CodexTokenUsageStats,
 )
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
+from agent_deck.core.modes import DeckMode, DeckSelection
 from agent_deck.core.state import AgentStatus
 from agent_deck.hardware.fake import HardwareInput
 from agent_deck.hardware.streamdock_n4pro import StreamDockN4ProAnimationResult
 from agent_deck.hardware.streamdock_touchscreen import StreamDockTouchscreenRenderResult
+from agent_deck.rendering.key_surface import (
+    KeySurfaceKind,
+    N4ProKeyBinding,
+    N4ProKeyLayout,
+    default_n4pro_key_layout,
+)
+from agent_deck.rendering.layout import build_layout_plan
 from agent_deck.server.app import DaemonPollerConfig, create_app
 
 
@@ -92,10 +101,10 @@ def test_local_apps_api_returns_injected_catalog() -> None:
     app = create_app(
         local_app_catalog_reader=lambda: (
             LocalAppInfo(
-                name="Cursor",
-                app_path="/Applications/Cursor.app",
-                bundle_id="com.todesktop.230313mzl4w4u92",
-                icon_token="CU",
+                name="Finder",
+                app_path="/System/Library/CoreServices/Finder.app",
+                bundle_id="com.apple.finder",
+                icon_token="FI",
                 icon_data_url="data:image/png;base64,abc",
             ),
         )
@@ -109,10 +118,10 @@ def test_local_apps_api_returns_injected_catalog() -> None:
         "platform": "darwin",
         "apps": [
             {
-                "name": "Cursor",
-                "app_path": "/Applications/Cursor.app",
-                "bundle_id": "com.todesktop.230313mzl4w4u92",
-                "icon_token": "CU",
+                "name": "Finder",
+                "app_path": "/System/Library/CoreServices/Finder.app",
+                "bundle_id": "com.apple.finder",
+                "icon_token": "FI",
                 "icon_data_url": "data:image/png;base64,abc",
             }
         ],
@@ -134,10 +143,11 @@ def test_key_layout_api_saves_runtime_layout_and_updates_status_projection() -> 
             {
                 "index": 0,
                 "kind": "app",
-                "label": "Cursor",
-                "app_name": "Cursor",
-                "app_path": "/Applications/Cursor.app",
-                "icon_token": "Cu",
+                "label": "Finder",
+                "app_name": "Finder",
+                "app_path": "/System/Library/CoreServices/Finder.app",
+                "bundle_id": "com.apple.finder",
+                "icon_token": "FI",
             },
             {"index": 1, "kind": "unassigned"},
             {"index": 2, "kind": "unassigned"},
@@ -160,7 +170,7 @@ def test_key_layout_api_saves_runtime_layout_and_updates_status_projection() -> 
     assert status["key_layout"]["source"] == "runtime"
     assert status["layout"]["keys"][0]["kind"] == "app"
     assert status["layout"]["keys"][0]["intent"] == "open_or_focus_app"
-    assert status["layout"]["keys"][0]["payload"]["app_name"] == "Cursor"
+    assert status["layout"]["keys"][0]["payload"]["app_name"] == "Finder"
     assert status["layout"]["keys"][1]["kind"] == "unassigned"
     assert status["layout"]["keys"][1]["intent"] == "show_brand_feedback"
     assert status["layout"]["keys"][5]["kind"] == "agent"
@@ -185,10 +195,11 @@ def test_key_layout_api_persists_layout_when_store_path_is_configured(
             {
                 "index": 0,
                 "kind": "app",
-                "label": "Cursor",
-                "app_name": "Cursor",
-                "app_path": "/Applications/Cursor.app",
-                "icon_token": "Cu",
+                "label": "Finder",
+                "app_name": "Finder",
+                "app_path": "/System/Library/CoreServices/Finder.app",
+                "bundle_id": "com.apple.finder",
+                "icon_token": "FI",
             },
             {"index": 1, "kind": "unassigned"},
             {"index": 2, "kind": "unassigned"},
@@ -216,7 +227,7 @@ def test_key_layout_api_persists_layout_when_store_path_is_configured(
     assert restored.json()["source"] == "persisted"
     assert restored.json()["path"] == str(layout_path)
     assert restored.json()["layout"]["keys"][0]["kind"] == "app"
-    assert restored.json()["layout"]["keys"][0]["app_name"] == "Cursor"
+    assert restored.json()["layout"]["keys"][0]["app_name"] == "Finder"
 
 
 def test_key_layout_store_error_falls_back_to_default_layout(tmp_path: Path) -> None:
@@ -258,7 +269,7 @@ def test_key_layout_api_rejects_incomplete_or_high_risk_shape() -> None:
         "/ui/key-layout",
         json={
             "keys": [
-                {"index": 0, "kind": "app", "app_name": "Cursor"},
+                {"index": 0, "kind": "app", "app_name": "Finder"},
                 {"index": 1, "kind": "unassigned"},
                 {"index": 2, "kind": "unassigned"},
                 {"index": 3, "kind": "unassigned"},
@@ -818,11 +829,11 @@ def test_app_key_input_executes_local_app_action() -> None:
                     {
                         "index": 0,
                         "kind": "app",
-                        "label": "Cursor",
-                        "app_name": "Cursor",
-                        "app_path": "/Applications/Cursor.app",
-                        "bundle_id": "com.todesktop.230313mzl4w4u92",
-                        "icon_token": "CU",
+                        "label": "Finder",
+                        "app_name": "Finder",
+                        "app_path": "/System/Library/CoreServices/Finder.app",
+                        "bundle_id": "com.apple.finder",
+                        "icon_token": "FI",
                     },
                     {"index": 1, "kind": "unassigned"},
                     {"index": 2, "kind": "unassigned"},
@@ -844,18 +855,58 @@ def test_app_key_input_executes_local_app_action() -> None:
 
     assert calls == [
         {
-            "app_name": "Cursor",
-            "app_path": "/Applications/Cursor.app",
-            "bundle_id": "com.todesktop.230313mzl4w4u92",
+            "app_name": "Finder",
+            "app_path": "/System/Library/CoreServices/Finder.app",
+            "bundle_id": "com.apple.finder",
         }
     ]
     assert response.status_code == 200
     assert response.json()["interaction_intent"]["intent"] == "open_or_focus_app"
     assert response.json()["interaction_intent"]["dry_run"] is False
-    assert response.json()["interaction_intent"]["payload"]["app_name"] == "Cursor"
+    assert response.json()["interaction_intent"]["payload"]["app_name"] == "Finder"
     assert response.json()["action"]["status"] == "succeeded"
-    assert response.json()["action"]["bundle_id"] == "com.todesktop.230313mzl4w4u92"
-    assert status["interaction"]["last_action"]["message"] == "opened Cursor"
+    assert response.json()["action"]["bundle_id"] == "com.apple.finder"
+    assert status["interaction"]["last_action"]["message"] == "opened Finder"
+
+
+def test_streamdock_n4pro_key_images_include_app_bindings(tmp_path: Path) -> None:
+    """N4 Pro renderer 应把 App binding 转成静态物理按键图。
+
+    入参：`tmp_path` 提供 fake Finder `.app` bundle。
+    返回：无返回值；断言通过代表 daemon renderer 会把 App key 投影到 key_images。
+    错误处理：缺少 key image、尺寸错误或未使用 App 图标时由 pytest 报告。
+    副作用：只写 pytest 临时目录，不访问真实 N4 Pro 或真实 App。
+    """
+
+    finder_app = _fake_finder_app(tmp_path)
+    key_layout = N4ProKeyLayout(
+        keys=(
+            N4ProKeyBinding(
+                index=0,
+                kind=KeySurfaceKind.APP,
+                label="Finder",
+                app_name="Finder",
+                app_path=str(finder_app),
+                bundle_id="com.apple.finder",
+                icon_token="FI",
+            ),
+            *default_n4pro_key_layout().sorted_keys()[1:],
+        )
+    )
+    layout = build_layout_plan(
+        [],
+        [],
+        DeckSelection(mode=DeckMode.OVERVIEW),
+        key_layout=key_layout,
+    )
+
+    key_images = server_app._key_images_from_layout(layout)
+
+    assert sorted(key_images) == [1]
+    image = key_images[1]
+    assert getattr(image, "size") == (112, 112)
+    assert getattr(image, "mode") == "RGB"
+    assert _near_color(image.getpixel((56, 56)), (20, 120, 220))
 
 
 def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
@@ -990,6 +1041,7 @@ def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
     call = renderer_calls[0]
     assert getattr(call["background_image"], "size") == (800, 480)
     assert call["key_frame_paths"] == {1: (frame_path.resolve(),)}
+    assert call["key_images"] == {}
     assert call["duration_seconds"] == 0.5
     assert call["fps"] == 4
     assert len(visible_splash_calls) == 2
@@ -1073,6 +1125,7 @@ def test_streamdock_n4pro_renderer_starts_with_placeholder_without_panel_data(
     assert background_image.getpixel((400, 120)) == (14, 18, 28)
     assert background_image.getpixel((82, 408)) != (14, 18, 28)
     assert call["key_frame_paths"] == {}
+    assert call["key_images"] == {}
     assert len(visible_splash_calls) == 2
     shutdown_background_image = visible_splash_calls[-1]
     assert getattr(shutdown_background_image, "size") == (800, 480)
@@ -1792,6 +1845,48 @@ def _hardware_input(
         "value": value,
         "occurred_at": datetime(2026, 6, 22, 12, 0, tzinfo=UTC).isoformat(),
     }
+
+
+def _fake_finder_app(tmp_path: Path) -> Path:
+    """创建测试用 fake Finder `.app` bundle。
+
+    入参：`tmp_path` 是 fake 应用根目录。
+    返回：fake Finder bundle 路径。
+    错误处理：文件写入失败按 pathlib/Pillow 异常传播。
+    副作用：写 pytest 临时目录。
+    """
+
+    app = tmp_path / "Finder.app"
+    resources = app / "Contents" / "Resources"
+    resources.mkdir(parents=True)
+    with (app / "Contents" / "Info.plist").open("wb") as handle:
+        plistlib.dump(
+            {
+                "CFBundleName": "Finder",
+                "CFBundleIdentifier": "com.apple.finder",
+                "CFBundleIconFile": "Finder.png",
+            },
+            handle,
+        )
+    Image.new("RGBA", (64, 64), (20, 120, 220, 255)).save(resources / "Finder.png")
+    return app
+
+
+def _near_color(
+    actual: tuple[int, int, int],
+    expected: tuple[int, int, int],
+    *,
+    tolerance: int = 24,
+) -> bool:
+    """判断采样像素是否接近目标 RGB。
+
+    入参：`actual` 是采样像素；`expected` 是目标颜色；`tolerance` 是每通道容差。
+    返回：三通道都在容差内时返回 True。
+    错误处理：无。
+    副作用：无。
+    """
+
+    return all(abs(a - b) <= tolerance for a, b in zip(actual, expected, strict=True))
 
 
 def _key_index_for_agent(status: dict[str, object], agent_key: str) -> int:

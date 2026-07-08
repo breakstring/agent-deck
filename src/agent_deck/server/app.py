@@ -69,6 +69,7 @@ from agent_deck.input.interactions import (
     interaction_intent_from_streamdock_input_event,
 )
 from agent_deck.rendering.brand import render_agent_deck_splash_touchscreen
+from agent_deck.rendering.app_key import render_app_key_image
 from agent_deck.rendering.codex_key_frames import codex_key_frame_paths_for_key_variants
 from agent_deck.rendering.key_surface import (
     N4ProKeyLayout,
@@ -1856,10 +1857,12 @@ async def _render_streamdock_n4pro_once(
             layout,
             frame_root=frame_root,
         )
+        key_images = _key_images_from_layout(layout)
         result = await asyncio.to_thread(
             renderer_sink,
             background_image=background,
             key_frame_paths=key_frame_paths,
+            key_images=key_images,
             duration_seconds=duration_seconds,
             fps=fps,
         )
@@ -1930,6 +1933,28 @@ def _key_frame_paths_from_layout(
         frame_root=frame_root,
         key_variants=key_variants,
     )
+
+
+def _key_images_from_layout(layout: LayoutPlan) -> dict[int, Any]:
+    """从 layout 提取 N4 Pro 静态主键图片。
+
+    入参：`layout` 是当前 daemon layout。
+    返回：物理按钮编号到 Pillow 图像的映射；当前只包含 App quick-action 主键。
+    错误处理：单个 App 图标读取失败会 fallback 成 token 图，不影响整轮渲染。
+    副作用：可能只读 `.app` bundle 图标资源；不访问硬件、不启动 App。
+    """
+
+    key_images: dict[int, Any] = {}
+    for key in layout.keys[:10]:
+        if key.kind != "app":
+            continue
+        key_images[key.index + 1] = render_app_key_image(
+            app_name=key.payload.get("app_name") or key.label,
+            app_path=key.payload.get("app_path"),
+            icon_token=key.payload.get("icon_token"),
+            icon_color=key.payload.get("icon_color"),
+        )
+    return key_images
 
 
 def _active_tool_from_reason(reason: str) -> str | None:

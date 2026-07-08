@@ -299,6 +299,79 @@ def test_animate_key_images_on_n4pro_keeps_one_device_session(
     assert device.calls[-1] == ("close", False)
 
 
+def test_animate_key_images_on_n4pro_writes_static_key_images(
+    tmp_path: Path,
+) -> None:
+    """验证动画 sink 能在同一设备会话里写入 App 等静态按键图。
+
+    入参：`tmp_path` 提供临时背景和静态图目录。
+    返回：无返回值；断言通过表示静态图下发后会 refresh，且不要求动态帧。
+    错误处理：调用顺序、key_count 或临时文件清理不符合预期时由 pytest 报告。
+    副作用：在 pytest 临时目录写入 PNG/JPEG 文件；不访问真实 N4 Pro。
+    """
+
+    device = FakeN4ProUnifiedDevice(background_result=0, key_result=0)
+    manager = FakeUnifiedManager([device])
+
+    result = animate_key_images_on_n4pro(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={},
+        key_images={1: Image.new("RGB", (112, 112), (20, 120, 220))},
+        duration_seconds=0.3,
+        fps=10,
+        manager=manager,
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+
+    assert result.ok is True
+    assert result.frames_rendered == 1
+    assert result.key_count == 1
+    assert [name for name, _ in device.calls] == [
+        "open",
+        "init",
+        "set_frame_background",
+        "set_key_image",
+        "refresh",
+        "close",
+    ]
+    assert device.calls[3] == ("set_key_image", 1)
+    assert device.calls[-1] == ("close", False)
+    assert all(not path.exists() for path in device.paths_seen)
+
+
+def test_animate_key_images_on_n4pro_reports_static_key_failure(
+    tmp_path: Path,
+) -> None:
+    """验证静态按键图下发失败时会返回明确错误。
+
+    入参：`tmp_path` 提供临时背景和静态图目录。
+    返回：无返回值；断言通过表示 App 静态图失败不会被误报为成功。
+    错误处理：错误信息或关闭行为不符合预期时由 pytest 报告。
+    副作用：只操作 fake device 和 pytest 临时文件，不访问真实 N4 Pro。
+    """
+
+    device = FakeN4ProUnifiedDevice(background_result=0, key_result=-1)
+    manager = FakeUnifiedManager([device])
+
+    result = animate_key_images_on_n4pro(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={},
+        key_images={1: Image.new("RGB", (112, 112), (20, 120, 220))},
+        duration_seconds=0.3,
+        fps=10,
+        manager=manager,
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+
+    assert result.ok is False
+    assert result.key_count == 1
+    assert result.error == "set_key_image failed for key 1: SDK returned -1"
+    assert device.calls[-1] == ("close", False)
+    assert all(not path.exists() for path in device.paths_seen)
+
+
 def test_animate_key_images_on_n4pro_reports_timing_diagnostics(
     tmp_path: Path,
 ) -> None:
@@ -331,6 +404,7 @@ def test_animate_key_images_on_n4pro_reports_timing_diagnostics(
     assert result.timing_seconds == {
         "open_init": 0.1,
         "background": 0.1,
+        "static_keys": 0.0,
         "first_frame": 0.1,
         "playback": 0.7,
         "close": 0.1,

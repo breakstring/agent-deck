@@ -211,11 +211,13 @@ class StreamDockN4ProPersistentAnimator:
         key_frame_paths: Mapping[int, tuple[Path, ...]],
         duration_seconds: float,
         fps: int,
+        key_images: Mapping[int, Image.Image] | None = None,
     ) -> StreamDockN4ProAnimationResult:
         """播放一轮按键动画，复用已经打开的 N4 Pro 会话。
 
         入参：`background_image` 是可选 800x480 背景图；`key_frame_paths` 是 key 到帧 PNG
-        路径的映射；`duration_seconds` 是本轮播放窗口；`fps` 是目标帧率。
+        路径的映射；`key_images` 是 key 到静态 Pillow 图的映射；`duration_seconds` 是本轮
+        播放窗口；`fps` 是目标帧率。
         返回：`StreamDockN4ProAnimationResult`，成功结果包含 timing 诊断；persistent 模式下
         `close` 阶段耗时固定为 0，真实 close 只在 `close()` 中发生。
         错误处理：非法参数、设备不可用或 SDK 返回 -1 时返回 `ok=False`；异常会关闭当前会话
@@ -227,6 +229,7 @@ class StreamDockN4ProPersistentAnimator:
             duration_seconds=duration_seconds,
             fps=fps,
             key_frame_paths=key_frame_paths,
+            key_images=key_images,
             require_surface=background_image is not None,
         )
         if validation_error is not None:
@@ -234,6 +237,8 @@ class StreamDockN4ProPersistentAnimator:
         normalized_frames = {
             key: tuple(paths) for key, paths in key_frame_paths.items()
         }
+        normalized_key_images = dict(key_images or {})
+        key_count = len(set(normalized_frames) | set(normalized_key_images))
         frame_budget = max(1, int(round(duration_seconds * fps)))
         frame_interval = 1.0 / fps
         timing: dict[str, float] = {}
@@ -268,13 +273,12 @@ class StreamDockN4ProPersistentAnimator:
             else:
                 timing["background"] = 0.0
 
-            frames_rendered = 0
-            playback_started_at = after_background
-            next_frame_at = playback_started_at
-            for frame_index in range(frame_budget):
-                for key, paths in normalized_frames.items():
-                    frame_path = paths[frame_index % len(paths)]
-                    key_result = device.set_key_image(key, str(frame_path))
+            if normalized_key_images:
+                static_started_at = self._monotonic()
+                for key, image in normalized_key_images.items():
+                    key_path = _save_temp_png(image, temp_dir=self._temp_dir)
+                    temp_paths.append(key_path)
+                    key_result = device.set_key_image(key, str(key_path))
                     if key_result == -1:
                         self.close()
                         return StreamDockN4ProAnimationResult(
@@ -282,22 +286,56 @@ class StreamDockN4ProPersistentAnimator:
                             device_type=self._device_type,
                             path=self._path,
                             background_result=_stringify_optional(background_result),
-                            frames_rendered=frames_rendered,
-                            key_count=len(normalized_frames),
+                            key_count=key_count,
                             error=f"set_key_image failed for key {key}: SDK returned -1",
                         )
+                timing["static_keys"] = _elapsed_seconds(
+                    static_started_at,
+                    self._monotonic(),
+                )
+                after_static = self._monotonic()
+            else:
+                timing["static_keys"] = 0.0
+                after_static = after_background
+
+            frames_rendered = 0
+            playback_started_at = after_static
+            next_frame_at = playback_started_at
+            if normalized_frames:
+                for frame_index in range(frame_budget):
+                    for key, paths in normalized_frames.items():
+                        frame_path = paths[frame_index % len(paths)]
+                        key_result = device.set_key_image(key, str(frame_path))
+                        if key_result == -1:
+                            self.close()
+                            return StreamDockN4ProAnimationResult(
+                                ok=False,
+                                device_type=self._device_type,
+                                path=self._path,
+                                background_result=_stringify_optional(background_result),
+                                frames_rendered=frames_rendered,
+                                key_count=key_count,
+                                error=f"set_key_image failed for key {key}: SDK returned -1",
+                            )
+                    device.refresh()
+                    frames_rendered += 1
+                    if frames_rendered == 1:
+                        timing["first_frame"] = _elapsed_seconds(
+                            playback_started_at,
+                            self._monotonic(),
+                        )
+                    next_frame_at += frame_interval
+                    if frame_index + 1 < frame_budget:
+                        delay = next_frame_at - self._monotonic()
+                        if delay > 0:
+                            self._sleep(delay)
+            else:
                 device.refresh()
                 frames_rendered += 1
-                if frames_rendered == 1:
-                    timing["first_frame"] = _elapsed_seconds(
-                        playback_started_at,
-                        self._monotonic(),
-                    )
-                next_frame_at += frame_interval
-                if frame_index + 1 < frame_budget:
-                    delay = next_frame_at - self._monotonic()
-                    if delay > 0:
-                        self._sleep(delay)
+                timing["first_frame"] = _elapsed_seconds(
+                    playback_started_at,
+                    self._monotonic(),
+                )
 
             playback_finished_at = self._monotonic()
             timing.setdefault("first_frame", 0.0)
@@ -313,7 +351,7 @@ class StreamDockN4ProPersistentAnimator:
                 path=self._path,
                 background_result=_stringify_optional(background_result),
                 frames_rendered=frames_rendered,
-                key_count=len(normalized_frames),
+                key_count=key_count,
                 timing_seconds=timing,
             )
         except Exception as exc:
@@ -524,6 +562,7 @@ def animate_key_images_on_n4pro(
     key_frame_paths: Mapping[int, tuple[Path, ...]],
     duration_seconds: float,
     fps: int,
+    key_images: Mapping[int, Image.Image] | None = None,
     manager: StreamDockN4ProManagerLike | None = None,
     temp_dir: Path | None = None,
     sleep: Callable[[float], None] = time.sleep,
@@ -532,9 +571,10 @@ def animate_key_images_on_n4pro(
     """在同一次 N4 Pro 设备会话里播放多个按键动画并保留背景层。
 
     入参：`background_image` 是可选 800x480 背景图；`key_frame_paths` 是 key 到帧 PNG
-    路径元组的映射，key 必须在 1-15 且每个 key 至少一帧；`duration_seconds` 是播放时长；
-    `fps` 是目标刷新帧率；`manager` 可注入 fake 或官方 DeviceManager；`temp_dir` 是背景
-    临时 JPEG 目录；`sleep`/`monotonic` 仅供测试替换计时函数。
+    路径元组的映射，key 必须在 1-15 且每个 key 至少一帧；`key_images` 是 key 到静态
+    Pillow 图像的映射；`duration_seconds` 是播放时长；`fps` 是目标刷新帧率；`manager`
+    可注入 fake 或官方 DeviceManager；`temp_dir` 是背景临时 JPEG 目录；`sleep`/`monotonic`
+    仅供测试替换计时函数。
     返回：`StreamDockN4ProAnimationResult`，成功时包含刷新帧数和参与按键数。
     错误处理：非法 key、空帧、时长/FPS 非正、找不到 N4 Pro、open false、SDK 返回 -1 或
     抛异常都会返回 `ok=False`；临时背景文件会尽力清理。
@@ -549,26 +589,20 @@ def animate_key_images_on_n4pro(
         )
     if fps <= 0:
         return StreamDockN4ProAnimationResult(ok=False, error="fps must be positive")
+    validation_error = _validate_animation_inputs(
+        duration_seconds=duration_seconds,
+        fps=fps,
+        key_frame_paths=key_frame_paths,
+        key_images=key_images,
+        require_surface=background_image is not None,
+    )
+    if validation_error is not None:
+        return validation_error
     normalized_frames = {
         key: tuple(paths) for key, paths in key_frame_paths.items()
     }
-    invalid_keys = sorted(key for key in normalized_frames if key not in range(1, 16))
-    if invalid_keys:
-        return StreamDockN4ProAnimationResult(
-            ok=False,
-            error=f"keys must be in range 1..15: {invalid_keys}",
-        )
-    empty_keys = sorted(key for key, paths in normalized_frames.items() if not paths)
-    if empty_keys:
-        return StreamDockN4ProAnimationResult(
-            ok=False,
-            error=f"keys must have at least one frame: {empty_keys}",
-        )
-    if background_image is None and not normalized_frames:
-        return StreamDockN4ProAnimationResult(
-            ok=False,
-            error="at least one background or key animation is required",
-        )
+    normalized_key_images = dict(key_images or {})
+    key_count = len(set(normalized_frames) | set(normalized_key_images))
 
     active_manager = manager if manager is not None else _load_default_manager()
     device = _first_n4pro_device(active_manager.enumerate())
@@ -617,35 +651,61 @@ def animate_key_images_on_n4pro(
         else:
             timing["background"] = 0.0
 
-        frames_rendered = 0
-        playback_started_at = after_background
-        next_frame_at = playback_started_at
-        for frame_index in range(frame_budget):
-            for key, paths in normalized_frames.items():
-                frame_path = paths[frame_index % len(paths)]
-                key_result = device.set_key_image(key, str(frame_path))
+        if normalized_key_images:
+            static_started_at = monotonic()
+            for key, image in normalized_key_images.items():
+                key_path = _save_temp_png(image, temp_dir=temp_dir)
+                temp_paths.append(key_path)
+                key_result = device.set_key_image(key, str(key_path))
                 if key_result == -1:
                     return StreamDockN4ProAnimationResult(
                         ok=False,
                         device_type=device_type,
                         path=path,
                         background_result=_stringify_optional(background_result),
-                        frames_rendered=frames_rendered,
-                        key_count=len(normalized_frames),
+                        key_count=key_count,
                         error=f"set_key_image failed for key {key}: SDK returned -1",
                     )
+            timing["static_keys"] = _elapsed_seconds(static_started_at, monotonic())
+            after_static = monotonic()
+        else:
+            timing["static_keys"] = 0.0
+            after_static = after_background
+
+        frames_rendered = 0
+        playback_started_at = after_static
+        next_frame_at = playback_started_at
+        if normalized_frames:
+            for frame_index in range(frame_budget):
+                for key, paths in normalized_frames.items():
+                    frame_path = paths[frame_index % len(paths)]
+                    key_result = device.set_key_image(key, str(frame_path))
+                    if key_result == -1:
+                        return StreamDockN4ProAnimationResult(
+                            ok=False,
+                            device_type=device_type,
+                            path=path,
+                            background_result=_stringify_optional(background_result),
+                            frames_rendered=frames_rendered,
+                            key_count=key_count,
+                            error=f"set_key_image failed for key {key}: SDK returned -1",
+                        )
+                device.refresh()
+                frames_rendered += 1
+                if frames_rendered == 1:
+                    timing["first_frame"] = _elapsed_seconds(
+                        playback_started_at,
+                        monotonic(),
+                    )
+                next_frame_at += frame_interval
+                if frame_index + 1 < frame_budget:
+                    delay = next_frame_at - monotonic()
+                    if delay > 0:
+                        sleep(delay)
+        else:
             device.refresh()
             frames_rendered += 1
-            if frames_rendered == 1:
-                timing["first_frame"] = _elapsed_seconds(
-                    playback_started_at,
-                    monotonic(),
-                )
-            next_frame_at += frame_interval
-            if frame_index + 1 < frame_budget:
-                delay = next_frame_at - monotonic()
-                if delay > 0:
-                    sleep(delay)
+            timing["first_frame"] = _elapsed_seconds(playback_started_at, monotonic())
 
         playback_finished_at = monotonic()
         timing.setdefault("first_frame", 0.0)
@@ -656,7 +716,7 @@ def animate_key_images_on_n4pro(
             path=path,
             background_result=_stringify_optional(background_result),
             frames_rendered=frames_rendered,
-            key_count=len(normalized_frames),
+            key_count=key_count,
             timing_seconds=timing,
         )
     except Exception as exc:
@@ -707,12 +767,14 @@ def _validate_animation_inputs(
     duration_seconds: float,
     fps: int,
     key_frame_paths: Mapping[int, tuple[Path, ...]],
+    key_images: Mapping[int, Image.Image] | None,
     require_surface: bool,
 ) -> StreamDockN4ProAnimationResult | None:
     """校验 N4 Pro 按键动画 sink 的硬件无关参数。
 
     入参：`duration_seconds` 是播放窗口；`fps` 是目标帧率；`key_frame_paths` 是 key 到帧路径；
-    `require_surface` 表示调用方已经提供背景或其他非 key surface。
+    `key_images` 是 key 到静态图的映射；`require_surface` 表示调用方已经提供背景或其他非 key
+    surface。
     返回：参数合法时返回 None；非法时返回 `ok=False` 的错误结果。
     错误处理：本函数不抛业务异常，统一把校验失败转成结果对象。
     副作用：无；只读取内存参数，不访问文件或硬件。
@@ -728,7 +790,12 @@ def _validate_animation_inputs(
     normalized_frames = {
         key: tuple(paths) for key, paths in key_frame_paths.items()
     }
-    invalid_keys = sorted(key for key in normalized_frames if key not in range(1, 16))
+    normalized_key_images = dict(key_images or {})
+    invalid_keys = sorted(
+        key
+        for key in set(normalized_frames) | set(normalized_key_images)
+        if key not in range(1, 16)
+    )
     if invalid_keys:
         return StreamDockN4ProAnimationResult(
             ok=False,
@@ -740,10 +807,10 @@ def _validate_animation_inputs(
             ok=False,
             error=f"keys must have at least one frame: {empty_keys}",
         )
-    if not require_surface and not normalized_frames:
+    if not require_surface and not normalized_frames and not normalized_key_images:
         return StreamDockN4ProAnimationResult(
             ok=False,
-            error="at least one background or key animation is required",
+            error="at least one background, key animation, or key image is required",
         )
     return None
 
