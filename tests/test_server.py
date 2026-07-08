@@ -1,9 +1,9 @@
 """Tests for the local Agent Deck daemon HTTP API.
 
 These tests define Task 7's in-process FastAPI contract only. They do not open
-real sockets, probe StreamDock hardware, install hooks, read user files, or
-persist configuration; their side effects are limited to TestClient requests,
-local asyncio scheduling inside FastAPI, and pytest assertion reporting.
+real sockets, probe StreamDock hardware, install hooks, or read user files; their side
+effects are limited to TestClient requests, local asyncio scheduling inside FastAPI,
+pytest temp files, and pytest assertion reporting.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 from PIL import Image
 
+from agent_deck.actions.apps import LocalAppActionResult, LocalAppInfo
 from agent_deck.actions.focus import FocusActionResult
 from agent_deck.adapters.codex_app_state import CodexAppActiveSession
 from agent_deck.adapters.codex_quota import CodexQuotaSnapshot
@@ -77,6 +78,45 @@ def test_web_asset_route_serves_only_whitelisted_assets() -> None:
     assert css_response.headers["content-type"].startswith("text/css")
     assert missing_response.status_code == 404
     assert missing_web_response.status_code == 404
+
+
+def test_local_apps_api_returns_injected_catalog() -> None:
+    """Verify GUI can fetch local App catalog from the daemon.
+
+    入参：无；测试内注入 fake app catalog reader。
+    返回：无返回值；断言通过代表 `/ui/apps` 暴露 App 名称、路径、bundle id 和图标。
+    错误处理：catalog reader 未调用或 JSON shape 错误时由 pytest 报告。
+    副作用：只创建 TestClient，不扫描本机应用目录。
+    """
+
+    app = create_app(
+        local_app_catalog_reader=lambda: (
+            LocalAppInfo(
+                name="Cursor",
+                app_path="/Applications/Cursor.app",
+                bundle_id="com.todesktop.230313mzl4w4u92",
+                icon_token="CU",
+                icon_data_url="data:image/png;base64,abc",
+            ),
+        )
+    )
+    client = TestClient(app)
+
+    response = client.get("/ui/apps")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "platform": "darwin",
+        "apps": [
+            {
+                "name": "Cursor",
+                "app_path": "/Applications/Cursor.app",
+                "bundle_id": "com.todesktop.230313mzl4w4u92",
+                "icon_token": "CU",
+                "icon_data_url": "data:image/png;base64,abc",
+            }
+        ],
+    }
 
 
 def test_key_layout_api_saves_runtime_layout_and_updates_status_projection() -> None:
@@ -732,6 +772,90 @@ def test_focus_action_can_be_disabled_for_diagnostics() -> None:
         "focus_agent dry-run recorded for app:Codex"
     )
     assert status["interaction"]["last_action"]["status"] == "dry_run"
+
+
+def test_app_key_input_executes_local_app_action() -> None:
+    """App key press should execute the structured local App action.
+
+    入参：无；测试内保存 App key layout 并注入 fake App action executor。
+    返回：无返回值；断言通过代表硬件按键会把 payload 交给 action 层。
+    错误处理：payload 丢失、executor 未调用或 action 诊断错误时由 pytest 报告。
+    副作用：只修改测试 app 内存 runtime，不启动真实 App。
+    """
+
+    calls: list[dict[str, str | None]] = []
+
+    def fake_app_executor(
+        *,
+        app_name: str | None = None,
+        app_path: str | None = None,
+        bundle_id: str | None = None,
+    ) -> LocalAppActionResult:
+        """记录 App action payload 并返回成功。"""
+
+        calls.append(
+            {
+                "app_name": app_name,
+                "app_path": app_path,
+                "bundle_id": bundle_id,
+            }
+        )
+        return LocalAppActionResult(
+            ok=True,
+            status="succeeded",
+            app_name=app_name,
+            app_path=app_path,
+            bundle_id=bundle_id,
+            message=f"opened {app_name}",
+        )
+
+    app = create_app(local_app_action_executor=fake_app_executor)
+    with TestClient(app) as client:
+        client.put(
+            "/ui/key-layout",
+            json={
+                "keys": [
+                    {
+                        "index": 0,
+                        "kind": "app",
+                        "label": "Cursor",
+                        "app_name": "Cursor",
+                        "app_path": "/Applications/Cursor.app",
+                        "bundle_id": "com.todesktop.230313mzl4w4u92",
+                        "icon_token": "CU",
+                    },
+                    {"index": 1, "kind": "unassigned"},
+                    {"index": 2, "kind": "unassigned"},
+                    {"index": 3, "kind": "unassigned"},
+                    {"index": 4, "kind": "unassigned"},
+                    {"index": 5, "kind": "agent"},
+                    {"index": 6, "kind": "agent"},
+                    {"index": 7, "kind": "agent"},
+                    {"index": 8, "kind": "agent"},
+                    {"index": 9, "kind": "agent"},
+                ]
+            },
+        )
+        response = client.post(
+            "/hardware/input",
+            json=_hardware_input(kind="key", index=0, value={"state": 1}),
+        )
+        status = client.get("/status").json()
+
+    assert calls == [
+        {
+            "app_name": "Cursor",
+            "app_path": "/Applications/Cursor.app",
+            "bundle_id": "com.todesktop.230313mzl4w4u92",
+        }
+    ]
+    assert response.status_code == 200
+    assert response.json()["interaction_intent"]["intent"] == "open_or_focus_app"
+    assert response.json()["interaction_intent"]["dry_run"] is False
+    assert response.json()["interaction_intent"]["payload"]["app_name"] == "Cursor"
+    assert response.json()["action"]["status"] == "succeeded"
+    assert response.json()["action"]["bundle_id"] == "com.todesktop.230313mzl4w4u92"
+    assert status["interaction"]["last_action"]["message"] == "opened Cursor"
 
 
 def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(

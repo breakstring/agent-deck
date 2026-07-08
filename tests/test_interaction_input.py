@@ -128,6 +128,46 @@ def test_streamdock_second_main_button_maps_to_second_agent_slot() -> None:
     assert intent.agent_key == "codex:session-2"
 
 
+def test_app_key_press_carries_action_payload() -> None:
+    """App key press 应透传 layout 中的结构化 action payload。
+
+    入参：无；测试内构造 App key plan 和 fake key press。
+    返回：无返回值；断言通过代表 action 层能收到 App 名称、路径和 bundle id。
+    错误处理：payload 或 dry-run 状态错误时由 pytest 报告。
+    副作用：只创建内存模型。
+    """
+
+    layout = _layout(
+        second_key=KeyPlan(
+            index=1,
+            label="Cursor",
+            intent="open_or_focus_app",
+            action="open_or_focus_app",
+            payload={
+                "app_name": "Cursor",
+                "app_path": "/Applications/Cursor.app",
+                "bundle_id": "com.todesktop.230313mzl4w4u92",
+            },
+        )
+    )
+    event = HardwareInput(
+        kind="key",
+        index=1,
+        value={"state": 1},
+        occurred_at=datetime(2026, 6, 23, 12, 0, tzinfo=UTC),
+    )
+
+    intent = interaction_intent_from_hardware_input(event, layout)
+
+    assert intent is not None
+    assert intent.intent == "open_or_focus_app"
+    assert intent.action == "open_or_focus_app"
+    assert intent.payload["app_name"] == "Cursor"
+    assert intent.payload["app_path"] == "/Applications/Cursor.app"
+    assert intent.payload["bundle_id"] == "com.todesktop.230313mzl4w4u92"
+    assert intent.dry_run is False
+
+
 def _layout(second_key: KeyPlan | None = None) -> LayoutPlan:
     """构造包含 agent slot 和空键位的测试 layout。
 

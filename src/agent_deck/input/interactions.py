@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from agent_deck.hardware.fake import HardwareInput
 from agent_deck.rendering.layout import KeyPlan, LayoutPlan
@@ -21,7 +21,8 @@ class InteractionIntent(BaseModel):
 
     入参：`source` 是输入来源；`key_index` 是 0-based layout key index；`intent` 是 layout
     key plan 上声明的业务意图；`agent_key` 和 `decision_id` 透传 key plan 上下文；
-    `dry_run` 表示该 intent 当前是否只能记录、不执行外部副作用。
+    `action` 和 `payload` 透传 layout key 上的结构化动作参数；`dry_run` 表示该 intent 当前
+    是否只能记录、不执行外部副作用。
     返回：frozen Pydantic model，可进入 runtime status 或 action executor。
     错误处理：字段类型非法由 Pydantic 报告。
     副作用：仅保存内存数据，不执行动作。
@@ -34,6 +35,8 @@ class InteractionIntent(BaseModel):
     intent: str
     agent_key: str | None = None
     decision_id: str | None = None
+    action: str | None = None
+    payload: dict[str, str] = Field(default_factory=dict)
     dry_run: bool = True
 
 
@@ -132,7 +135,9 @@ def _intent_from_layout_key(
         intent=key.intent,
         agent_key=key.agent_key,
         decision_id=key.decision_id,
-        dry_run=key.intent != "select_agent",
+        action=key.action,
+        payload=key.payload,
+        dry_run=key.intent not in {"select_agent", "open_or_focus_app"},
     )
 
 

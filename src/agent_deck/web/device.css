@@ -141,6 +141,12 @@
     0 10px 26px rgba(0, 0, 0, 0.36);
 }
 
+.app-icon-img {
+  display: block;
+  object-fit: contain;
+  background: transparent;
+}
+
 .folder-icon {
   width: 70%;
   height: 52%;

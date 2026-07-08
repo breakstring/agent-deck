@@ -23,6 +23,12 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent_deck.actions.apps import (
+    LocalAppActionResult,
+    LocalAppInfo,
+    list_local_apps,
+    open_or_focus_local_app,
+)
 from agent_deck.actions.focus import FocusActionResult, focus_agent_target
 from agent_deck.adapters.codex_app_state import (
     CodexAppActiveSession,
@@ -96,6 +102,8 @@ QuotaTouchscreenSink = Callable[[Any], StreamDockTouchscreenRenderResult]
 StreamDockN4ProRendererSink = Callable[..., StreamDockN4ProAnimationResult]
 FocusActionExecutor = Callable[[str], FocusActionResult]
 VisibleSplashTouchscreenSink = Callable[[Any], StreamDockTouchscreenRenderResult]
+LocalAppCatalogReader = Callable[[], tuple[LocalAppInfo, ...]]
+LocalAppActionExecutor = Callable[..., LocalAppActionResult]
 
 _STREAMDOCK_TOUCH_TAP_DEBOUNCE_SECONDS = 0.45
 """真实 StreamDock touch bar 连续 touch_point 归并为一次 tap 的最短间隔。"""
@@ -270,6 +278,8 @@ class _DaemonRuntime:
     recent_interactions: list[dict[str, Any]]
     focus_actions_enabled: bool
     focus_action_executor: FocusActionExecutor
+    local_app_catalog_reader: LocalAppCatalogReader
+    local_app_action_executor: LocalAppActionExecutor
     streamdock_quota_touchscreen_result: StreamDockTouchscreenRenderResult | None
     streamdock_n4pro_renderer_result: StreamDockN4ProAnimationResult | None
     streamdock_n4pro_renderer_updated_at: datetime | None
@@ -659,6 +669,14 @@ class _DaemonRuntime:
                 action = _dry_run_action(focus_intent, state)
         elif intent.intent in {"approve_request", "deny_request"}:
             action = self._apply_decision_intent(intent)
+        elif intent.intent == "open_or_focus_app":
+            if self.focus_actions_enabled:
+                action = _execute_local_app_action(
+                    intent,
+                    self.local_app_action_executor,
+                )
+            else:
+                action = _dry_run_action(intent, state=None)
         else:
             state = self.store.get(intent.agent_key) if intent.agent_key else None
             if intent.intent == "focus_agent" and self.focus_actions_enabled:
@@ -1237,6 +1255,8 @@ def create_app(
     streamdock_n4pro_renderer_sink: StreamDockN4ProRendererSink | None = None,
     visible_splash_touchscreen_sink: VisibleSplashTouchscreenSink = render_dual_device_touchscreen_image_to_n4pro,
     focus_action_executor: FocusActionExecutor = focus_agent_target,
+    local_app_catalog_reader: LocalAppCatalogReader = list_local_apps,
+    local_app_action_executor: LocalAppActionExecutor = open_or_focus_local_app,
     key_layout_path: Path | None = None,
 ) -> FastAPI:
     """Create the local daemon FastAPI app without binding sockets.
@@ -1252,8 +1272,10 @@ def create_app(
     `visible_splash_touchscreen_sink` 专门写 N4 Pro dual-device 可见触屏层，用于启动/退出时
     清掉旧 quota 残留；不参与常规按键动画渲染；
     `focus_action_executor` 是 `focus_agent` 的真实动作执行器，poller config 未禁用
-    `focus_actions_enabled` 且目标 agent 有 focus target 时会被调用；`key_layout_path`
-    为 None 时 GUI 布局只保存在进程内，传入路径时启动会读该 JSON，保存会写回该 JSON。
+    `focus_actions_enabled` 且目标 agent 有 focus target 时会被调用；`local_app_catalog_reader`
+    和 `local_app_action_executor` 支撑 GUI App 选择和 App key 执行，测试可替换；
+    `key_layout_path` 为 None 时 GUI 布局只保存在进程内，传入路径时启动会读该 JSON，
+    保存会写回该 JSON。
     返回：配置好路由且持有 in-memory runtime 的 `FastAPI` ASGI app。
     错误处理：对象构造失败会直接抛出；poller 单次失败会记录到 status，不让 app 启动失败。
     副作用：总是分配内存对象并注册路由；只有显式启用 poller 时，lifespan startup 才会只读访问
@@ -1297,6 +1319,8 @@ def create_app(
         recent_interactions=[],
         focus_actions_enabled=resolved_poller_config.focus_actions_enabled,
         focus_action_executor=focus_action_executor,
+        local_app_catalog_reader=local_app_catalog_reader,
+        local_app_action_executor=local_app_action_executor,
         streamdock_quota_touchscreen_result=None,
         streamdock_n4pro_renderer_result=None,
         streamdock_n4pro_renderer_updated_at=None,
@@ -1490,6 +1514,25 @@ def create_app(
         """
 
         return _dump_model(runtime.current_key_layout_response())
+
+    @app.get("/ui/apps")
+    async def get_local_apps() -> dict[str, Any]:
+        """Return local apps that can be assigned to quick-action keys.
+
+        入参：无。
+        返回：JSON-safe app catalog，包含 App 名称、路径、bundle id 和可选 data URL 图标。
+        错误处理：catalog reader 异常返回 500；单个坏 App 应由 reader 自行跳过。
+        副作用：调用注入的只读 app catalog reader；生产默认只读扫描本机应用目录。
+        """
+
+        try:
+            apps = runtime.local_app_catalog_reader()
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {
+            "platform": "darwin",
+            "apps": [_dump_model(app) for app in apps],
+        }
 
     @app.put("/ui/key-layout")
     async def put_key_layout(layout: N4ProKeyLayout) -> dict[str, Any]:
@@ -2093,6 +2136,27 @@ def _dry_run_action(
             "focus_target": focus_target,
             "message": message,
         }
+    if intent.intent == "open_or_focus_app":
+        app_target = (
+            intent.payload.get("bundle_id")
+            or intent.payload.get("app_path")
+            or intent.payload.get("app_name")
+        )
+        return {
+            "intent": intent.intent,
+            "agent_key": intent.agent_key,
+            "decision_id": intent.decision_id,
+            "status": "dry_run",
+            "target_available": app_target is not None,
+            "app_name": intent.payload.get("app_name"),
+            "app_path": intent.payload.get("app_path"),
+            "bundle_id": intent.payload.get("bundle_id"),
+            "message": (
+                f"open_or_focus_app dry-run recorded for {app_target}"
+                if app_target
+                else "open_or_focus_app dry-run recorded; missing app target"
+            ),
+        }
     return {
         "intent": intent.intent,
         "agent_key": intent.agent_key,
@@ -2186,6 +2250,37 @@ def _execute_focus_action(
         "ok": result.ok,
         "target_available": True,
         "focus_target": result.focus_target,
+        "message": result.message,
+    }
+
+
+def _execute_local_app_action(
+    intent: InteractionIntent,
+    local_app_action_executor: LocalAppActionExecutor,
+) -> dict[str, Any]:
+    """执行 App quick-action 并返回诊断。
+
+    入参：`intent` 是 `open_or_focus_app` 交互意图；payload 中可包含 `app_name`、
+    `app_path` 和 `bundle_id`；`local_app_action_executor` 是受配置保护的真实动作执行器。
+    返回：JSON-safe action 诊断。
+    错误处理：executor 自己负责把系统异常转换为 `LocalAppActionResult`，本函数只序列化结果。
+    副作用：当 executor 为生产实现时会调用 macOS `open` 打开或切换 App。
+    """
+
+    result = local_app_action_executor(
+        app_name=intent.payload.get("app_name"),
+        app_path=intent.payload.get("app_path"),
+        bundle_id=intent.payload.get("bundle_id"),
+    )
+    return {
+        "intent": intent.intent,
+        "agent_key": intent.agent_key,
+        "decision_id": intent.decision_id,
+        "status": result.status,
+        "ok": result.ok,
+        "app_name": result.app_name,
+        "app_path": result.app_path,
+        "bundle_id": result.bundle_id,
         "message": result.message,
     }
 

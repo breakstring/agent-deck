@@ -3,7 +3,7 @@
  * 边界：从本地 daemon 读取/保存 10 键布局，只做预览和 runtime 配置，不直接访问硬件或执行动作。
  */
 
-const appChoices = [
+let appChoices = [
   { name: "Terminal", token: "T", path: "/System/Applications/Utilities/Terminal.app", color: "linear-gradient(135deg, #2f3540, #0c0f13)" },
   { name: "Chrome", token: "C", path: "/Applications/Google Chrome.app", color: "linear-gradient(135deg, #55a6ff, #1f5fc7)" },
   { name: "Cursor", token: "Cu", path: "/Applications/Cursor.app", color: "linear-gradient(135deg, #f0f3f6, #636d78)", darkText: true },
@@ -75,13 +75,19 @@ function agentVisualClass(agent) {
 }
 
 function appFromBinding(binding) {
-  const found = appChoices.find((app) => app.name === binding.app_name || app.path === binding.app_path);
+  const found = appChoices.find(
+    (app) =>
+      app.bundleId === binding.bundle_id ||
+      app.name === binding.app_name ||
+      app.path === binding.app_path,
+  );
   if (found) return found;
   const token = binding.icon_token || (binding.app_name || "App").slice(0, 2);
   return {
     name: binding.app_name || binding.label || "App",
     token,
     path: binding.app_path || "",
+    bundleId: binding.bundle_id || "",
     color: binding.icon_color || "linear-gradient(135deg, #5a6572, #202832)",
   };
 }
@@ -125,6 +131,7 @@ function bindingFromUiKey(key) {
       label: key.app.name,
       app_name: key.app.name,
       app_path: key.app.path,
+      bundle_id: key.app.bundleId || null,
       icon_token: key.app.token,
       icon_color: key.app.color,
     };
@@ -160,8 +167,11 @@ function renderKeyFace(key) {
   }
   if (key.kind === "app") {
     const app = key.app;
+    if (app.iconUrl) {
+      return `<img class="app-icon app-icon-img" src="${escapeAttr(app.iconUrl)}" alt="">`;
+    }
     const textColor = app.darkText ? "#15191f" : "#ffffff";
-    return `<div class="app-icon" style="background:${app.color};color:${textColor}">${app.token}</div>`;
+    return `<div class="app-icon" style="background:${app.color};color:${textColor}">${escapeHtml(app.token)}</div>`;
   }
   if (key.kind === "url") {
     return '<div class="url-icon">URL</div>';
@@ -212,7 +222,7 @@ function choiceButton(kind, title, meta) {
 }
 
 function detailRow(label, value) {
-  return `<div class="detail-row"><span>${label}</span><span title="${value}">${value}</span></div>`;
+  return `<div class="detail-row"><span>${escapeHtml(label)}</span><span title="${escapeAttr(value)}">${escapeHtml(value)}</span></div>`;
 }
 
 function renderInspector() {
@@ -326,12 +336,15 @@ function renderAppList() {
   el.appList.innerHTML = appChoices
     .map((app, index) => {
       const textColor = app.darkText ? "#15191f" : "#ffffff";
+      const icon = app.iconUrl
+        ? `<img class="app-icon app-icon-img" src="${escapeAttr(app.iconUrl)}" alt="">`
+        : `<span class="app-icon" style="background:${app.color};color:${textColor}">${escapeHtml(app.token)}</span>`;
       return `
         <button class="app-option" type="button" data-app="${index}">
-          <span class="app-icon" style="background:${app.color};color:${textColor}">${app.token}</span>
+          ${icon}
           <span>
-            <span class="app-option-name">${app.name}</span>
-            <span class="app-option-path">${app.path}</span>
+            <span class="app-option-name">${escapeHtml(app.name)}</span>
+            <span class="app-option-path">${escapeHtml(app.path)}</span>
           </span>
         </button>
       `;
@@ -412,6 +425,25 @@ async function loadKeyLayout() {
   }
 }
 
+async function loadAppCatalog() {
+  try {
+    const response = await fetch("/ui/apps", { cache: "no-store" });
+    if (!response.ok) throw new Error(`apps ${response.status}`);
+    const body = await response.json();
+    if (!Array.isArray(body.apps) || body.apps.length === 0) return;
+    appChoices = body.apps.map((app) => ({
+      name: app.name,
+      token: app.icon_token || (app.name || "App").slice(0, 2),
+      path: app.app_path || "",
+      bundleId: app.bundle_id || "",
+      iconUrl: app.icon_data_url || "",
+      color: "linear-gradient(135deg, #5a6572, #202832)",
+    }));
+  } catch (error) {
+    el.toast.textContent = `App 列表读取失败：${error.message}`;
+  }
+}
+
 async function saveAndApply() {
   state.saving = true;
   renderSaveState();
@@ -453,9 +485,23 @@ el.appModal.addEventListener("click", (event) => {
 });
 
 async function boot() {
+  await loadAppCatalog();
   await loadKeyLayout();
   await refreshStatus();
   render();
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function escapeAttr(value) {
+  return escapeHtml(value).replaceAll("`", "&#96;");
 }
 
 render();
