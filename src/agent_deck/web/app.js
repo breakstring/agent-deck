@@ -38,8 +38,7 @@ const el = {
   selectedSubtitle: document.getElementById("selectedSubtitle"),
   inspectorBody: document.getElementById("inspectorBody"),
   saveButton: document.getElementById("saveButton"),
-  configState: document.getElementById("configState"),
-  hardwareState: document.getElementById("hardwareState"),
+  syncState: document.getElementById("syncState"),
   deviceDot: document.getElementById("deviceDot"),
   deviceState: document.getElementById("deviceState"),
   rendererState: document.getElementById("rendererState"),
@@ -293,11 +292,13 @@ function renderInspector() {
   }
 }
 
+/**
+ * 标记当前 GUI 预览已偏离 daemon 配置；只影响保存按钮和状态提示，不直接下发硬件。
+ */
 function markDirty(key) {
   key.dirty = true;
   state.dirty = true;
-  el.saveButton.disabled = false;
-  el.saveState.textContent = "有未保存改动";
+  renderSyncState();
 }
 
 function updateKeyKind(kind) {
@@ -341,10 +342,16 @@ function openAppModal() {
   window.requestAnimationFrame(() => el.appSearch?.focus());
 }
 
+/**
+ * 关闭 App 选择浮层；不回滚已经写入 GUI 预览的按键配置。
+ */
 function closeAppModal() {
   el.appModal.classList.remove("open");
 }
 
+/**
+ * 根据当前搜索词渲染 App 候选项；点击候选项只更新预览，等待保存动作统一下发。
+ */
 function renderAppList() {
   const query = state.appQuery.trim().toLocaleLowerCase();
   const matches = appChoices
@@ -382,14 +389,19 @@ function renderAppList() {
     .join("");
 
   el.appList.querySelectorAll(".app-option").forEach((button) => {
-    button.addEventListener("click", () => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const app = appChoices[Number(button.dataset.app)];
       const key = state.keys[state.selectedIndex];
       key.role = "quick";
       key.kind = "app";
-      key.app = appChoices[Number(button.dataset.app)];
+      key.app = app;
       markDirty(key);
       closeAppModal();
       render();
+      el.toast.textContent = `已选择 ${app.name}，保存并应用后下发`;
+      el.saveButton.focus({ preventScroll: true });
     });
   });
 }
@@ -417,54 +429,46 @@ function setStatusChip(element, text, variant) {
   }
 }
 
-function renderConfigState() {
-  if (state.saving) {
-    setStatusChip(el.configState, "配置保存中", "pending");
-    el.saveButton.disabled = true;
-    return;
-  }
-  if (state.dirty) {
-    setStatusChip(el.configState, "配置有改动", "pending");
-    el.saveButton.disabled = false;
-  } else {
-    setStatusChip(el.configState, "配置已保存", "ok");
-    el.saveButton.disabled = true;
-  }
-}
-
-function renderHardwareState() {
+/**
+ * 将配置保存状态和硬件下发状态合并为一个用户可理解的同步状态。
+ */
+function renderSyncState() {
   const renderer = state.status?.streamdock_n4pro_renderer;
   const result = renderer?.last_result;
-  const ok = result?.ok === true;
   if (state.saving) {
-    setStatusChip(el.hardwareState, "硬件下发中", "pending");
+    setStatusChip(el.syncState, "保存中", "pending");
+    el.saveButton.disabled = true;
     return;
   }
   if (state.dirty) {
-    setStatusChip(el.hardwareState, "硬件待应用", "pending");
+    setStatusChip(el.syncState, "有未保存改动", "pending");
+    el.saveButton.disabled = false;
     return;
   }
   if (renderer?.last_error || result?.ok === false) {
-    setStatusChip(el.hardwareState, "硬件下发失败", "error");
+    setStatusChip(el.syncState, "下发失败", "error");
+    el.saveButton.disabled = true;
     return;
   }
   if (state.awaitingHardwareApply) {
-    setStatusChip(el.hardwareState, "等待硬件下发", "pending");
+    setStatusChip(el.syncState, "等待下发", "pending");
+    el.saveButton.disabled = true;
     return;
   }
-  if (ok) {
-    setStatusChip(el.hardwareState, "硬件已下发", "ok");
+  if (result?.ok === true) {
+    setStatusChip(el.syncState, "已下发", "ok");
+    el.saveButton.disabled = true;
     return;
   }
-  setStatusChip(el.hardwareState, "硬件检查中", "");
+  setStatusChip(el.syncState, "检查中", "");
+  el.saveButton.disabled = true;
 }
 
 function render() {
   renderKeys();
   renderInspector();
   renderRuntime();
-  renderConfigState();
-  renderHardwareState();
+  renderSyncState();
 }
 
 function reconcileHardwareApply() {
@@ -562,11 +566,13 @@ async function refreshAppIcons() {
   }
 }
 
+/**
+ * 保存当前 GUI 预览并请求 daemon 应用到硬件；失败时保留本地状态并提示错误。
+ */
 async function saveAndApply() {
   const saveStartedAt = Date.now();
   state.saving = true;
-  renderConfigState();
-  renderHardwareState();
+  renderSyncState();
   el.toast.textContent = "";
   try {
     const response = await fetch("/ui/key-layout", {
