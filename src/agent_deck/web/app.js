@@ -25,6 +25,9 @@ const state = {
   dirty: false,
   status: null,
   saving: false,
+  refreshingApps: false,
+  awaitingHardwareApply: false,
+  lastSaveStartedAt: null,
   keyLayoutSource: "default",
 };
 
@@ -35,7 +38,8 @@ const el = {
   selectedSubtitle: document.getElementById("selectedSubtitle"),
   inspectorBody: document.getElementById("inspectorBody"),
   saveButton: document.getElementById("saveButton"),
-  saveState: document.getElementById("saveState"),
+  configState: document.getElementById("configState"),
+  hardwareState: document.getElementById("hardwareState"),
   deviceDot: document.getElementById("deviceDot"),
   deviceState: document.getElementById("deviceState"),
   rendererState: document.getElementById("rendererState"),
@@ -46,6 +50,7 @@ const el = {
   toast: document.getElementById("toast"),
   appModal: document.getElementById("appModal"),
   appSearch: document.getElementById("appSearch"),
+  refreshApps: document.getElementById("refreshApps"),
   appCount: document.getElementById("appCount"),
   appList: document.getElementById("appList"),
   closeAppModal: document.getElementById("closeAppModal"),
@@ -404,26 +409,71 @@ function renderRuntime() {
   el.panelHint.textContent = panel === "quota" ? "quota panel" : "global panel";
 }
 
-function renderSaveState() {
+function setStatusChip(element, text, variant) {
+  element.textContent = text;
+  element.classList.remove("ok", "pending", "error");
+  if (variant) {
+    element.classList.add(variant);
+  }
+}
+
+function renderConfigState() {
   if (state.saving) {
-    el.saveState.textContent = "正在应用";
+    setStatusChip(el.configState, "配置保存中", "pending");
     el.saveButton.disabled = true;
     return;
   }
   if (state.dirty) {
-    el.saveState.textContent = "有未保存改动";
+    setStatusChip(el.configState, "配置有改动", "pending");
     el.saveButton.disabled = false;
   } else {
-    el.saveState.textContent = "配置已保存";
+    setStatusChip(el.configState, "配置已保存", "ok");
     el.saveButton.disabled = true;
   }
+}
+
+function renderHardwareState() {
+  const renderer = state.status?.streamdock_n4pro_renderer;
+  const result = renderer?.last_result;
+  const ok = result?.ok === true;
+  if (state.saving) {
+    setStatusChip(el.hardwareState, "硬件下发中", "pending");
+    return;
+  }
+  if (state.dirty) {
+    setStatusChip(el.hardwareState, "硬件待应用", "pending");
+    return;
+  }
+  if (renderer?.last_error || result?.ok === false) {
+    setStatusChip(el.hardwareState, "硬件下发失败", "error");
+    return;
+  }
+  if (state.awaitingHardwareApply) {
+    setStatusChip(el.hardwareState, "等待硬件下发", "pending");
+    return;
+  }
+  if (ok) {
+    setStatusChip(el.hardwareState, "硬件已下发", "ok");
+    return;
+  }
+  setStatusChip(el.hardwareState, "硬件检查中", "");
 }
 
 function render() {
   renderKeys();
   renderInspector();
   renderRuntime();
-  renderSaveState();
+  renderConfigState();
+  renderHardwareState();
+}
+
+function reconcileHardwareApply() {
+  if (!state.awaitingHardwareApply || state.lastSaveStartedAt === null) return;
+  const renderer = state.status?.streamdock_n4pro_renderer;
+  const updatedAt = renderer?.updated_at ? Date.parse(renderer.updated_at) : NaN;
+  if (renderer?.last_result?.ok === true && Number.isFinite(updatedAt) && updatedAt >= state.lastSaveStartedAt) {
+    state.awaitingHardwareApply = false;
+  }
 }
 
 async function refreshStatus() {
@@ -431,6 +481,7 @@ async function refreshStatus() {
     const response = await fetch("/status", { cache: "no-store" });
     if (!response.ok) throw new Error(`status ${response.status}`);
     state.status = await response.json();
+    reconcileHardwareApply();
     render();
   } catch (error) {
     el.deviceState.textContent = "N4 Pro · 状态不可用";
@@ -465,14 +516,57 @@ async function loadAppCatalog() {
       keyIconUrl: app.key_icon_url || "",
       color: "linear-gradient(135deg, #5a6572, #202832)",
     }));
+    refreshConfiguredAppIcons();
   } catch (error) {
     el.toast.textContent = `App 列表读取失败：${error.message}`;
   }
 }
 
+function refreshConfiguredAppIcons() {
+  state.keys.forEach((key) => {
+    if (key.kind !== "app") return;
+    const found = appChoices.find(
+      (app) =>
+        app.bundleId === key.app.bundleId ||
+        app.path === key.app.path ||
+        app.name === key.app.name,
+    );
+    if (found) {
+      key.app = found;
+    }
+  });
+}
+
+async function refreshAppIcons() {
+  state.refreshingApps = true;
+  el.refreshApps.disabled = true;
+  el.toast.textContent = "正在刷新 App 图标";
+  try {
+    const response = await fetch("/ui/apps/refresh-icons", {
+      method: "POST",
+      cache: "no-store",
+    });
+    if (!response.ok) throw new Error(`refresh ${response.status}`);
+    await loadAppCatalog();
+    renderAppList();
+    render();
+    el.toast.textContent = "App 图标已刷新";
+  } catch (error) {
+    el.toast.textContent = `App 图标刷新失败：${error.message}`;
+  } finally {
+    state.refreshingApps = false;
+    el.refreshApps.disabled = false;
+    window.setTimeout(() => {
+      if (!state.refreshingApps) el.toast.textContent = "";
+    }, 2400);
+  }
+}
+
 async function saveAndApply() {
+  const saveStartedAt = Date.now();
   state.saving = true;
-  renderSaveState();
+  renderConfigState();
+  renderHardwareState();
   el.toast.textContent = "";
   try {
     const response = await fetch("/ui/key-layout", {
@@ -492,8 +586,12 @@ async function saveAndApply() {
       key.dirty = false;
     });
     state.dirty = false;
-    el.toast.textContent = "已保存到 daemon runtime，并已重新生成布局";
+    state.lastSaveStartedAt = saveStartedAt;
+    state.awaitingHardwareApply = true;
+    el.toast.textContent = "配置已保存，等待硬件下发";
+    await refreshStatus();
   } catch (error) {
+    state.awaitingHardwareApply = false;
     el.toast.textContent = `保存失败：${error.message}`;
   } finally {
     state.saving = false;
@@ -513,6 +611,7 @@ el.appSearch.addEventListener("input", () => {
   state.appQuery = el.appSearch.value;
   renderAppList();
 });
+el.refreshApps.addEventListener("click", refreshAppIcons);
 
 async function boot() {
   await loadAppCatalog();

@@ -181,7 +181,7 @@
   padding: 12px 14px;
   border-bottom: 1px solid var(--line);
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 12px;
 }
@@ -296,6 +296,11 @@
 
   .top-actions {
     justify-content: space-between;
+  }
+
+  .top-statuses {
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
   .workspace {

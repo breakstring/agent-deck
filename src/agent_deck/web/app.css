@@ -64,7 +64,8 @@ button {
 
 button:focus-visible,
 .deck-key:focus-visible,
-.close-button:focus-visible {
+.close-button:focus-visible,
+.icon-button:focus-visible {
   outline: 2px solid rgba(111, 213, 255, 0.88);
   outline-offset: 3px;
 }
@@ -159,16 +160,50 @@ button:focus-visible,
   gap: 12px;
 }
 
-.save-state {
+.top-statuses {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  min-width: 0;
+}
+
+.status-chip {
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.035);
   color: var(--muted);
-  font-size: 13px;
+  font-size: 12px;
   white-space: nowrap;
+}
+
+.status-chip.ok {
+  color: var(--accent-2);
+  border-color: rgba(123, 216, 143, 0.25);
+  background: rgba(123, 216, 143, 0.07);
+}
+
+.status-chip.pending {
+  color: var(--warn);
+  border-color: rgba(255, 200, 87, 0.25);
+  background: rgba(255, 200, 87, 0.07);
+}
+
+.status-chip.error {
+  color: var(--error);
+  border-color: rgba(255, 107, 107, 0.28);
+  background: rgba(255, 107, 107, 0.08);
 }
 
 .primary-button,
 .ghost-button,
 .choice-button,
-.app-option {
+.app-option,
+.icon-button {
   border: 0;
   border-radius: var(--radius);
   cursor: pointer;
@@ -193,6 +228,28 @@ button:focus-visible,
   border: 1px solid var(--line);
   background: transparent;
   color: var(--muted);
+}
+
+.icon-button {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+}
+
+.icon-button:hover {
+  border-color: rgba(111, 213, 255, 0.42);
+  color: var(--accent);
+}
+
+.icon-button:disabled {
+  cursor: default;
+  opacity: 0.48;
 }
 
 .workspace {

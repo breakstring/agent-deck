@@ -36,7 +36,10 @@ Reasoning:
           <span id="deviceState">N4 Pro · 检查中</span>
         </div>
         <div class="top-actions">
-          <span id="saveState" class="save-state">配置已保存</span>
+          <div class="top-statuses" aria-live="polite">
+            <span id="configState" class="status-chip">配置已保存</span>
+            <span id="hardwareState" class="status-chip">硬件检查中</span>
+          </div>
           <button id="saveButton" class="primary-button" type="button" disabled>保存并应用</button>
         </div>
       </header>
@@ -92,6 +95,7 @@ Reasoning:
         </div>
         <div class="modal-tools">
           <input id="appSearch" class="app-search" type="search" autocomplete="off" placeholder="搜索 App" aria-label="搜索 App" />
+          <button id="refreshApps" class="icon-button" type="button" title="刷新 App 图标" aria-label="刷新 App 图标">↻</button>
           <span id="appCount" class="app-count">0 个 App</span>
         </div>
         <div id="appList" class="app-list"></div>
