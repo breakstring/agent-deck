@@ -9,8 +9,10 @@ pytest temp files, and pytest assertion reporting.
 from __future__ import annotations
 
 import asyncio
+import base64
 import plistlib
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -23,6 +25,7 @@ from agent_deck.actions.app_icon_cache import AppIconCache
 from agent_deck.actions.apps import LocalAppActionResult, LocalAppInfo
 from agent_deck.actions.focus import FocusActionResult
 from agent_deck.actions.local_targets import LocalTargetActionResult
+from agent_deck.actions.url_icon_cache import UrlIconCache
 from agent_deck.adapters.codex_app_state import CodexAppActiveSession
 from agent_deck.adapters.codex_quota import CodexQuotaSnapshot
 from agent_deck.adapters.codex_tokens import (
@@ -134,6 +137,106 @@ def test_local_apps_api_returns_injected_catalog(tmp_path: Path) -> None:
     refresh_response = client.post("/ui/apps/refresh-icons")
     assert refresh_response.status_code == 200
     assert refresh_response.json()["refreshed_count"] == 1
+
+
+def test_url_icon_api_returns_cached_favicon(tmp_path: Path) -> None:
+    """Verify GUI can resolve and fetch cached URL favicon assets.
+
+    入参：`tmp_path` 提供隔离 URL icon cache。
+    返回：无返回值；断言通过代表 `/ui/url-icons/resolve` 会生成 GUI/硬件共用缓存。
+    错误处理：HTTP 状态、响应 shape 或 PNG route 不符合预期时由 pytest 报告。
+    副作用：只写 pytest 临时目录，不访问互联网。
+    """
+
+    calls: list[str] = []
+    client = TestClient(
+        create_app(
+            url_icon_cache_path=tmp_path / "url-icons",
+            url_icon_fetcher=_fake_site_fetcher(calls),
+        )
+    )
+
+    response = client.get("/ui/url-icons/resolve", params={"url": "https://example.com/docs"})
+    body = response.json()
+
+    assert response.status_code == 200
+    assert calls == [
+        "https://example.com",
+        "https://example.com/assets/icon.png",
+    ]
+    assert body["origin"] == "https://example.com"
+    assert body["host"] == "example.com"
+    assert body["icon_token"] == "EX"
+    assert body["icon_cache_status"] == "ready"
+    assert body["icon_url"].startswith("/ui/url-icons/example.com-")
+    assert body["key_icon_url"].endswith("/key-112.png")
+    icon_response = client.get(body["icon_url"])
+    key_icon_response = client.get(body["key_icon_url"])
+    assert icon_response.status_code == 200
+    assert icon_response.headers["content-type"] == "image/png"
+    assert key_icon_response.status_code == 200
+    assert key_icon_response.headers["content-type"] == "image/png"
+
+
+def test_url_icon_lookup_does_not_fetch_missing_icon(tmp_path: Path) -> None:
+    """Verify GUI can lookup cached URL icons without network access.
+
+    入参：`tmp_path` 提供隔离 URL icon cache。
+    返回：无返回值；断言通过代表 URL 输入不会自动触发网页解析。
+    错误处理：fetcher 被调用或响应 shape 错误时由 pytest 报告。
+    副作用：只读 pytest 临时目录，不访问互联网。
+    """
+
+    calls: list[str] = []
+    client = TestClient(
+        create_app(
+            url_icon_cache_path=tmp_path / "url-icons",
+            url_icon_fetcher=_fake_site_fetcher(calls),
+        )
+    )
+
+    response = client.get("/ui/url-icons/lookup", params={"url": "https://example.com/docs"})
+    body = response.json()
+
+    assert response.status_code == 200
+    assert calls == []
+    assert body["origin"] == "https://example.com"
+    assert body["host"] == "example.com"
+    assert body["icon_cache_status"] == "missing"
+    assert body["icon_url"] is None
+
+
+def test_url_icon_upload_stores_custom_image(tmp_path: Path) -> None:
+    """Verify GUI can upload a local image as URL icon cache.
+
+    入参：`tmp_path` 提供隔离 URL icon cache。
+    返回：无返回值；断言通过代表本地图片可复制进程序缓存并用于 GUI。
+    错误处理：HTTP 状态、响应 shape 或 PNG route 不符合预期时由 pytest 报告。
+    副作用：只写 pytest 临时目录，不访问互联网。
+    """
+
+    client = TestClient(create_app(url_icon_cache_path=tmp_path / "url-icons"))
+    data_url = "data:image/png;base64," + base64.b64encode(
+        _png_bytes((32, 32), (220, 80, 60, 255))
+    ).decode("ascii")
+
+    response = client.post(
+        "/ui/url-icons/upload",
+        json={
+            "url": "https://example.com/docs",
+            "filename": "custom.png",
+            "data_url": data_url,
+        },
+    )
+    body = response.json()
+
+    assert response.status_code == 200
+    assert body["icon_cache_status"] == "custom"
+    assert body["icon_cache_source"] == "custom_upload"
+    assert body["icon_url"].startswith("/ui/url-icons/example.com-")
+    icon_response = client.get(body["icon_url"])
+    assert icon_response.status_code == 200
+    assert icon_response.headers["content-type"] == "image/png"
 
 
 def test_key_layout_api_saves_runtime_layout_and_updates_status_projection() -> None:
@@ -1097,6 +1200,50 @@ def test_streamdock_n4pro_key_images_include_app_bindings(tmp_path: Path) -> Non
     assert _near_color(image.getpixel((56, 56)), (20, 120, 220))
 
 
+def test_streamdock_n4pro_key_images_include_url_bindings(tmp_path: Path) -> None:
+    """N4 Pro renderer 应把 URL binding 转成静态物理按键图。
+
+    入参：`tmp_path` 提供隔离 URL icon cache。
+    返回：无返回值；断言通过代表 daemon renderer 会把 URL key 投影到 key_images。
+    错误处理：缺少 key image、尺寸错误或未使用 favicon 时由 pytest 报告。
+    副作用：只写 pytest 临时目录，不访问真实 N4 Pro 或互联网。
+    """
+
+    key_layout = N4ProKeyLayout(
+        keys=(
+            N4ProKeyBinding(
+                index=0,
+                kind=KeySurfaceKind.URL,
+                label="Docs",
+                url="https://example.com/docs",
+            ),
+            *default_n4pro_key_layout().sorted_keys()[1:],
+        )
+    )
+    layout = build_layout_plan(
+        [],
+        [],
+        DeckSelection(mode=DeckMode.OVERVIEW),
+        key_layout=key_layout,
+    )
+    url_icon_cache = UrlIconCache(
+        tmp_path / "url-icon-cache",
+        fetcher=_fake_site_fetcher([]),
+    )
+    url_icon_cache.ensure("https://example.com/docs")
+
+    key_images = server_app._key_images_from_layout(
+        layout,
+        url_icon_cache=url_icon_cache,
+    )
+
+    assert sorted(key_images) == [1]
+    image = key_images[1]
+    assert getattr(image, "size") == (112, 112)
+    assert getattr(image, "mode") == "RGB"
+    assert _near_color(image.getpixel((56, 56)), (50, 120, 210))
+
+
 def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
     tmp_path: Path,
 ) -> None:
@@ -2058,6 +2205,48 @@ def _fake_finder_app(tmp_path: Path) -> Path:
         )
     Image.new("RGBA", (64, 64), (20, 120, 220, 255)).save(resources / "Finder.png")
     return app
+
+
+def _fake_site_fetcher(calls: list[str]):
+    """构造记录请求 URL 的 fake 站点 fetcher。
+
+    入参：`calls` 是测试内存列表。
+    返回：可注入 `create_app()` 或 `UrlIconCache` 的 fetcher。
+    错误处理：无。
+    副作用：写入 `calls`。
+    """
+
+    def fetcher(url: str) -> bytes:
+        """返回 HTML 或 32x32 PNG favicon。
+
+        入参：`url` 是 cache 访问的首页、manifest 或 icon URL。
+        返回：HTML 或 PNG bytes。
+        错误处理：无。
+        副作用：写入 `calls`。
+        """
+
+        calls.append(url)
+        if url == "https://example.com":
+            return b'<html><head><link rel="icon" sizes="32x32" href="/assets/icon.png"></head></html>'
+        if url == "https://example.com/assets/icon.png":
+            return _png_bytes((32, 32), (50, 120, 210, 255))
+        return b""
+
+    return fetcher
+
+
+def _png_bytes(size: tuple[int, int], color: tuple[int, int, int, int]) -> bytes:
+    """生成测试 PNG bytes。
+
+    入参：`size` 是图片尺寸；`color` 是 RGBA 填充色。
+    返回：PNG bytes。
+    错误处理：无。
+    副作用：只写内存 buffer。
+    """
+
+    buffer = BytesIO()
+    Image.new("RGBA", size, color).save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def _near_color(

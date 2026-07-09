@@ -29,6 +29,7 @@ const state = {
   awaitingHardwareApply: false,
   lastSaveStartedAt: null,
   keyLayoutSource: "default",
+  urlIconCache: new Map(),
 };
 
 const el = {
@@ -104,7 +105,16 @@ function uiKeyFromBinding(binding) {
     return { ...base, role: "quick", kind: "app", app: appFromBinding(binding) };
   }
   if (binding.kind === "url") {
-    return { ...base, role: "quick", kind: "url", url: binding.url || "" };
+    return {
+      ...base,
+      role: "quick",
+      kind: "url",
+      url: binding.url || "",
+      iconUrl: "",
+      iconToken: tokenForUrl(binding.url),
+      iconStatus: "使用域名缩写",
+      iconLoading: false,
+    };
   }
   if (binding.kind === "agent") {
     return { ...base, role: "agent", kind: "agent", slot: 1 };
@@ -123,6 +133,7 @@ function applyKeyLayoutResponse(response) {
     .sort((a, b) => a.index - b.index)
     .map(uiKeyFromBinding);
   renumberAgentSlots();
+  refreshConfiguredUrlIcons();
   state.dirty = false;
 }
 
@@ -169,7 +180,10 @@ function renderKeyFace(key) {
     return `<div class="app-icon" style="background:${app.color};color:${textColor}">${escapeHtml(app.token)}</div>`;
   }
   if (key.kind === "url") {
-    return '<div class="url-icon">URL</div>';
+    if (key.iconUrl) {
+      return `<img class="url-icon-img" src="${escapeAttr(key.iconUrl)}" alt="">`;
+    }
+    return `<div class="url-icon">${escapeHtml(key.iconToken || tokenForUrl(key.url))}</div>`;
   }
   if (key.kind === "agent") {
     const agent = agentForSlot(key.slot);
@@ -226,6 +240,27 @@ function textField(id, label, value, placeholder) {
   `;
 }
 
+function renderUrlIconControls(key) {
+  const preview = key.iconUrl
+    ? `<img class="url-icon-preview-img" src="${escapeAttr(key.iconUrl)}" alt="">`
+    : `<div class="url-icon-preview-token">${escapeHtml(key.iconToken || tokenForUrl(key.url))}</div>`;
+  const disabled = key.iconLoading ? " disabled" : "";
+  return `
+    <div class="field-group">
+      <div class="field-label">图标</div>
+      <div class="url-icon-control">
+        <div class="url-icon-preview">${preview}</div>
+        <div class="url-icon-actions">
+          <button id="parseUrlIcon" class="ghost-button compact" type="button"${disabled}>解析网页图标</button>
+          <button id="chooseUrlIcon" class="ghost-button compact" type="button"${disabled}>选择图片</button>
+          <input id="urlIconFile" class="hidden-file-input" type="file" accept="image/png,image/jpeg,image/webp,image/x-icon">
+        </div>
+      </div>
+      <div class="url-icon-status">${escapeHtml(key.iconLoading ? "正在处理图标" : key.iconStatus || "使用域名缩写")}</div>
+    </div>
+  `;
+}
+
 function renderInspector() {
   const key = state.keys[state.selectedIndex];
   el.selectedEyebrow.textContent = `Key ${key.index + 1}`;
@@ -250,7 +285,7 @@ function renderInspector() {
       detailRow("当前", agent ? agent.status : "空槽") +
       detailRow("按下", "选择并聚焦");
   } else if (key.kind === "url") {
-    details = detailRow("网址", key.url || "https://example.com") + detailRow("图标", "自动 favicon");
+    details = detailRow("网址", key.url || "https://example.com") + detailRow("图标", key.iconStatus || "使用域名缩写");
   }
 
   el.inspectorBody.innerHTML = `
@@ -266,6 +301,11 @@ function renderInspector() {
     ${
       key.kind === "url"
         ? `<div class="field-group"><div class="field-label">目标</div>${textField("urlInput", "网址", key.url || "", "https://example.com")}</div>`
+        : ""
+    }
+    ${
+      key.kind === "url"
+        ? renderUrlIconControls(key)
         : ""
     }
     ${details ? `<div class="field-group"><div class="field-label">当前配置</div>${details}</div>` : ""}
@@ -291,7 +331,26 @@ function renderInspector() {
   if (urlInput) {
     urlInput.addEventListener("input", () => {
       key.url = urlInput.value.trim();
+      key.iconUrl = "";
+      key.iconToken = tokenForUrl(key.url);
+      key.iconStatus = "使用域名缩写";
       markDirty(key);
+    });
+  }
+
+  const parseUrlIcon = document.getElementById("parseUrlIcon");
+  if (parseUrlIcon) {
+    parseUrlIcon.addEventListener("click", () => resolveUrlIconForKey(key.index, key.url, { force: true }));
+  }
+
+  const chooseUrlIcon = document.getElementById("chooseUrlIcon");
+  const urlIconFile = document.getElementById("urlIconFile");
+  if (chooseUrlIcon && urlIconFile) {
+    chooseUrlIcon.addEventListener("click", () => urlIconFile.click());
+    urlIconFile.addEventListener("change", () => {
+      const file = urlIconFile.files?.[0];
+      if (file) uploadUrlIconForKey(key.index, key.url, file);
+      urlIconFile.value = "";
     });
   }
 
@@ -313,7 +372,15 @@ function updateKeyKind(kind) {
     return;
   }
   if (kind === "url") {
-    Object.assign(key, { role: "quick", kind: "url", url: "https://agent.deck.local" });
+    Object.assign(key, {
+      role: "quick",
+      kind: "url",
+      url: "https://agent.deck.local",
+      iconUrl: "",
+      iconToken: "AD",
+      iconStatus: "使用域名缩写",
+      iconLoading: false,
+    });
   } else if (kind === "agent") {
     const agentCountBefore = state.keys.filter((item) => item.kind === "agent" && item.index < key.index).length;
     Object.assign(key, { role: "agent", kind: "agent", slot: agentCountBefore + 1 });
@@ -474,6 +541,21 @@ function render() {
   renderSyncState();
 }
 
+function isEditingInspectorField() {
+  const active = document.activeElement;
+  if (!active || !el.inspectorBody.contains(active)) return false;
+  return active.matches("input, textarea, select, [contenteditable='true']");
+}
+
+function renderPassiveRuntimeRefresh() {
+  renderKeys();
+  renderRuntime();
+  renderSyncState();
+  if (!isEditingInspectorField()) {
+    renderInspector();
+  }
+}
+
 function reconcileHardwareApply() {
   if (!state.awaitingHardwareApply || state.lastSaveStartedAt === null) return;
   const renderer = state.status?.streamdock_n4pro_renderer;
@@ -489,7 +571,7 @@ async function refreshStatus() {
     if (!response.ok) throw new Error(`status ${response.status}`);
     state.status = await response.json();
     reconcileHardwareApply();
-    render();
+    renderPassiveRuntimeRefresh();
   } catch (error) {
     el.deviceState.textContent = "N4 Pro · 状态不可用";
     el.rendererState.textContent = `renderer: ${error.message}`;
@@ -542,6 +624,164 @@ function refreshConfiguredAppIcons() {
       key.app = found;
     }
   });
+}
+
+function refreshConfiguredUrlIcons() {
+  state.keys.forEach((key) => {
+    if (key.kind === "url") {
+      key.iconToken = tokenForUrl(key.url);
+      lookupCachedUrlIconForKey(key.index, key.url);
+    }
+  });
+}
+
+async function lookupCachedUrlIconForKey(index, url) {
+  if (!isHttpUrl(url)) return;
+  try {
+    const response = await fetch(`/ui/url-icons/lookup?url=${encodeURIComponent(url)}`, {
+      cache: "no-store",
+    });
+    if (!response.ok) return;
+    const body = await response.json();
+    state.urlIconCache.set(url, body);
+    const key = state.keys.find((item) => item.index === index);
+    if (!key || key.kind !== "url" || key.url !== url) return;
+    if (body.icon_url) {
+      applyUrlIconToKey(key, body);
+    }
+    renderPassiveRuntimeRefresh();
+  } catch (_error) {
+    // 缓存查询失败时保持 token fallback。
+  }
+}
+
+async function resolveUrlIconForKey(index, url, options = {}) {
+  if (!isHttpUrl(url)) {
+    el.toast.textContent = "请输入 http/https 网址";
+    return;
+  }
+  const key = state.keys.find((item) => item.index === index);
+  if (!key || key.kind !== "url") return;
+  key.iconLoading = true;
+  key.iconStatus = "正在解析网页图标";
+  render();
+  try {
+    const force = options.force ? "&force=true" : "";
+    const response = await fetch(`/ui/url-icons/resolve?url=${encodeURIComponent(url)}${force}`, {
+      cache: "no-store",
+    });
+    if (!response.ok) throw new Error(`resolve ${response.status}`);
+    const body = await response.json();
+    state.urlIconCache.set(url, body);
+    const current = state.keys.find((item) => item.index === index);
+    if (!current || current.kind !== "url" || current.url !== url) return;
+    applyUrlIconToKey(current, body);
+    markDirty(current);
+    render();
+  } catch (error) {
+    const current = state.keys.find((item) => item.index === index);
+    if (current && current.kind === "url" && current.url === url) {
+      current.iconStatus = `解析失败：${error.message}`;
+      current.iconUrl = "";
+      current.iconToken = tokenForUrl(url);
+      render();
+    }
+  } finally {
+    const current = state.keys.find((item) => item.index === index);
+    if (current && current.kind === "url" && current.url === url) {
+      current.iconLoading = false;
+      render();
+    }
+  }
+}
+
+async function uploadUrlIconForKey(index, url, file) {
+  if (!isHttpUrl(url)) {
+    el.toast.textContent = "请先输入 http/https 网址";
+    return;
+  }
+  const key = state.keys.find((item) => item.index === index);
+  if (!key || key.kind !== "url") return;
+  key.iconLoading = true;
+  key.iconStatus = "正在导入本地图片";
+  render();
+  try {
+    const dataUrl = await readFileAsDataUrl(file);
+    const response = await fetch("/ui/url-icons/upload", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        url,
+        filename: file.name,
+        data_url: dataUrl,
+      }),
+    });
+    if (!response.ok) throw new Error(`upload ${response.status}`);
+    const body = await response.json();
+    state.urlIconCache.set(url, body);
+    const current = state.keys.find((item) => item.index === index);
+    if (!current || current.kind !== "url" || current.url !== url) return;
+    applyUrlIconToKey(current, body);
+    markDirty(current);
+    render();
+  } catch (error) {
+    const current = state.keys.find((item) => item.index === index);
+    if (current && current.kind === "url" && current.url === url) {
+      current.iconStatus = `导入失败：${error.message}`;
+      render();
+    }
+  } finally {
+    const current = state.keys.find((item) => item.index === index);
+    if (current && current.kind === "url" && current.url === url) {
+      current.iconLoading = false;
+      render();
+    }
+  }
+}
+
+function applyUrlIconToKey(key, icon) {
+  key.iconUrl = icon.icon_url || "";
+  key.iconToken = icon.icon_token || tokenForUrl(key.url);
+  if (icon.icon_cache_source === "custom_upload") {
+    key.iconStatus = "使用自定义图片";
+  } else if (icon.icon_cache_status === "ready") {
+    key.iconStatus = `已缓存 ${icon.host || "网站"} 图标`;
+  } else if (icon.icon_cache_status === "fallback") {
+    key.iconStatus = "未找到可用图标，使用缩写";
+  } else {
+    key.iconStatus = "使用域名缩写";
+  }
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => resolve(String(reader.result || "")));
+    reader.addEventListener("error", () => reject(new Error("file read failed")));
+    reader.readAsDataURL(file);
+  });
+}
+
+function isHttpUrl(value) {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch (_error) {
+    return false;
+  }
+}
+
+function tokenForUrl(value) {
+  try {
+    const parsed = new URL(value);
+    const host = parsed.hostname.replace(/^www\./i, "");
+    const firstLabel = host.split(".")[0] || "URL";
+    const compact = firstLabel.replace(/[^a-z0-9]/gi, "").toUpperCase();
+    if (!compact) return "URL";
+    return compact.length <= 3 ? compact : compact.slice(0, 2);
+  } catch (_error) {
+    return "URL";
+  }
 }
 
 async function refreshAppIcons() {

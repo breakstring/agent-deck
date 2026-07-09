@@ -178,6 +178,13 @@
   font-weight: 760;
 }
 
+.url-icon-img {
+  width: 68%;
+  height: 68%;
+  object-fit: contain;
+  filter: drop-shadow(0 10px 18px rgba(0, 0, 0, 0.35));
+}
+
 .agent-visual {
   width: 72%;
   height: 72%;

@@ -11,6 +11,8 @@ Codex local-state/quota polling or real StreamDock rendering is enabled.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
@@ -37,6 +39,13 @@ from agent_deck.actions.focus import FocusActionResult, focus_agent_target
 from agent_deck.actions.local_targets import (
     LocalTargetActionResult,
     open_local_url,
+)
+from agent_deck.actions.url_icon_cache import (
+    CachedUrlIcon,
+    UrlIconCache,
+    UrlIconFetcher,
+    origin_for_url,
+    resolve_url_icon_cache_root,
 )
 from agent_deck.adapters.codex_app_state import (
     CodexAppActiveSession,
@@ -97,6 +106,7 @@ from agent_deck.rendering.logical_panel_touchscreen import (
     render_logical_panel_touchscreen,
 )
 from agent_deck.rendering.quota_touchscreen import render_quota_touchscreen
+from agent_deck.rendering.url_key import render_url_key_image, token_for_url
 from agent_deck.server.key_layout_store import (
     KeyLayoutStoreError,
     load_n4pro_key_layout,
@@ -186,6 +196,21 @@ class DaemonPollerConfig(BaseModel):
     focus_actions_enabled: bool = True
     local_actions_enabled: bool = True
     poll_on_start: bool = True
+
+
+class UrlIconUploadRequest(BaseModel):
+    """URL 图标本地上传请求体。
+
+    入参：`url` 是 URL key 的目标网址；`filename` 是浏览器侧文件名；`data_url` 是浏览器
+    FileReader 生成的 base64 data URL。
+    返回：Pydantic model，供 `/ui/url-icons/upload` 使用。
+    错误处理：缺失字段或空字符串由 Pydantic 校验为 422。
+    副作用：模型自身不解析图片、不写文件。
+    """
+
+    url: str = Field(min_length=1)
+    filename: str | None = None
+    data_url: str = Field(min_length=1)
 
 
 class DecisionRequestBody(BaseModel):
@@ -300,6 +325,7 @@ class _DaemonRuntime:
     local_app_action_executor: LocalAppActionExecutor
     local_url_action_executor: LocalUrlActionExecutor
     app_icon_cache: AppIconCache
+    url_icon_cache: UrlIconCache
     streamdock_quota_touchscreen_result: StreamDockTouchscreenRenderResult | None
     streamdock_n4pro_renderer_result: StreamDockN4ProAnimationResult | None
     streamdock_n4pro_renderer_updated_at: datetime | None
@@ -1340,6 +1366,8 @@ def create_app(
     local_app_action_executor: LocalAppActionExecutor = open_or_focus_local_app,
     local_url_action_executor: LocalUrlActionExecutor = open_local_url,
     app_icon_cache_path: Path | None = None,
+    url_icon_cache_path: Path | None = None,
+    url_icon_fetcher: UrlIconFetcher | None = None,
     key_layout_path: Path | None = None,
 ) -> FastAPI:
     """Create the local daemon FastAPI app without binding sockets.
@@ -1358,7 +1386,8 @@ def create_app(
     `focus_actions_enabled` 且目标 agent 有 focus target 时会被调用；`local_app_catalog_reader`
     支撑 GUI App 选择；`local_app_action_executor` 和 `local_url_action_executor`
     支撑本机快捷动作执行，测试可替换；
-    `app_icon_cache_path` 是 App 图标缓存根目录，默认使用用户级 Application Support；
+    `app_icon_cache_path` 是 App 图标缓存根目录；`url_icon_cache_path` 是 URL favicon
+    缓存根目录；两者默认使用用户级 Application Support；`url_icon_fetcher` 供测试替换网络请求；
     `key_layout_path` 为 None 时 GUI 布局只保存在进程内，传入路径时启动会读该 JSON，
     保存会写回该 JSON。
     返回：配置好路由且持有 in-memory runtime 的 `FastAPI` ASGI app。
@@ -1369,6 +1398,10 @@ def create_app(
 
     resolved_poller_config = poller_config or DaemonPollerConfig()
     app_icon_cache = AppIconCache(resolve_app_icon_cache_root(app_icon_cache_path))
+    url_icon_cache = UrlIconCache(
+        resolve_url_icon_cache_root(url_icon_cache_path),
+        fetcher=url_icon_fetcher,
+    )
     initial_key_layout: N4ProKeyLayout | None = None
     initial_key_layout_source: str | None = None
     key_layout_last_error: str | None = None
@@ -1411,6 +1444,7 @@ def create_app(
         local_app_action_executor=local_app_action_executor,
         local_url_action_executor=local_url_action_executor,
         app_icon_cache=app_icon_cache,
+        url_icon_cache=url_icon_cache,
         streamdock_quota_touchscreen_result=None,
         streamdock_n4pro_renderer_result=None,
         streamdock_n4pro_renderer_updated_at=None,
@@ -1663,6 +1697,80 @@ def create_app(
         icon_path = runtime.app_icon_cache.resolve_file(cache_key, asset_name)
         if icon_path is None:
             raise HTTPException(status_code=404, detail="app icon is not cached")
+        return FileResponse(icon_path)
+
+    @app.get("/ui/url-icons/resolve")
+    async def resolve_url_icon(
+        url: str = Query(min_length=1),
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Resolve and cache one URL favicon for GUI preview.
+
+        入参：`url` 是用户配置的网址；`force` 为 True 时强制重建缓存。
+        返回：包含 icon URL、key icon URL、fallback token 和缓存状态的 dict。
+        错误处理：URL 非 http/https 或缺少 host 返回 422；缓存写入失败返回 500。
+        副作用：缓存缺失、过期或强制刷新时可能发起一次 favicon HTTP 请求并写 PNG/metadata。
+        """
+
+        try:
+            return _dump_url_icon_for_ui(url, runtime.url_icon_cache, force=force)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.get("/ui/url-icons/lookup")
+    async def lookup_url_icon(url: str = Query(min_length=1)) -> dict[str, Any]:
+        """Lookup one cached URL icon without network access.
+
+        入参：`url` 是用户配置的网址。
+        返回：缓存命中时包含 icon URL、key icon URL、fallback token 和缓存状态；未命中时
+        `icon_url` 为 None。
+        错误处理：URL 非 http/https 或缺少 host 返回 422。
+        副作用：只读 URL icon cache，不访问网络、不写文件。
+        """
+
+        try:
+            return _dump_cached_url_icon_for_ui(url, runtime.url_icon_cache)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/ui/url-icons/upload")
+    async def upload_url_icon(body: UrlIconUploadRequest) -> dict[str, Any]:
+        """Store one user-selected local image as the URL key icon.
+
+        入参：`body` 包含目标 URL、文件名和 base64 data URL。
+        返回：缓存后的 icon URL、key icon URL 和状态。
+        错误处理：URL 非法、data URL 非法或图片无法解析返回 422；缓存写入失败返回 500。
+        副作用：把用户选择的本地图像转换成 PNG 并写入 URL icon cache。
+        """
+
+        try:
+            image_bytes = _decode_upload_data_url(body.data_url)
+            cached = runtime.url_icon_cache.store_custom_icon(
+                body.url,
+                image_bytes=image_bytes,
+                filename=body.filename,
+            )
+            return _dump_cached_url_icon(cached)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (OSError, binascii.Error) as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.get("/ui/url-icons/{cache_key}/{asset_name}")
+    async def get_url_icon(cache_key: str, asset_name: str) -> FileResponse:
+        """Return one cached URL icon PNG.
+
+        入参：`cache_key` 是缓存目录名；`asset_name` 必须是允许的 PNG 名称。
+        返回：`FileResponse`。
+        错误处理：未知 cache key、未知文件名或文件不存在返回 404。
+        副作用：只读取 Agent Deck URL icon cache 文件。
+        """
+
+        icon_path = runtime.url_icon_cache.resolve_file(cache_key, asset_name)
+        if icon_path is None:
+            raise HTTPException(status_code=404, detail="url icon is not cached")
         return FileResponse(icon_path)
 
     @app.put("/ui/key-layout")
@@ -1990,6 +2098,7 @@ async def _render_streamdock_n4pro_once(
         key_images = _key_images_from_layout(
             layout,
             app_icon_cache=runtime.app_icon_cache,
+            url_icon_cache=runtime.url_icon_cache,
         )
         result = await asyncio.to_thread(
             renderer_sink,
@@ -2072,39 +2181,48 @@ def _key_images_from_layout(
     layout: LayoutPlan,
     *,
     app_icon_cache: AppIconCache | None = None,
+    url_icon_cache: UrlIconCache | None = None,
 ) -> dict[int, Any]:
     """从 layout 提取 N4 Pro 静态主键图片。
 
-    入参：`layout` 是当前 daemon layout；`app_icon_cache` 是可选 App 图标缓存。
-    返回：物理按钮编号到 Pillow 图像的映射；当前只包含 App quick-action 主键。
-    错误处理：单个 App 图标读取失败会 fallback 成 token 图，不影响整轮渲染。
-    副作用：可能只读 `.app` bundle 图标资源；不访问硬件、不启动 App。
+    入参：`layout` 是当前 daemon layout；`app_icon_cache` 是可选 App 图标缓存；
+    `url_icon_cache` 是可选 URL favicon 缓存。
+    返回：物理按钮编号到 Pillow 图像的映射；包含 App 和 URL quick-action 主键。
+    错误处理：单个图标读取失败会 fallback 成 token 图，不影响整轮渲染。
+    副作用：可能只读 `.app` bundle 图标资源或访问 favicon 缓存；不访问硬件、不启动 App。
     """
 
     key_images: dict[int, Any] = {}
     for key in layout.keys[:10]:
-        if key.kind != "app":
-            continue
-        app_name = key.payload.get("app_name") or key.label
-        app_path = key.payload.get("app_path")
-        bundle_id = key.payload.get("bundle_id")
-        icon_token = key.payload.get("icon_token")
-        icon_color = key.payload.get("icon_color")
-        cached_image = None
-        if app_icon_cache is not None:
-            cached_image = app_icon_cache.key_image_for_binding(
+        if key.kind == "app":
+            app_name = key.payload.get("app_name") or key.label
+            app_path = key.payload.get("app_path")
+            bundle_id = key.payload.get("bundle_id")
+            icon_token = key.payload.get("icon_token")
+            icon_color = key.payload.get("icon_color")
+            cached_image = None
+            if app_icon_cache is not None:
+                cached_image = app_icon_cache.key_image_for_binding(
+                    app_name=app_name,
+                    app_path=app_path,
+                    bundle_id=bundle_id,
+                    icon_token=icon_token,
+                    icon_color=icon_color,
+                )
+            key_images[key.index + 1] = cached_image or render_app_key_image(
                 app_name=app_name,
                 app_path=app_path,
-                bundle_id=bundle_id,
                 icon_token=icon_token,
                 icon_color=icon_color,
             )
-        key_images[key.index + 1] = cached_image or render_app_key_image(
-            app_name=app_name,
-            app_path=app_path,
-            icon_token=icon_token,
-            icon_color=icon_color,
-        )
+        if key.kind == "url":
+            url = key.payload.get("url") or key.label
+            cached_url_image = None
+            if url_icon_cache is not None:
+                cached_url_image = url_icon_cache.key_image_for_url(url)
+            key_images[key.index + 1] = cached_url_image or render_url_key_image(
+                url=url,
+            )
     return key_images
 
 
@@ -2297,6 +2415,115 @@ def _dump_app_for_ui(
         }
     )
     return payload
+
+
+def _dump_url_icon_for_ui(
+    url: str,
+    url_icon_cache: UrlIconCache,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """把 URL favicon 缓存条目序列化为 GUI 可消费的 dict。
+
+    入参：`url` 是用户输入的网址；`url_icon_cache` 是 favicon 缓存；`force` 控制是否强制重建。
+    返回：包含 origin、host、`icon_url`、`key_icon_url` 和缓存状态的 dict。
+    错误处理：URL 非法时由 cache 抛 ValueError；缓存写入失败按 OSError 传播。
+    副作用：缓存缺失、过期或强制刷新时可能发起 HTTP 请求并写 PNG/metadata 文件。
+    """
+
+    cached = url_icon_cache.ensure(url, force=force)
+    return _dump_cached_url_icon(cached)
+
+
+def _dump_cached_url_icon_for_ui(
+    url: str,
+    url_icon_cache: UrlIconCache,
+) -> dict[str, Any]:
+    """只读序列化 URL icon cache 条目。
+
+    入参：`url` 是用户输入的网址；`url_icon_cache` 是 favicon 缓存。
+    返回：缓存命中时包含 icon URL；未命中时包含 origin/host/token 和空 icon URL。
+    错误处理：URL 非法时由 cache 抛 ValueError。
+    副作用：只读缓存目录，不访问网络、不写文件。
+    """
+
+    cached = url_icon_cache.lookup(url)
+    if cached is not None:
+        return _dump_cached_url_icon(cached)
+    origin = _url_icon_cache_origin(url)
+    return {
+        "origin": origin["origin"],
+        "host": origin["host"],
+        "icon_token": origin["icon_token"],
+        "icon_url": None,
+        "key_icon_url": None,
+        "icon_cache_key": None,
+        "icon_cache_status": "missing",
+        "icon_cache_updated": False,
+        "icon_cache_fallback_reason": None,
+        "icon_cache_source": None,
+    }
+
+
+def _dump_cached_url_icon(cached: CachedUrlIcon) -> dict[str, Any]:
+    """序列化 URL icon cache 条目。
+
+    入参：`cached` 是 URL icon cache 返回的条目。
+    返回：GUI 可消费的 dict。
+    错误处理：无。
+    副作用：无。
+    """
+
+    return {
+        "origin": cached.origin,
+        "host": cached.host,
+        "icon_token": cached.icon_token,
+        "icon_url": cached.icon_url,
+        "key_icon_url": cached.key_icon_url,
+        "icon_cache_key": cached.cache_key,
+        "icon_cache_status": cached.status,
+        "icon_cache_updated": cached.updated,
+        "icon_cache_fallback_reason": cached.fallback_reason,
+        "icon_cache_source": cached.source,
+    }
+
+
+def _url_icon_cache_origin(url: str) -> dict[str, str]:
+    """解析 URL icon cache lookup 未命中时仍需要返回的 origin 信息。
+
+    入参：`url` 是用户输入的网址。
+    返回：包含 origin、host 和 token 的 dict。
+    错误处理：URL 非法时抛 ValueError。
+    副作用：无。
+    """
+
+    origin = origin_for_url(url)
+    return {
+        "origin": origin,
+        "host": origin.split("://", 1)[-1],
+        "icon_token": token_for_url(origin),
+    }
+
+
+def _decode_upload_data_url(data_url: str) -> bytes:
+    """解码浏览器 FileReader 生成的 base64 data URL。
+
+    入参：`data_url` 应形如 `data:image/png;base64,...`。
+    返回：原始图片 bytes。
+    错误处理：非 data URL、非图片 MIME 或 base64 非法时抛 ValueError。
+    副作用：无。
+    """
+
+    header, separator, encoded = data_url.partition(",")
+    if separator != "," or not header.startswith("data:"):
+        raise ValueError("url icon upload requires data URL")
+    media_type = header[5:].split(";", 1)[0].lower()
+    if media_type not in {"image/png", "image/jpeg", "image/webp", "image/x-icon"}:
+        raise ValueError(f"unsupported url icon media type: {media_type or '<none>'}")
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except binascii.Error as exc:
+        raise ValueError("invalid url icon base64 payload") from exc
 
 
 def _dump_optional_model(model: BaseModel | None) -> dict[str, Any] | None:

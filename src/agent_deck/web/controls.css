@@ -151,6 +151,62 @@
   color: var(--quiet);
 }
 
+.url-icon-control {
+  display: grid;
+  grid-template-columns: 58px 1fr;
+  gap: 12px;
+  align-items: center;
+}
+
+.url-icon-preview {
+  width: 58px;
+  height: 58px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.045);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+
+.url-icon-preview-img {
+  width: 42px;
+  height: 42px;
+  object-fit: contain;
+}
+
+.url-icon-preview-token {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: 2px solid rgba(111, 213, 255, 0.72);
+  display: grid;
+  place-items: center;
+  color: var(--accent);
+  font-weight: 760;
+  font-size: 13px;
+}
+
+.url-icon-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ghost-button.compact {
+  height: 34px;
+  padding: 0 12px;
+}
+
+.hidden-file-input {
+  display: none;
+}
+
+.url-icon-status {
+  color: var(--quiet);
+  font-size: 12px;
+}
+
 .detail-row {
   display: grid;
   grid-template-columns: 84px 1fr;
