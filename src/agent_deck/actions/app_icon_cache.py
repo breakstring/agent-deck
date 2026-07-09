@@ -29,7 +29,7 @@ _APP_ICON_CACHE_ENV = "AGENT_DECK_APP_ICON_CACHE_DIR"
 _DEFAULT_APP_ICON_CACHE_ROOT = (
     Path.home() / "Library/Application Support/AgentDeck/icon-cache/apps"
 )
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 _ICON_96 = "icon-96.png"
 _KEY_112 = "key-112.png"
 _METADATA = "metadata.json"

@@ -101,6 +101,7 @@ def test_url_icon_cache_falls_back_when_favicon_missing(tmp_path: Path) -> None:
     assert entry.fallback_reason == "icon not found"
     with Image.open(entry.key_icon_path or "") as image:
         assert image.size == (112, 112)
+        assert _near_color(image.convert("RGB").getpixel((8, 8)), (11, 14, 18), tolerance=2)
 
 
 def test_url_icon_cache_decodes_data_svg_icon(tmp_path: Path) -> None:

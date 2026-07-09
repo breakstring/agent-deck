@@ -55,6 +55,7 @@ def test_render_app_key_image_falls_back_to_token() -> None:
     assert image.size == (112, 112)
     assert image.mode == "RGB"
     assert _near_color(image.getpixel((30, 30)), (52, 86, 120))
+    assert _near_color(image.getpixel((8, 8)), (11, 14, 18), tolerance=2)
 
 
 def _fake_finder_app(tmp_path: Path) -> Path:

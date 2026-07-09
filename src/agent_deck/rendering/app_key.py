@@ -17,7 +17,6 @@ N4PRO_KEY_IMAGE_SIZE = (112, 112)
 """N4 Pro 主按键图片尺寸。"""
 
 _KEY_BACKGROUND = (11, 14, 18)
-_KEY_BORDER = (47, 57, 67)
 _FALLBACK_FILL = (55, 67, 82)
 _FALLBACK_ACCENT = (111, 213, 255)
 _FALLBACK_TEXT = (238, 243, 246)
@@ -44,7 +43,7 @@ def render_app_key_image(
         raise ValueError("app key image size is too small")
 
     canvas = _base_canvas(size)
-    icon = load_local_app_icon(Path(app_path), max_size=(78, 78)) if app_path else None
+    icon = load_local_app_icon(Path(app_path), max_size=(104, 104)) if app_path else None
     if icon is not None:
         _paste_centered(canvas, icon)
         return canvas.convert("RGB")
@@ -59,7 +58,7 @@ def render_app_key_image(
 
 
 def _base_canvas(size: tuple[int, int]) -> Image.Image:
-    """创建带边框和轻微高光的按键背景。
+    """创建无装饰边框的按键背景。
 
     入参：`size` 是目标图尺寸。
     返回：RGBA `Image`。
@@ -67,22 +66,7 @@ def _base_canvas(size: tuple[int, int]) -> Image.Image:
     副作用：无。
     """
 
-    image = Image.new("RGBA", size, (*_KEY_BACKGROUND, 255))
-    draw = ImageDraw.Draw(image)
-    inset = 3
-    draw.rounded_rectangle(
-        (inset, inset, size[0] - inset - 1, size[1] - inset - 1),
-        radius=14,
-        outline=(*_KEY_BORDER, 255),
-        width=1,
-    )
-    draw.rounded_rectangle(
-        (8, 8, size[0] - 9, size[1] - 9),
-        radius=12,
-        outline=(255, 255, 255, 18),
-        width=1,
-    )
-    return image
+    return Image.new("RGBA", size, (*_KEY_BACKGROUND, 255))
 
 
 def _paste_centered(canvas: Image.Image, icon: Image.Image) -> None:
