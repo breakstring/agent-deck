@@ -61,7 +61,7 @@ function keyLabel(key) {
   if (key.kind === "app") return "打开或切换 App";
   if (key.kind === "url") return "打开网址";
   if (key.kind === "agent") return "Agent 状态槽位";
-  if (key.kind === "disabled") return "已关闭";
+  if (key.kind === "disabled") return "暂不设定";
   return "按键";
 }
 
@@ -269,7 +269,7 @@ function renderInspector() {
     key.kind === "agent"
       ? "按键只表达状态，不显示文字或详情。"
       : key.kind === "disabled"
-        ? "这个键不会显示内容，也不会响应按下。"
+        ? "这个键暂不显示内容，也不会响应按下。"
         : "修改只更新 GUI 预览，保存并应用后才下发。";
 
   let details = "";
@@ -295,7 +295,7 @@ function renderInspector() {
         ${choiceButton("app", "打开或切换 App", key.kind === "app" ? key.app.name : "")}
         ${choiceButton("url", "打开网址", "")}
         ${choiceButton("agent", "Agent 状态", key.kind === "agent" ? `槽位 ${key.slot}` : "")}
-        ${choiceButton("disabled", "关闭这个键", "")}
+        ${choiceButton("disabled", "暂不设定", "")}
       </div>
     </div>
     ${
