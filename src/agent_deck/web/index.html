@@ -19,9 +19,22 @@ Reasoning:
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#0b0d10" />
     <title>Agent Deck · N4 Pro</title>
-    <link rel="stylesheet" href="/web/app.css" />
-    <link rel="stylesheet" href="/web/device.css" />
-    <link rel="stylesheet" href="/web/controls.css" />
+    <script>
+      (() => {
+        try {
+          const storedTheme = localStorage.getItem("agentDeckTheme");
+          const theme = storedTheme === "light" || storedTheme === "dark" ? storedTheme : "dark";
+          document.documentElement.dataset.theme = theme;
+          document.documentElement.style.colorScheme = theme;
+          document.querySelector('meta[name="theme-color"]')?.setAttribute("content", theme === "light" ? "#f4f7fb" : "#0b0d10");
+        } catch (_error) {
+          document.documentElement.dataset.theme = "dark";
+        }
+      })();
+    </script>
+    <link rel="stylesheet" href="/web/app.css?v=20260709-theme" />
+    <link rel="stylesheet" href="/web/device.css?v=20260709-theme" />
+    <link rel="stylesheet" href="/web/controls.css?v=20260709-theme" />
   </head>
   <body>
     <a class="skip-link" href="#mainWorkspace">跳到布局编辑器</a>
@@ -35,6 +48,9 @@ Reasoning:
           <span id="deviceDot" class="status-dot"></span>
           <span id="deviceState">N4 Pro · 检查中</span>
         </div>
+        <button id="themeToggle" class="theme-toggle header-theme-toggle" type="button" aria-pressed="false" aria-label="切换到亮色主题" title="切换主题">
+          <span id="themeToggleIcon" class="theme-toggle-icon" aria-hidden="true">☀</span>
+        </button>
         <div class="top-actions">
           <div class="top-statuses" aria-live="polite">
             <span id="syncState" class="status-chip">检查中</span>
@@ -51,10 +67,6 @@ Reasoning:
               <div id="keyGrid" class="key-grid"></div>
               <div class="touchbar">
                 <img src="/assets/n4pro_splash_command_core.png" alt="Agent Deck touch bar brand panel" width="800" height="480" fetchpriority="high" />
-                <div class="touchbar-overlay">
-                  <span id="panelKind">brand</span>
-                  <span id="panelHint">global panel</span>
-                </div>
               </div>
               <div class="knob-strip" aria-hidden="true">
                 <div class="knob-cell"><div class="knob"></div><div class="led"></div></div>
@@ -101,6 +113,6 @@ Reasoning:
       </div>
     </div>
 
-    <script src="/web/app.js"></script>
+    <script src="/web/app.js?v=20260709-theme"></script>
   </body>
 </html>

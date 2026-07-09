@@ -11,6 +11,31 @@ let appChoices = [
   { name: "Finder", token: "F", path: "/System/Library/CoreServices/Finder.app", color: "linear-gradient(135deg, #7dccff, #2c6ecb)" },
 ];
 
+const THEME_STORAGE_KEY = "agentDeckTheme";
+
+/**
+ * 读取用户上次选择的页面主题；localStorage 不可用或值非法时回退到暗色主题。
+ */
+function readStoredTheme() {
+  try {
+    const storedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return storedTheme === "light" || storedTheme === "dark" ? storedTheme : "dark";
+  } catch (_error) {
+    return "dark";
+  }
+}
+
+/**
+ * 将页面主题写入浏览器本地存储；写入失败不阻断本次 UI 交互。
+ */
+function persistTheme(theme) {
+  try {
+    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+  } catch (_error) {
+    // localStorage 不可用时仍允许本次页面内切换主题。
+  }
+}
+
 const fallbackKeys = Array.from({ length: 10 }, (_, index) => {
   if (index < 5) {
     return { index, role: "quick", kind: "unassigned", dirty: false };
@@ -27,6 +52,7 @@ const state = {
   saving: false,
   refreshingApps: false,
   awaitingHardwareApply: false,
+  theme: readStoredTheme(),
   lastSaveStartedAt: null,
   keyLayoutSource: "default",
   urlIconCache: new Map(),
@@ -39,14 +65,14 @@ const el = {
   selectedSubtitle: document.getElementById("selectedSubtitle"),
   inspectorBody: document.getElementById("inspectorBody"),
   saveButton: document.getElementById("saveButton"),
+  themeToggle: document.getElementById("themeToggle"),
+  themeToggleIcon: document.getElementById("themeToggleIcon"),
   syncState: document.getElementById("syncState"),
   deviceDot: document.getElementById("deviceDot"),
   deviceState: document.getElementById("deviceState"),
   rendererState: document.getElementById("rendererState"),
   agentState: document.getElementById("agentState"),
   panelState: document.getElementById("panelState"),
-  panelKind: document.getElementById("panelKind"),
-  panelHint: document.getElementById("panelHint"),
   toast: document.getElementById("toast"),
   appModal: document.getElementById("appModal"),
   appSearch: document.getElementById("appSearch"),
@@ -55,6 +81,33 @@ const el = {
   appList: document.getElementById("appList"),
   closeAppModal: document.getElementById("closeAppModal"),
 };
+
+/**
+ * 根据当前主题刷新右上角切换按钮的文案、图标和无障碍状态。
+ */
+function updateThemeToggle() {
+  if (!el.themeToggle) return;
+  const isLight = state.theme === "light";
+  el.themeToggle.setAttribute("aria-pressed", String(isLight));
+  el.themeToggle.setAttribute("aria-label", isLight ? "切换到暗色主题" : "切换到亮色主题");
+  el.themeToggle.title = isLight ? "切换到暗色主题" : "切换到亮色主题";
+  if (el.themeToggleIcon) el.themeToggleIcon.textContent = isLight ? "☾" : "☀";
+}
+
+/**
+ * 应用页面主题并按需持久化；只影响配置 GUI，不改变硬件下发布局。
+ */
+function applyTheme(theme, options = {}) {
+  const resolvedTheme = theme === "light" ? "light" : "dark";
+  state.theme = resolvedTheme;
+  document.documentElement.dataset.theme = resolvedTheme;
+  document.documentElement.style.colorScheme = resolvedTheme;
+  document
+    .querySelector('meta[name="theme-color"]')
+    ?.setAttribute("content", resolvedTheme === "light" ? "#f4f7fb" : "#0b0d10");
+  updateThemeToggle();
+  if (options.persist) persistTheme(resolvedTheme);
+}
 
 function keyLabel(key) {
   if (key.kind === "unassigned") return "未设置快捷动作";
@@ -578,8 +631,6 @@ function renderRuntime() {
   el.rendererState.textContent = ok ? "renderer: ok" : `renderer: ${renderer?.last_error || "unknown"}`;
   el.agentState.textContent = `agents: ${agents.length}`;
   el.panelState.textContent = `panel: ${panel}`;
-  el.panelKind.textContent = panel;
-  el.panelHint.textContent = panel === "quota" ? "quota panel" : "global panel";
 }
 
 function setStatusChip(element, text, variant) {
@@ -943,6 +994,9 @@ async function saveAndApply() {
 }
 
 el.saveButton.addEventListener("click", saveAndApply);
+el.themeToggle?.addEventListener("click", () => {
+  applyTheme(state.theme === "light" ? "dark" : "light", { persist: true });
+});
 el.closeAppModal.addEventListener("click", closeAppModal);
 el.appModal.addEventListener("click", (event) => {
   if (event.target === el.appModal) closeAppModal();
@@ -973,6 +1027,7 @@ function escapeAttr(value) {
   return escapeHtml(value).replaceAll("`", "&#96;");
 }
 
+applyTheme(state.theme);
 render();
 boot();
 window.setInterval(refreshStatus, 5000);

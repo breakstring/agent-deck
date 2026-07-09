@@ -6,7 +6,7 @@
 .inspector {
   min-width: 0;
   border-left: 1px solid var(--line);
-  background: rgba(12, 15, 19, 0.72);
+  background: var(--panel-bg);
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
 }
@@ -70,19 +70,19 @@
   align-items: center;
   justify-content: space-between;
   border: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.035);
+  background: var(--control-bg);
   text-align: left;
 }
 
 .choice-button:hover,
 .choice-button.active {
   border-color: rgba(111, 213, 255, 0.46);
-  background: rgba(111, 213, 255, 0.08);
+  background: var(--control-hover);
 }
 
 .choice-button.active {
   border-color: rgba(111, 213, 255, 0.82);
-  background: rgba(111, 213, 255, 0.13);
+  background: var(--control-active);
   box-shadow:
     inset 3px 0 0 rgba(111, 213, 255, 0.95),
     0 0 0 1px rgba(111, 213, 255, 0.1);
@@ -136,7 +136,7 @@
   height: 40px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: rgba(255, 255, 255, 0.045);
+  background: var(--control-bg-strong);
   color: var(--text);
   padding: 0 12px;
   outline: none;
@@ -163,7 +163,7 @@
   height: 58px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: rgba(255, 255, 255, 0.045);
+  background: var(--control-bg-strong);
   display: grid;
   place-items: center;
   overflow: hidden;
@@ -212,7 +212,7 @@
   grid-template-columns: 84px 1fr;
   gap: 12px;
   padding: 11px 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid var(--line);
 }
 
 .detail-row span:first-child {
@@ -234,7 +234,7 @@
   gap: 18px;
   padding: 0 24px;
   border-top: 1px solid var(--line);
-  background: rgba(8, 10, 13, 0.92);
+  background: var(--bottom-bg);
   color: var(--muted);
   font-size: 12px;
 }
@@ -261,7 +261,7 @@
   align-items: center;
   justify-content: center;
   padding: 24px;
-  background: rgba(0, 0, 0, 0.52);
+  background: var(--modal-backdrop);
   z-index: 10;
   overscroll-behavior: contain;
 }
@@ -275,7 +275,7 @@
   max-height: min(720px, calc(100vh - 48px));
   border: 1px solid var(--line-strong);
   border-radius: 10px;
-  background: #11151a;
+  background: var(--surface);
   box-shadow: var(--shadow);
   overflow: hidden;
   display: grid;
@@ -310,7 +310,7 @@
   height: 36px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: rgba(255, 255, 255, 0.045);
+  background: var(--control-bg-strong);
   color: var(--text);
   padding: 0 12px;
   outline: none;
@@ -362,7 +362,7 @@
 }
 
 .app-option:hover {
-  background: rgba(255, 255, 255, 0.055);
+  background: var(--control-bg-strong);
 }
 
 .app-option .app-icon {
@@ -407,6 +407,15 @@
     padding: 14px 18px;
   }
 
+  .brand-lockup {
+    padding-right: 46px;
+  }
+
+  .header-theme-toggle {
+    top: 14px;
+    right: 18px;
+  }
+
   .device-pill,
   .top-actions {
     justify-self: stretch;
@@ -414,6 +423,7 @@
 
   .top-actions {
     justify-content: space-between;
+    padding-right: 0;
   }
 
   .top-statuses {

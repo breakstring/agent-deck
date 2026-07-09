@@ -365,18 +365,6 @@
   opacity: 0.94;
 }
 
-.touchbar-overlay {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  padding: 11px 16px;
-  background: linear-gradient(180deg, transparent 20%, rgba(0, 0, 0, 0.28));
-  color: rgba(255, 255, 255, 0.72);
-  font-size: 12px;
-}
-
 .knob-strip {
   position: absolute;
   left: var(--n4pro-rail-left);
