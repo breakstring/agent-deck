@@ -13,15 +13,34 @@ Python 项目使用 `uv` 管理。
 
 ## 本地启动
 
-仓库根目录提供了默认启动脚本：
+开发和协作调试时，推荐使用 tmux 启动脚本：
+
+```bash
+scripts/agent-deckd-tmux.sh start
+scripts/agent-deckd-tmux.sh status
+scripts/agent-deckd-tmux.sh logs
+scripts/agent-deckd-tmux.sh restart
+scripts/agent-deckd-tmux.sh attach
+```
+
+tmux 脚本会在 detached session `agent-deckd` 中启动 daemon，方便随时查看日志或 attach
+到进程。它最终执行的仍然是仓库根目录下的 `agent-deckd --host 127.0.0.1 --port 8765`，
+因此同样会读取当前目录的 `agent-deck.toml`，并按配置接管 N4 Pro 硬件渲染。
+
+仓库根目录也提供了普通后台启动脚本：
 
 ```bash
 ./run.sh
 ```
 
-默认会在后台启动 `agent-deckd`：监听 `127.0.0.1:8765`，读取 `agent-deck.toml`，
+`run.sh` 更适合作为普通本机后台入口：它不依赖 tmux，会把 PID 和日志写到固定位置，便于
+用 `./run.sh status`、`./run.sh logs` 和 `./run.sh restart` 管理。
+
+两种启动方式都会启动同一个 `agent-deckd`：监听 `127.0.0.1:8765`，读取 `agent-deck.toml`，
 并默认执行真实硬件渲染。当前配置里的默认设备 profile 是 `n4pro`，所以 Codex 状态按钮动画
-和底部 quota 背景会在同一次硬件写入里共存。脚本不依赖 tmux；PID 和日志默认写到：
+和底部 quota 背景会在同一次硬件写入里共存。
+
+`run.sh` 的 PID 和日志默认写到：
 
 ```text
 ~/Library/Application Support/AgentDeck/agent-deckd.pid

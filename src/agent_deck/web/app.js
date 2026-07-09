@@ -61,8 +61,23 @@ function keyLabel(key) {
   if (key.kind === "app") return "打开或切换 App";
   if (key.kind === "url") return "打开网址";
   if (key.kind === "agent") return "Agent 状态槽位";
+  if (key.kind === "quota_status") return "订阅 / 限额状态";
+  if (key.kind === "usage_summary") return "Token / 金额用量";
   if (key.kind === "disabled") return "暂不设定";
   return "按键";
+}
+
+function quotaWindowLabel(value) {
+  if (value === "primary") return "5H";
+  if (value === "secondary") return "WEEK";
+  return "AUTO";
+}
+
+function usagePeriodLabel(value) {
+  if (value === "week") return "Week";
+  if (value === "month") return "Month";
+  if (value === "all") return "All";
+  return "Day";
 }
 
 function runtimeAgents() {
@@ -119,6 +134,22 @@ function uiKeyFromBinding(binding) {
   if (binding.kind === "agent") {
     return { ...base, role: "agent", kind: "agent", slot: 1 };
   }
+  if (binding.kind === "quota_status") {
+    return {
+      ...base,
+      role: "status",
+      kind: "quota_status",
+      quotaWindow: binding.quota_window || "auto",
+    };
+  }
+  if (binding.kind === "usage_summary") {
+    return {
+      ...base,
+      role: "status",
+      kind: "usage_summary",
+      usagePeriod: binding.usage_period || "today",
+    };
+  }
   if (binding.kind === "disabled") {
     return { ...base, role: "disabled", kind: "disabled" };
   }
@@ -161,6 +192,22 @@ function bindingFromUiKey(key) {
   if (key.kind === "agent") {
     return { index: key.index, kind: "agent", label: "Agent" };
   }
+  if (key.kind === "quota_status") {
+    return {
+      index: key.index,
+      kind: "quota_status",
+      label: "订阅 / 限额状态",
+      quota_window: key.quotaWindow || "auto",
+    };
+  }
+  if (key.kind === "usage_summary") {
+    return {
+      index: key.index,
+      kind: "usage_summary",
+      label: "Token / 金额用量",
+      usage_period: key.usagePeriod || "today",
+    };
+  }
   if (key.kind === "disabled") {
     return { index: key.index, kind: "disabled" };
   }
@@ -188,6 +235,22 @@ function renderKeyFace(key) {
   if (key.kind === "agent") {
     const agent = agentForSlot(key.slot);
     return `<div class="agent-visual ${agentVisualClass(agent)}"></div>`;
+  }
+  if (key.kind === "quota_status") {
+    return `
+      <div class="status-key-preview quota-status-preview">
+        <span>${escapeHtml(quotaWindowLabel(key.quotaWindow))}</span>
+        <strong>Quota</strong>
+      </div>
+    `;
+  }
+  if (key.kind === "usage_summary") {
+    return `
+      <div class="status-key-preview usage-summary-preview">
+        <span>${escapeHtml(usagePeriodLabel(key.usagePeriod))}</span>
+        <strong>Usage</strong>
+      </div>
+    `;
   }
   if (key.kind === "disabled") {
     return '<div class="disabled-key"></div>';
@@ -268,6 +331,10 @@ function renderInspector() {
   el.selectedSubtitle.textContent =
     key.kind === "agent"
       ? "按键只表达状态，不显示文字或详情。"
+      : key.kind === "quota_status"
+        ? "按下后切换 Auto、5H、Week 的订阅状态图。"
+        : key.kind === "usage_summary"
+          ? "按下后切换 Day、Week、Month、All 的 Token/金额统计图。"
       : key.kind === "disabled"
         ? "这个键暂不显示内容，也不会响应按下。"
         : "修改只更新 GUI 预览，保存并应用后才下发。";
@@ -286,6 +353,16 @@ function renderInspector() {
       detailRow("按下", "选择并聚焦");
   } else if (key.kind === "url") {
     details = detailRow("网址", key.url || "https://example.com") + detailRow("图标", key.iconStatus || "使用域名缩写");
+  } else if (key.kind === "quota_status") {
+    details =
+      detailRow("展示", quotaWindowLabel(key.quotaWindow)) +
+      detailRow("按下", "切换 Auto / 5H / Week") +
+      detailRow("数据", "复用 touch bar quota 快照");
+  } else if (key.kind === "usage_summary") {
+    details =
+      detailRow("周期", usagePeriodLabel(key.usagePeriod)) +
+      detailRow("按下", "切换 Day / Week / Month / All") +
+      detailRow("数据", "复用 touch bar ccusage 快照");
   }
 
   el.inspectorBody.innerHTML = `
@@ -294,6 +371,8 @@ function renderInspector() {
       <div class="choice-grid">
         ${choiceButton("app", "打开或切换 App", key.kind === "app" ? key.app.name : "")}
         ${choiceButton("url", "打开网址", "")}
+        ${choiceButton("quota_status", "订阅 / 限额状态", key.kind === "quota_status" ? quotaWindowLabel(key.quotaWindow) : "")}
+        ${choiceButton("usage_summary", "Token / 金额用量", key.kind === "usage_summary" ? usagePeriodLabel(key.usagePeriod) : "")}
         ${choiceButton("agent", "Agent 状态", key.kind === "agent" ? `槽位 ${key.slot}` : "")}
         ${choiceButton("disabled", "暂不设定", "")}
       </div>
@@ -385,6 +464,18 @@ function updateKeyKind(kind) {
     const agentCountBefore = state.keys.filter((item) => item.kind === "agent" && item.index < key.index).length;
     Object.assign(key, { role: "agent", kind: "agent", slot: agentCountBefore + 1 });
     renumberAgentSlots();
+  } else if (kind === "quota_status") {
+    Object.assign(key, {
+      role: "status",
+      kind: "quota_status",
+      quotaWindow: key.quotaWindow || "auto",
+    });
+  } else if (kind === "usage_summary") {
+    Object.assign(key, {
+      role: "status",
+      kind: "usage_summary",
+      usagePeriod: key.usagePeriod || "today",
+    });
   } else if (kind === "disabled") {
     Object.assign(key, { role: "disabled", kind: "disabled" });
   }

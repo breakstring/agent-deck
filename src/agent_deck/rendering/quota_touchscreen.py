@@ -21,6 +21,7 @@ from agent_deck.rendering.n4pro_panel import (
     VirtualPanelViewport,
     compose_n4pro_background,
 )
+from agent_deck.rendering.reset_credit import draw_reset_credit_key_icon
 
 N4PRO_TOUCH_BAR_RECT: Final[tuple[int, int, int, int]] = (
     N4PRO_TOUCH_BAR_VIEWPORT.left,
@@ -278,55 +279,18 @@ def _draw_reset_credit_marker(
     if available_count is None or available_count <= 0:
         return
     x, y = origin
-    _draw_key_icon(draw, (x, y + 3), icon_size)
+    draw_reset_credit_key_icon(
+        draw,
+        (x, y + 3),
+        icon_size,
+        color=_RESET_CREDIT,
+    )
     draw.text(
         (x + icon_size + 8, y + icon_size // 2),
         str(available_count),
         fill=_RESET_CREDIT,
         font=font,
         anchor="lm",
-    )
-
-
-def _draw_key_icon(
-    draw: ImageDraw.ImageDraw,
-    origin: tuple[int, int],
-    size: int,
-) -> None:
-    """绘制一个小钥匙图标。
-
-    入参：`draw` 是绘图对象；`origin` 是图标左上角；`size` 是图标尺寸。
-    返回：无返回值。
-    错误处理：Pillow 绘制失败时异常传播。
-    副作用：修改 `draw` 绑定的内存图像；不依赖系统 emoji 字体。
-    """
-
-    x, y = origin
-    bow_radius = max(4, size // 4)
-    bow_cx = x + bow_radius + 1
-    bow_cy = y + bow_radius + 1
-    shaft_y = bow_cy
-    shaft_start = bow_cx + bow_radius
-    shaft_end = x + size - 1
-    tooth_x = shaft_end - max(4, size // 4)
-    tooth_h = max(4, size // 4)
-
-    draw.ellipse(
-        (
-            bow_cx - bow_radius,
-            bow_cy - bow_radius,
-            bow_cx + bow_radius,
-            bow_cy + bow_radius,
-        ),
-        outline=_RESET_CREDIT,
-        width=2,
-    )
-    draw.line((shaft_start, shaft_y, shaft_end, shaft_y), fill=_RESET_CREDIT, width=3)
-    draw.line((tooth_x, shaft_y, tooth_x, shaft_y + tooth_h), fill=_RESET_CREDIT, width=3)
-    draw.line(
-        (shaft_end - 2, shaft_y, shaft_end - 2, shaft_y + tooth_h - 1),
-        fill=_RESET_CREDIT,
-        width=2,
     )
 
 

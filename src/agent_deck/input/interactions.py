@@ -137,7 +137,13 @@ def _intent_from_layout_key(
         decision_id=key.decision_id,
         action=key.action,
         payload=key.payload,
-        dry_run=key.intent not in {"select_agent", "open_or_focus_app"},
+        dry_run=key.intent
+        not in {
+            "select_agent",
+            "open_or_focus_app",
+            "cycle_quota_status_window",
+            "cycle_usage_summary_period",
+        },
     )
 
 

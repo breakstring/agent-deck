@@ -33,6 +33,8 @@ class KeySurfaceKind(StrEnum):
     URL = "url"
     FOLDER = "folder"
     AGENT = "agent"
+    QUOTA_STATUS = "quota_status"
+    USAGE_SUMMARY = "usage_summary"
     DISABLED = "disabled"
 
 
@@ -56,6 +58,8 @@ class N4ProKeyBinding(BaseModel):
     bundle_id: str | None = None
     url: str | None = None
     path: str | None = None
+    quota_window: str | None = None
+    usage_period: str | None = None
     icon_token: str | None = None
     icon_color: str | None = None
 
@@ -80,6 +84,8 @@ class N4ProKeyBinding(BaseModel):
         "bundle_id",
         "url",
         "path",
+        "quota_window",
+        "usage_period",
         "icon_token",
         "icon_color",
         mode="before",
@@ -118,6 +124,21 @@ class N4ProKeyBinding(BaseModel):
             raise ValueError("url key requires url")
         if self.kind == KeySurfaceKind.FOLDER and not self.path:
             raise ValueError("folder key requires path")
+        if self.kind == KeySurfaceKind.QUOTA_STATUS and self.quota_window not in {
+            None,
+            "auto",
+            "primary",
+            "secondary",
+        }:
+            raise ValueError("quota_status key requires quota_window auto/primary/secondary")
+        if self.kind == KeySurfaceKind.USAGE_SUMMARY and self.usage_period not in {
+            None,
+            "today",
+            "week",
+            "month",
+            "all",
+        }:
+            raise ValueError("usage_summary key requires usage_period today/week/month/all")
         return self
 
     def display_label(self) -> str:
@@ -137,6 +158,10 @@ class N4ProKeyBinding(BaseModel):
             return self.url
         if self.kind == KeySurfaceKind.FOLDER and self.path:
             return self.path
+        if self.kind == KeySurfaceKind.QUOTA_STATUS:
+            return "订阅 / 限额状态"
+        if self.kind == KeySurfaceKind.USAGE_SUMMARY:
+            return "Token / 金额用量"
         if self.kind == KeySurfaceKind.UNASSIGNED:
             return "未设置快捷动作"
         if self.kind == KeySurfaceKind.AGENT:
@@ -263,7 +288,7 @@ def project_n4pro_key_layout(
 def _project_static_binding(binding: N4ProKeyBinding) -> KeyPlan:
     """把非 Agent binding 投影成单个 key plan。
 
-    入参：`binding` 是 unassigned/app/url/folder/disabled 按键配置。
+    入参：`binding` 是 unassigned/app/url/folder/status/disabled 按键配置。
     返回：对应的 `KeyPlan`。
     错误处理：未知 kind 降级为无 intent 空键。
     副作用：无。
@@ -312,6 +337,24 @@ def _project_static_binding(binding: N4ProKeyBinding) -> KeyPlan:
             kind=binding.kind.value,
             action="open_path",
             payload=_compact_payload(path=binding.path),
+        )
+    if binding.kind == KeySurfaceKind.QUOTA_STATUS:
+        return KeyPlan(
+            index=binding.index,
+            label=binding.display_label(),
+            intent="cycle_quota_status_window",
+            role="user_action",
+            kind=binding.kind.value,
+            payload={"quota_window": binding.quota_window or "auto"},
+        )
+    if binding.kind == KeySurfaceKind.USAGE_SUMMARY:
+        return KeyPlan(
+            index=binding.index,
+            label=binding.display_label(),
+            intent="cycle_usage_summary_period",
+            role="user_action",
+            kind=binding.kind.value,
+            payload={"usage_period": binding.usage_period or "today"},
         )
     if binding.kind == KeySurfaceKind.DISABLED:
         return KeyPlan(

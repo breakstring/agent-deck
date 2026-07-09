@@ -1244,6 +1244,103 @@ def test_streamdock_n4pro_key_images_include_url_bindings(tmp_path: Path) -> Non
     assert _near_color(image.getpixel((56, 56)), (50, 120, 210))
 
 
+def test_streamdock_n4pro_key_images_include_cached_status_bindings() -> None:
+    """N4 Pro renderer 应把 quota/usage 状态键转成可缓存静态按键图。
+
+    入参：无；测试内构造 quota_status 和 usage_summary 布局。
+    返回：无返回值；断言通过代表状态键图片会进入 key_images，且相同输入复用缓存图像。
+    错误处理：缺少图片、尺寸不对或缓存未命中时由 pytest 报告。
+    副作用：只创建内存图片，不访问真实 N4 Pro 或用户配置。
+    """
+
+    key_layout = N4ProKeyLayout(
+        keys=(
+            N4ProKeyBinding(
+                index=0,
+                kind=KeySurfaceKind.QUOTA_STATUS,
+                quota_window="primary",
+            ),
+            N4ProKeyBinding(
+                index=1,
+                kind=KeySurfaceKind.USAGE_SUMMARY,
+                usage_period="week",
+            ),
+            *default_n4pro_key_layout().sorted_keys()[2:],
+        )
+    )
+    layout = build_layout_plan(
+        [],
+        [],
+        DeckSelection(mode=DeckMode.OVERVIEW),
+        key_layout=key_layout,
+    )
+    cache = server_app.StatusKeyImageCache()
+
+    first = server_app._key_images_from_layout(
+        layout,
+        quota_snapshot=_quota_snapshot(),
+        token_usage_snapshot=_token_snapshot(),
+        status_key_cache=cache,
+    )
+    second = server_app._key_images_from_layout(
+        layout,
+        quota_snapshot=_quota_snapshot(),
+        token_usage_snapshot=_token_snapshot(),
+        status_key_cache=cache,
+    )
+
+    assert sorted(first) == [1, 2]
+    assert getattr(first[1], "size") == (112, 112)
+    assert getattr(first[2], "size") == (112, 112)
+    assert second[1] is first[1]
+    assert second[2] is first[2]
+
+
+def test_hardware_status_key_press_cycles_quota_window_and_usage_period() -> None:
+    """按下状态型主键应切换当前展示窗口/周期，而不是执行外部动作。
+
+    入参：无；测试内保存状态型按键布局并发送 fake hardware key press。
+    返回：无返回值；断言通过代表 runtime key layout 被更新，后续渲染可从缓存取新图。
+    错误处理：按键 intent 未处理、周期未切换或被当成 dry-run 时由 pytest 报告。
+    副作用：只修改测试 app 内存状态，不写真实用户配置、不访问硬件。
+    """
+
+    client = TestClient(create_app())
+    layout_body = {
+        "keys": [
+            {"index": 0, "kind": "quota_status", "quota_window": "primary"},
+            {"index": 1, "kind": "usage_summary", "usage_period": "today"},
+            {"index": 2, "kind": "unassigned"},
+            {"index": 3, "kind": "unassigned"},
+            {"index": 4, "kind": "unassigned"},
+            {"index": 5, "kind": "agent"},
+            {"index": 6, "kind": "agent"},
+            {"index": 7, "kind": "agent"},
+            {"index": 8, "kind": "agent"},
+            {"index": 9, "kind": "agent"},
+        ]
+    }
+
+    save_response = client.put("/ui/key-layout", json=layout_body)
+    quota_response = client.post(
+        "/hardware/input",
+        json=_hardware_input(kind="key", index=0, value={"state": 1}),
+    )
+    usage_response = client.post(
+        "/hardware/input",
+        json=_hardware_input(kind="key", index=1, value={"state": 1}),
+    )
+    status = client.get("/status").json()
+
+    assert save_response.status_code == 200
+    assert quota_response.json()["action"]["status"] == "cycled"
+    assert quota_response.json()["action"]["quota_window"] == "secondary"
+    assert usage_response.json()["action"]["status"] == "cycled"
+    assert usage_response.json()["action"]["usage_period"] == "week"
+    assert status["key_layout"]["layout"]["keys"][0]["quota_window"] == "secondary"
+    assert status["key_layout"]["layout"]["keys"][1]["usage_period"] == "week"
+
+
 def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
     tmp_path: Path,
 ) -> None:

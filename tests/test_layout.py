@@ -237,6 +237,46 @@ def test_n4pro_app_binding_projects_action_payload() -> None:
     assert plan.keys[0].payload["icon_token"] == "FI"
 
 
+def test_n4pro_status_bindings_project_to_stateful_key_intents() -> None:
+    """状态型按键配置应投影为可切换的 quota/usage key intent。
+
+    入参：无；测试内配置一个 quota_status 和一个 usage_summary 主键。
+    返回：无返回值；断言通过代表 layout 中包含 renderer 和 input router 所需的 kind/payload。
+    错误处理：kind、intent 或 payload 不符合状态键契约时由 pytest 报告。
+    副作用：无；只创建内存 layout。
+    """
+
+    layout = N4ProKeyLayout(
+        keys=(
+            N4ProKeyBinding(
+                index=0,
+                kind=KeySurfaceKind.QUOTA_STATUS,
+                quota_window="primary",
+            ),
+            N4ProKeyBinding(
+                index=1,
+                kind=KeySurfaceKind.USAGE_SUMMARY,
+                usage_period="week",
+            ),
+            *default_n4pro_key_layout().sorted_keys()[2:],
+        )
+    )
+
+    plan = build_layout_plan(
+        [],
+        [],
+        DeckSelection(mode=DeckMode.OVERVIEW),
+        key_layout=layout,
+    )
+
+    assert plan.keys[0].kind == KeySurfaceKind.QUOTA_STATUS.value
+    assert plan.keys[0].intent == "cycle_quota_status_window"
+    assert plan.keys[0].payload["quota_window"] == "primary"
+    assert plan.keys[1].kind == KeySurfaceKind.USAGE_SUMMARY.value
+    assert plan.keys[1].intent == "cycle_usage_summary_period"
+    assert plan.keys[1].payload["usage_period"] == "week"
+
+
 def test_overview_hides_offline_agents_from_main_button_slots() -> None:
     """Verify offline agents do not occupy overview agent key slots.
 

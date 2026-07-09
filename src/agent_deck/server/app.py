@@ -54,6 +54,7 @@ from agent_deck.adapters.codex_app_state import (
 )
 from agent_deck.adapters.codex_quota import CodexQuotaSnapshot, read_codex_quota
 from agent_deck.adapters.codex_tokens import (
+    CodexTokenPeriod,
     CodexTokenUsageSnapshot,
     read_codex_token_usage,
 )
@@ -106,6 +107,11 @@ from agent_deck.rendering.logical_panel_touchscreen import (
     render_logical_panel_touchscreen,
 )
 from agent_deck.rendering.quota_touchscreen import render_quota_touchscreen
+from agent_deck.rendering.status_key import (
+    QuotaStatusWindow,
+    render_quota_status_key_image,
+    render_usage_summary_key_image,
+)
 from agent_deck.rendering.url_key import render_url_key_image, token_for_url
 from agent_deck.server.key_layout_store import (
     KeyLayoutStoreError,
@@ -139,6 +145,9 @@ _RECENT_INTERACTION_LIMIT = 30
 
 _BRAND_FEEDBACK_DURATION_SECONDS = 4.0
 """未配置主按键触发默认品牌反馈面板的持续秒数。"""
+
+_MAX_STATUS_KEY_IMAGE_CACHE_ENTRIES = 64
+"""状态按键图片缓存最多保留多少张 Pillow image，避免长时间运行无限增长。"""
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 """agent_deck 包根目录，用于定位随包分发的 Web GUI 和品牌资源。"""
@@ -280,6 +289,121 @@ class KeyLayoutResponse(BaseModel):
     layout: N4ProKeyLayout
 
 
+class StatusKeyImageCache:
+    """缓存状态型 N4 Pro 主按键图片，避免交互时重复执行渲染。
+
+    入参：无；缓存由 quota/token 快照内容和当前展示窗口/周期组成。
+    返回：普通 Python 对象，通过 `quota_image()` / `usage_image()` 返回 Pillow image。
+    错误处理：渲染器异常按原样传播；未知窗口或周期会先归一到安全默认值。
+    副作用：仅保存内存 image 引用，不读取 ccusage、不访问网络或硬件。
+    """
+
+    def __init__(self) -> None:
+        """初始化空图片缓存。
+
+        入参：无。
+        返回：无。
+        错误处理：无。
+        副作用：分配进程内 dict；不会提前渲染图片。
+        """
+
+        self._images: dict[tuple[object, ...], Any] = {}
+
+    def clear(self) -> None:
+        """清空所有已渲染状态按键图片。
+
+        入参：无。
+        返回：无。
+        错误处理：无。
+        副作用：释放本对象持有的 Pillow image 引用。
+        """
+
+        self._images.clear()
+
+    def _store(self, key: tuple[object, ...], image: Any) -> None:
+        """保存一张图片并按插入顺序裁剪缓存。
+
+        入参：`key` 是图片内容指纹；`image` 是 Pillow image。
+        返回：无。
+        错误处理：无。
+        副作用：修改内存缓存；超过容量时移除最早条目。
+        """
+
+        self._images[key] = image
+        while len(self._images) > _MAX_STATUS_KEY_IMAGE_CACHE_ENTRIES:
+            self._images.pop(next(iter(self._images)))
+
+    def quota_image(
+        self,
+        snapshot: CodexQuotaSnapshot,
+        *,
+        window: str | None,
+    ) -> Any:
+        """返回 quota status 按键图片，优先命中缓存。
+
+        入参：`snapshot` 是 daemon 当前共享 quota 快照；`window` 是 key 配置中的窗口。
+        返回：112x112 Pillow image。
+        错误处理：渲染失败按原异常传播。
+        副作用：缓存 miss 时创建一张新图片并保存到内存。
+        """
+
+        normalized_window = _normalize_quota_status_window(window)
+        key = (
+            "quota_status",
+            normalized_window,
+            snapshot.plan_type,
+            snapshot.plan_short_label,
+            snapshot.plan_display_name,
+            snapshot.primary.used_percent,
+            snapshot.primary.window_duration_mins,
+            snapshot.primary.resets_at.isoformat(),
+            snapshot.secondary.used_percent,
+            snapshot.secondary.window_duration_mins,
+            snapshot.secondary.resets_at.isoformat(),
+            snapshot.credits_balance,
+            snapshot.reset_credits_available,
+        )
+        image = self._images.get(key)
+        if image is None:
+            image = render_quota_status_key_image(
+                snapshot,
+                window=normalized_window,
+            )
+            self._store(key, image)
+        return image
+
+    def usage_image(
+        self,
+        snapshot: CodexTokenUsageSnapshot,
+        *,
+        period: str | None,
+    ) -> Any:
+        """返回 token/cost usage 按键图片，优先命中缓存。
+
+        入参：`snapshot` 是 daemon 当前共享 token usage 快照；`period` 是 key 配置周期。
+        返回：112x112 Pillow image。
+        错误处理：渲染失败按原异常传播。
+        副作用：缓存 miss 时创建一张新图片并保存到内存。
+        """
+
+        normalized_period = _normalize_token_usage_period(period)
+        key = (
+            "usage_summary",
+            normalized_period.value,
+            snapshot.updated_at.isoformat(),
+            _token_usage_period_fingerprint(snapshot),
+            _token_usage_daily_fingerprint(snapshot),
+        )
+        image = self._images.get(key)
+        if image is None:
+            image = render_usage_summary_key_image(
+                snapshot,
+                period=normalized_period,
+            )
+            self._store(key, image)
+        return image
+
+
 @dataclass
 class _DaemonRuntime:
     """Hold all process-local daemon state used by the HTTP handlers.
@@ -326,6 +450,7 @@ class _DaemonRuntime:
     local_url_action_executor: LocalUrlActionExecutor
     app_icon_cache: AppIconCache
     url_icon_cache: UrlIconCache
+    status_key_image_cache: StatusKeyImageCache
     streamdock_quota_touchscreen_result: StreamDockTouchscreenRenderResult | None
     streamdock_n4pro_renderer_result: StreamDockN4ProAnimationResult | None
     streamdock_n4pro_renderer_updated_at: datetime | None
@@ -397,6 +522,7 @@ class _DaemonRuntime:
             self.key_layout_source = "runtime"
         self.key_layout = layout
         rendered_layout = self.render_current()
+        self.prewarm_status_key_images(rendered_layout)
         return {
             "key_layout": _dump_model(self.current_key_layout_response()),
             "layout": _dump_model(rendered_layout),
@@ -502,6 +628,7 @@ class _DaemonRuntime:
         self.codex_quota_updated_at = updated_at
         self.codex_quota_last_error = None
         image = self.render_current_logical_panel_image()
+        self.prewarm_status_key_images()
         return image
 
     def update_codex_token_usage(
@@ -521,6 +648,7 @@ class _DaemonRuntime:
         self.codex_token_usage_snapshot = snapshot
         self.codex_token_usage_updated_at = updated_at
         self.codex_token_usage_last_error = None
+        self.prewarm_status_key_images()
         return self.render_current_logical_panel_image()
 
     def mark_codex_token_usage_poll_error(
@@ -736,6 +864,10 @@ class _DaemonRuntime:
                 intent,
                 message="open_path ignored; folder quick actions are disabled",
             )
+        elif intent.intent == "cycle_quota_status_window":
+            action = self.cycle_quota_status_window(intent)
+        elif intent.intent == "cycle_usage_summary_period":
+            action = self.cycle_usage_summary_period(intent)
         elif intent.intent == "show_brand_feedback":
             action = self.show_brand_feedback_panel(intent)
         else:
@@ -762,6 +894,128 @@ class _DaemonRuntime:
             "deck_selection": _dump_model(self.selection),
             "action": action,
         }
+
+    def cycle_quota_status_window(self, intent: InteractionIntent) -> dict[str, Any]:
+        """切换一个 quota status 主按键展示的 quota 窗口。
+
+        入参：`intent` 是按下状态型主键产生的 interaction intent。
+        返回：JSON-safe action 诊断，包含切换后的窗口。
+        错误处理：若 key layout 中找不到匹配 quota key，返回 missing_key，不抛异常。
+        副作用：更新 runtime 内存 key layout 并 render 当前 layout；不写用户配置文件、不刷新 quota。
+        """
+
+        updated_window = _next_quota_status_window(
+            intent.payload.get("quota_window")
+        )
+        updated = self._replace_key_binding(
+            intent.key_index,
+            kind="quota_status",
+            update={"quota_window": updated_window},
+        )
+        if not updated:
+            return {
+                "intent": intent.intent,
+                "key_index": intent.key_index,
+                "status": "missing_key",
+                "ok": False,
+                "message": "quota_status key not found in current key layout",
+            }
+        layout = self.render_current()
+        self.prewarm_status_key_images(layout)
+        return {
+            "intent": intent.intent,
+            "key_index": intent.key_index,
+            "status": "cycled",
+            "ok": True,
+            "quota_window": updated_window,
+            "message": f"quota status window cycled to {updated_window}",
+        }
+
+    def cycle_usage_summary_period(self, intent: InteractionIntent) -> dict[str, Any]:
+        """切换一个 usage summary 主按键展示的 token/cost 周期。
+
+        入参：`intent` 是按下状态型主键产生的 interaction intent。
+        返回：JSON-safe action 诊断，包含切换后的周期。
+        错误处理：若 key layout 中找不到匹配 usage key，返回 missing_key，不抛异常。
+        副作用：更新 runtime 内存 key layout 并 render 当前 layout；不写用户配置文件、不执行 ccusage。
+        """
+
+        updated_period = _next_token_usage_period(intent.payload.get("usage_period"))
+        updated = self._replace_key_binding(
+            intent.key_index,
+            kind="usage_summary",
+            update={"usage_period": updated_period},
+        )
+        if not updated:
+            return {
+                "intent": intent.intent,
+                "key_index": intent.key_index,
+                "status": "missing_key",
+                "ok": False,
+                "message": "usage_summary key not found in current key layout",
+            }
+        layout = self.render_current()
+        self.prewarm_status_key_images(layout)
+        return {
+            "intent": intent.intent,
+            "key_index": intent.key_index,
+            "status": "cycled",
+            "ok": True,
+            "usage_period": updated_period,
+            "message": f"usage summary period cycled to {updated_period}",
+        }
+
+    def _replace_key_binding(
+        self,
+        index: int,
+        *,
+        kind: str,
+        update: dict[str, Any],
+    ) -> bool:
+        """替换当前 runtime key layout 中的一个主按键配置。
+
+        入参：`index` 是 0-based 主键编号；`kind` 是期望用途；`update` 是 Pydantic
+        `model_copy` 更新字段。
+        返回：找到并替换时为 True，否则为 False。
+        错误处理：更新后的 layout 若不合法会按 Pydantic 异常传播。
+        副作用：只更新 daemon 内存 layout；不写 key layout path，避免硬件临时切换落盘。
+        """
+
+        layout = self.current_key_layout_response().layout
+        bindings = []
+        replaced = False
+        for binding in layout.sorted_keys():
+            if binding.index == index and binding.kind.value == kind:
+                bindings.append(binding.model_copy(update=update))
+                replaced = True
+            else:
+                bindings.append(binding)
+        if not replaced:
+            return False
+        self.key_layout = N4ProKeyLayout(keys=tuple(bindings))
+        if self.key_layout_source is None:
+            self.key_layout_source = "runtime"
+        return True
+
+    def prewarm_status_key_images(self, layout: LayoutPlan | None = None) -> None:
+        """按当前配置预渲染状态型主按键图片到 runtime 缓存。
+
+        入参：`layout` 是可选的当前 layout；为空时会重建并记录一帧 fake layout。
+        返回：无。
+        错误处理：渲染异常按原样传播给调用方或 poller，由外层记录。
+        副作用：可能创建状态键 Pillow image 并写入 `status_key_image_cache`；不访问硬件、
+        不执行 ccusage、不读取 quota。
+        """
+
+        if self.codex_quota_snapshot is None and self.codex_token_usage_snapshot is None:
+            return
+        resolved_layout = layout or self.render_current()
+        _key_images_from_layout(
+            resolved_layout,
+            quota_snapshot=self.codex_quota_snapshot,
+            token_usage_snapshot=self.codex_token_usage_snapshot,
+            status_key_cache=self.status_key_image_cache,
+        )
 
     def show_brand_feedback_panel(self, intent: InteractionIntent) -> dict[str, Any]:
         """短暂显示 Agent Deck 默认品牌面板。
@@ -1445,6 +1699,7 @@ def create_app(
         local_url_action_executor=local_url_action_executor,
         app_icon_cache=app_icon_cache,
         url_icon_cache=url_icon_cache,
+        status_key_image_cache=StatusKeyImageCache(),
         streamdock_quota_touchscreen_result=None,
         streamdock_n4pro_renderer_result=None,
         streamdock_n4pro_renderer_updated_at=None,
@@ -2099,6 +2354,9 @@ async def _render_streamdock_n4pro_once(
             layout,
             app_icon_cache=runtime.app_icon_cache,
             url_icon_cache=runtime.url_icon_cache,
+            quota_snapshot=runtime.codex_quota_snapshot,
+            token_usage_snapshot=runtime.codex_token_usage_snapshot,
+            status_key_cache=runtime.status_key_image_cache,
         )
         result = await asyncio.to_thread(
             renderer_sink,
@@ -2182,17 +2440,23 @@ def _key_images_from_layout(
     *,
     app_icon_cache: AppIconCache | None = None,
     url_icon_cache: UrlIconCache | None = None,
+    quota_snapshot: CodexQuotaSnapshot | None = None,
+    token_usage_snapshot: CodexTokenUsageSnapshot | None = None,
+    status_key_cache: StatusKeyImageCache | None = None,
 ) -> dict[int, Any]:
     """从 layout 提取 N4 Pro 静态主键图片。
 
     入参：`layout` 是当前 daemon layout；`app_icon_cache` 是可选 App 图标缓存；
-    `url_icon_cache` 是可选 URL favicon 缓存。
-    返回：物理按钮编号到 Pillow 图像的映射；包含 App 和 URL quick-action 主键。
+    `url_icon_cache` 是可选 URL favicon 缓存；`quota_snapshot` 和 `token_usage_snapshot`
+    是 touchbar 面板已经复用的状态数据；`status_key_cache` 缓存状态按键渲染结果。
+    返回：物理按钮编号到 Pillow 图像的映射；包含 App、URL 和状态型主键。
     错误处理：单个图标读取失败会 fallback 成 token 图，不影响整轮渲染。
-    副作用：可能只读 `.app` bundle 图标资源或访问 favicon 缓存；不访问硬件、不启动 App。
+    副作用：可能只读 `.app` bundle 图标资源或访问 favicon 缓存；状态图缓存 miss 时会创建
+    内存图片；不访问硬件、不启动 App、不执行 ccusage。
     """
 
     key_images: dict[int, Any] = {}
+    resolved_status_key_cache = status_key_cache or StatusKeyImageCache()
     for key in layout.keys[:10]:
         if key.kind == "app":
             app_name = key.payload.get("app_name") or key.label
@@ -2223,7 +2487,133 @@ def _key_images_from_layout(
             key_images[key.index + 1] = cached_url_image or render_url_key_image(
                 url=url,
             )
+        if key.kind == "quota_status" and quota_snapshot is not None:
+            key_images[key.index + 1] = resolved_status_key_cache.quota_image(
+                quota_snapshot,
+                window=key.payload.get("quota_window"),
+            )
+        if key.kind == "usage_summary" and token_usage_snapshot is not None:
+            key_images[key.index + 1] = resolved_status_key_cache.usage_image(
+                token_usage_snapshot,
+                period=key.payload.get("usage_period"),
+            )
     return key_images
+
+
+def _normalize_quota_status_window(value: str | None) -> QuotaStatusWindow:
+    """把配置或 intent 中的 quota window 归一成渲染器可接受的值。
+
+    入参：`value` 是用户配置、layout payload 或硬件 intent 中的窗口字符串。
+    返回：`auto`、`primary` 或 `secondary`；未知值降级到 `auto`。
+    错误处理：不抛业务异常，避免坏配置打断硬件渲染循环。
+    副作用：无。
+    """
+
+    if value in {"auto", "primary", "secondary"}:
+        return value
+    return "auto"
+
+
+def _normalize_token_usage_period(value: str | None) -> CodexTokenPeriod:
+    """把配置或 intent 中的 token usage 周期归一成枚举。
+
+    入参：`value` 是用户配置、layout payload 或硬件 intent 中的周期字符串。
+    返回：合法 `CodexTokenPeriod`；未知值降级到 `today`。
+    错误处理：不抛业务异常，避免坏配置打断硬件渲染循环。
+    副作用：无。
+    """
+
+    try:
+        return CodexTokenPeriod(value or CodexTokenPeriod.TODAY.value)
+    except ValueError:
+        return CodexTokenPeriod.TODAY
+
+
+def _next_quota_status_window(value: str | None) -> str:
+    """返回 quota status 按键下一个展示窗口。
+
+    入参：`value` 是当前窗口。
+    返回：按 `auto -> primary -> secondary -> auto` 循环后的字符串。
+    错误处理：未知值视为 `auto`。
+    副作用：无。
+    """
+
+    order = ("auto", "primary", "secondary")
+    current = _normalize_quota_status_window(value)
+    return order[(order.index(current) + 1) % len(order)]
+
+
+def _next_token_usage_period(value: str | None) -> str:
+    """返回 usage summary 按键下一个统计周期。
+
+    入参：`value` 是当前周期。
+    返回：按 `today -> week -> month -> all -> today` 循环后的字符串。
+    错误处理：未知值视为 `today`。
+    副作用：无。
+    """
+
+    order = (
+        CodexTokenPeriod.TODAY,
+        CodexTokenPeriod.WEEK,
+        CodexTokenPeriod.MONTH,
+        CodexTokenPeriod.ALL,
+    )
+    current = _normalize_token_usage_period(value)
+    return order[(order.index(current) + 1) % len(order)].value
+
+
+def _token_usage_period_fingerprint(
+    snapshot: CodexTokenUsageSnapshot,
+) -> tuple[tuple[str, int, float], ...]:
+    """生成 token usage 四周期汇总的轻量缓存指纹。
+
+    入参：`snapshot` 是当前 token usage 快照。
+    返回：周期、总 token、金额三元组序列。
+    错误处理：缺失周期按当前 mapping 内容生成，渲染器后续仍会按原语义报错。
+    副作用：无。
+    """
+
+    return tuple(
+        (
+            period.value,
+            stats.total_tokens,
+            round(stats.cost_usd, 6),
+        )
+        for period, stats in sorted(
+            snapshot.periods.items(),
+            key=lambda item: item[0].value,
+        )
+    )
+
+
+def _token_usage_daily_fingerprint(
+    snapshot: CodexTokenUsageSnapshot,
+) -> tuple[tuple[str, int, float], ...]:
+    """生成 ccusage daily raw 的趋势缓存指纹。
+
+    入参：`snapshot` 是当前 token usage 快照。
+    返回：日期、总 token、金额三元组序列；raw 不符合预期时返回空 tuple。
+    错误处理：非 dict/list 结构会被忽略，避免缓存指纹构造打断状态页。
+    副作用：无。
+    """
+
+    raw_daily = snapshot.raw.get("daily") if isinstance(snapshot.raw, dict) else None
+    if not isinstance(raw_daily, list):
+        return ()
+    fingerprint: list[tuple[str, int, float]] = []
+    for item in raw_daily:
+        if not isinstance(item, dict):
+            continue
+        date_value = item.get("date")
+        if not isinstance(date_value, str):
+            continue
+        try:
+            total_tokens = int(item.get("totalTokens", item.get("total_tokens", 0)) or 0)
+            cost_usd = float(item.get("totalCost", item.get("cost_usd", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        fingerprint.append((date_value, total_tokens, round(cost_usd, 6)))
+    return tuple(fingerprint)
 
 
 def _active_tool_from_reason(reason: str) -> str | None:
