@@ -393,6 +393,45 @@ def test_persistent_animator_writes_a_new_background_revision_during_active_fram
     assert result.ok is True
     assert [name for name, _ in device.calls].count("set_frame_background") == 2
     assert [name for name, _ in device.calls].count("open") == 1
+    assert result.timing_seconds["background_hot_updates"] == 1.0
+    assert result.timing_seconds["background_hot_update"] >= 0.0
+
+
+def test_persistent_animator_background_notification_wakes_frame_wait(
+    tmp_path: Path,
+) -> None:
+    """背景 revision 通知应唤醒持久 animator，而不是固定等到下一帧。
+
+    入参：`tmp_path` 提供最小按键帧；测试通过可注入 wait 函数模拟一条输入通知。
+    返回：无返回值；断言通过表示 notifier 会让当前帧循环提前继续。
+    错误处理：没有调用 wait 或 notifier 未清除时由 pytest 报告。
+    副作用：只操作 fake device 和 pytest 临时图片。
+    """
+
+    frame = tmp_path / "frame.png"
+    Image.new("RGB", (96, 96), (10, 20, 30)).save(frame)
+    device = FakeN4ProUnifiedDevice()
+    waits: list[float] = []
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=FakeUnifiedManager([device]),
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+        background_wait=lambda timeout: waits.append(timeout) or True,
+    )
+    animator.set_background_update_provider(
+        lambda: (1, Image.new("RGB", (800, 480), (1, 2, 3)))
+    )
+
+    animator.notify_background_update()
+    result = animator(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={1: (frame,)},
+        duration_seconds=0.2,
+        fps=10,
+    )
+
+    assert result.ok is True
+    assert waits
 
 
 def test_animate_key_images_on_n4pro_keeps_one_device_session(

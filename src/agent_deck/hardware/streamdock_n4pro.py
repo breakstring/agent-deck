@@ -16,6 +16,7 @@ import tempfile
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from threading import Event
 from typing import Callable, Protocol
 
 from PIL import Image
@@ -26,6 +27,10 @@ from agent_deck.hardware.streamdock_probe import _prepend_sdk_path_from_env
 StreamDockInputCallback = Callable[[object, object], None]
 StreamDockN4ProSessionOutputCallback = Callable[[object, bool], str | None]
 StreamDockN4ProBackgroundUpdateProvider = Callable[[], tuple[int, Image.Image | None]]
+StreamDockN4ProBackgroundWaiter = Callable[[float], bool]
+
+_MIN_BACKGROUND_UPDATE_INTERVAL_SECONDS = 0.04
+"""连续输入时同会话背景热更新的最短间隔，超过此频率时只保留最新 revision。"""
 
 
 class StreamDockN4ProDeviceLike(Protocol):
@@ -188,13 +193,14 @@ class StreamDockN4ProPersistentAnimator:
         session_output_callback: StreamDockN4ProSessionOutputCallback | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        background_wait: StreamDockN4ProBackgroundWaiter | None = None,
     ) -> None:
         """初始化 persistent animator，但不立即访问硬件。
 
         入参：`manager` 是可选设备管理器；`temp_dir` 是临时背景文件目录；
         `input_callback` 是可选 SDK input 回调，会在首次 open/init 后注册到 key 和 touch bar；
         `session_output_callback` 在同一已打开会话中应用亮度/灯光等非图像输出；`sleep`/`monotonic`
-        用于帧节奏和诊断。
+        用于帧节奏和诊断；`background_wait` 允许测试替换输入唤醒等待器。
         返回：无显式返回值。
         错误处理：构造阶段不访问 SDK，不抛硬件错误。
         副作用：仅保存依赖到实例字段。
@@ -206,6 +212,11 @@ class StreamDockN4ProPersistentAnimator:
         self._session_output_callback = session_output_callback
         self._background_update_provider: StreamDockN4ProBackgroundUpdateProvider | None = None
         self._last_background_revision: int | None = None
+        self._last_background_update_monotonic: float | None = None
+        self._background_update_event = Event()
+        self._background_wait = background_wait or (
+            self._background_update_event.wait if sleep is time.sleep else None
+        )
         self._sleep = sleep
         self._monotonic = monotonic
         self._device: StreamDockN4ProDeviceLike | None = None
@@ -240,6 +251,17 @@ class StreamDockN4ProPersistentAnimator:
         """
 
         self._background_update_provider = provider
+
+    def notify_background_update(self) -> None:
+        """通知持久 animator 有新的背景 revision 可在同会话内尽快下发。
+
+        入参：无；调用方必须已经把新图写入 provider 可读的 daemon 内存缓存。
+        返回：无。
+        错误处理：不读取 provider、不访问 SDK，因此不会传播硬件或渲染异常。
+        副作用：唤醒当前帧间等待；连续通知会自然合并为一次事件信号。
+        """
+
+        self._background_update_event.set()
 
     def __call__(
         self,
@@ -348,12 +370,19 @@ class StreamDockN4ProPersistentAnimator:
                 after_static = after_background
 
             frames_rendered = 0
+            background_hot_updates = 0
+            background_hot_update_seconds = 0.0
             playback_started_at = after_static
             next_frame_at = playback_started_at
             if normalized_frames or self._background_update_provider is not None:
                 for frame_index in range(frame_budget):
-                    updated_background_result, background_update_error = (
+                    background_update_started_at = self._monotonic()
+                    background_updated, updated_background_result, background_update_error = (
                         self._write_pending_background_update(device, temp_paths=temp_paths)
+                    )
+                    background_update_elapsed = _elapsed_seconds(
+                        background_update_started_at,
+                        self._monotonic(),
                     )
                     if background_update_error is not None:
                         self.close()
@@ -366,8 +395,11 @@ class StreamDockN4ProPersistentAnimator:
                             key_count=key_count,
                             error=background_update_error,
                         )
-                    if updated_background_result is not None:
-                        background_result = updated_background_result
+                    if background_updated:
+                        if updated_background_result is not None:
+                            background_result = updated_background_result
+                        background_hot_updates += 1
+                        background_hot_update_seconds += background_update_elapsed
                     frame_session_output_error = self._apply_session_output(
                         device,
                         initialized=False,
@@ -399,7 +431,7 @@ class StreamDockN4ProPersistentAnimator:
                     if frame_index + 1 < frame_budget:
                         delay = next_frame_at - self._monotonic()
                         if delay > 0:
-                            self._sleep(delay)
+                            self._wait_for_next_frame(delay)
             else:
                 device.refresh()
                 frames_rendered += 1
@@ -414,6 +446,8 @@ class StreamDockN4ProPersistentAnimator:
                 playback_started_at,
                 playback_finished_at,
             )
+            timing["background_hot_updates"] = float(background_hot_updates)
+            timing["background_hot_update"] = background_hot_update_seconds
             timing["close"] = 0.0
             timing["total"] = _elapsed_seconds(started_at, self._monotonic())
             return StreamDockN4ProAnimationResult(
@@ -452,6 +486,8 @@ class StreamDockN4ProPersistentAnimator:
         self._device_type = None
         self._path = None
         self._last_background_revision = None
+        self._last_background_update_monotonic = None
+        self._background_update_event.clear()
         if device is None:
             return
         try:
@@ -503,31 +539,55 @@ class StreamDockN4ProPersistentAnimator:
         device: StreamDockN4ProDeviceLike,
         *,
         temp_paths: list[Path],
-    ) -> tuple[object | None, str | None]:
+    ) -> tuple[bool, object | None, str | None]:
         """在活跃帧循环内下发 revision 已变化的完整背景图。
 
         入参：`device` 是当前已 open/init 的 N4 Pro；`temp_paths` 收集本轮临时 JPEG 以便统一清理。
-        返回：未变化时返回 `(None, None)`；成功时返回 SDK 结果；provider/SDK 异常返回错误文本。
+        返回：第一个值表示是否实际写入；未变化时为 `(False, None, None)`；成功时保留 SDK
+        返回值（即使成功值是 None）；provider/SDK 异常返回错误文本。
         错误处理：provider 无图或读取异常保持当前背景；SDK 写入失败返回错误供调用方关闭会话并记录。
         副作用：revision 变化时调用一次 `set_frame_background`，不创建第二个 HID 会话。
         """
 
         pending = self._read_background_revision()
         if pending is None:
-            return None, None
+            return False, None, None
         revision, image = pending
         if revision == self._last_background_revision or image is None:
-            return None, None
+            return False, None, None
+        last_update = self._last_background_update_monotonic
+        if (
+            last_update is not None
+            and self._monotonic() - last_update < _MIN_BACKGROUND_UPDATE_INTERVAL_SECONDS
+        ):
+            return False, None, None
         try:
             background_path = _save_temp_jpeg(image, temp_dir=self._temp_dir)
             temp_paths.append(background_path)
             result = device.set_frame_background(str(background_path))
         except Exception as exc:
-            return None, f"set_frame_background update failed: {type(exc).__name__}: {exc}"
+            return False, None, f"set_frame_background update failed: {type(exc).__name__}: {exc}"
         if result == -1:
-            return result, "set_frame_background update failed: SDK returned -1"
+            return False, result, "set_frame_background update failed: SDK returned -1"
         self._last_background_revision = revision
-        return result, None
+        self._last_background_update_monotonic = self._monotonic()
+        return True, result, None
+
+    def _wait_for_next_frame(self, delay_seconds: float) -> None:
+        """等待下一帧或被新的背景 revision 提前唤醒。
+
+        入参：`delay_seconds` 是原本要等待的帧间隔。
+        返回：无。
+        错误处理：测试注入的 waiter 异常按原语义传播；默认 Event.wait 不抛业务异常。
+        副作用：默认路径可能因 `notify_background_update()` 提前结束等待；事件会在读取后清除。
+        """
+
+        waiter = self._background_wait
+        if waiter is None:
+            self._sleep(delay_seconds)
+            return
+        waiter(delay_seconds)
+        self._background_update_event.clear()
 
     def _ensure_open_device(
         self,

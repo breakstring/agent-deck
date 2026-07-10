@@ -12,6 +12,7 @@ from typing import Final
 
 from PIL import Image, ImageDraw, ImageFont
 
+from agent_deck.adapters.codex_tokens import CodexTokenPeriod, CodexTokenUsageSnapshot
 from agent_deck.rendering.logical_panel import LogicalPanelPlan, PanelKind, PanelMetric
 from agent_deck.rendering.n4pro_panel import (
     N4PRO_BACKGROUND_COLOR,
@@ -19,6 +20,11 @@ from agent_deck.rendering.n4pro_panel import (
     N4PRO_LOGICAL_PANEL_VIEWPORT,
     VirtualPanelViewport,
     compose_n4pro_background,
+)
+from agent_deck.rendering.status_key import (
+    usage_period_color,
+    usage_period_label,
+    usage_sparkline_values,
 )
 
 _BACKGROUND: Final[tuple[int, int, int]] = N4PRO_BACKGROUND_COLOR
@@ -36,28 +42,65 @@ def render_logical_panel_touchscreen(
     *,
     size: tuple[int, int] = N4PRO_BACKGROUND_SIZE,
     viewport: VirtualPanelViewport = N4PRO_LOGICAL_PANEL_VIEWPORT,
+    token_period: CodexTokenPeriod | None = None,
+    token_trend: tuple[float, ...] = (),
 ) -> Image.Image:
     """把 logical panel plan 渲染为 N4 Pro 背景图。
 
     入参：`plan` 是待展示的 logical panel；`size` 是 N4 Pro 背景尺寸；
-    `viewport` 是内容所在的底部逻辑窗口。
+    `viewport` 是内容所在的底部逻辑窗口；Token 面板可选传入 `token_period` 和已聚合的
+    `token_trend`，让 touch bar 与状态按键使用同一套周期趋势语义。
     返回：RGB `Image`，尺寸为 `size`，内容只绘制在 `viewport` 内。
     错误处理：panel 尺寸过小时抛 ValueError；Pillow 字体加载失败会回退默认字体。
     副作用：只创建内存图像，不访问外部 I/O。
     """
 
-    panel = render_logical_panel(plan, size=viewport.size)
+    panel = render_logical_panel(
+        plan,
+        size=viewport.size,
+        token_period=token_period,
+        token_trend=token_trend,
+    )
     return compose_n4pro_background(panel, viewport=viewport, background_size=size)
+
+
+def render_token_usage_touchscreen(
+    snapshot: CodexTokenUsageSnapshot,
+    *,
+    period: CodexTokenPeriod,
+    size: tuple[int, int] = N4PRO_BACKGROUND_SIZE,
+    viewport: VirtualPanelViewport = N4PRO_LOGICAL_PANEL_VIEWPORT,
+) -> Image.Image:
+    """渲染带周期色趋势线的 Token/金额 touch bar 面板。
+
+    入参：`snapshot` 是 daemon 已缓存的 ccusage 快照；`period` 是当前 Day、Week、Month 或
+    All 选择；`size` 和 `viewport` 允许 fake hardware 或后续设备复用几何契约。
+    返回：N4 Pro 背景图，内容只位于 logical panel viewport。
+    错误处理：快照缺少周期或 Pillow 绘制失败时按原语义抛出。
+    副作用：只创建内存图像，不执行 ccusage、不写真实硬件。
+    """
+
+    from agent_deck.rendering.logical_panel import tokens_panel_plan
+
+    return render_logical_panel_touchscreen(
+        tokens_panel_plan(snapshot, period=period),
+        size=size,
+        viewport=viewport,
+        token_period=period,
+        token_trend=usage_sparkline_values(snapshot, period=period),
+    )
 
 
 def render_logical_panel(
     plan: LogicalPanelPlan,
     *,
     size: tuple[int, int] = N4PRO_LOGICAL_PANEL_VIEWPORT.size,
+    token_period: CodexTokenPeriod | None = None,
+    token_trend: tuple[float, ...] = (),
 ) -> Image.Image:
     """把 logical panel plan 渲染为独立 panel 图像。
 
-    入参：`plan` 是待展示内容；`size` 是 panel 自身尺寸。
+    入参：`plan` 是待展示内容；`size` 是 panel 自身尺寸；Token 面板可选接收已经聚合的趋势。
     返回：RGB `Image`，只包含 panel 内容，不包含 N4 Pro 整屏背景。
     错误处理：尺寸太小时抛 ValueError；文本过长会被截断加省略号。
     副作用：只创建内存图像。
@@ -87,6 +130,8 @@ def render_logical_panel(
             content_left=content_left,
             content_right=content_right,
             content_top=content_top,
+            period=token_period,
+            trend=token_trend,
         )
         return image
 
@@ -125,25 +170,26 @@ def _draw_token_panel(
     content_left: int,
     content_right: int,
     content_top: int,
+    period: CodexTokenPeriod | None,
+    trend: tuple[float, ...],
 ) -> None:
     """绘制 tokens 面板的专用小屏布局。
 
     入参：`draw` 是绘图对象；`plan` 是 tokens logical panel；`content_left`、
-    `content_right` 和 `content_top` 是卡片内部内容边界。
+    `content_right` 和 `content_top` 是卡片内部内容边界；`period` 与 `trend` 是预先聚合的
+    当前周期身份与趋势数据。
     返回：无返回值。
     错误处理：Pillow 绘制失败时异常传播；缺少指标或辅助行时按可用内容降级绘制。
     副作用：修改内存图像，不访问外部 I/O。
     """
 
-    title_font = _load_font(20, bold=True)
-    main_value_font = _load_font(43, bold=True)
-    main_label_font = _load_font(14, bold=True)
-    detail_label_font = _load_font(13, bold=True)
-    detail_value_font = _load_font(22, bold=True)
+    main_value_font = _load_font(30, bold=True)
+    main_label_font = _load_font(11, bold=True)
+    detail_label_font = _load_font(10, bold=True)
+    detail_value_font = _load_font(14, bold=True)
+    period_font = _load_font(11, bold=True)
 
-    draw.text((content_left, content_top), plan.title, fill=_MUTED, font=title_font)
-
-    metric_top = content_top + 34
+    metric_top = content_top + 16
     _draw_token_main_metrics(
         draw,
         metrics=plan.metrics[:2],
@@ -151,10 +197,26 @@ def _draw_token_panel(
         value_font=main_value_font,
         label_font=main_label_font,
     )
+    if period is not None:
+        period_label = usage_period_label(period)
+        period_color = usage_period_color(period)
+        period_width = _text_width(draw, period_label, font=period_font)
+        draw.text(
+            (content_right - period_width, content_top + 1),
+            period_label,
+            fill=period_color,
+            font=period_font,
+        )
+        _draw_token_trend(
+            draw,
+            values=trend,
+            bounds=(content_left + 358, content_top + 20, content_right, content_top + 62),
+            color=period_color,
+        )
     _draw_token_detail_grid(
         draw,
         lines=plan.lines[:4],
-        origin=(content_left + 475, content_top + 16),
+        origin=(content_left, content_top + 76),
         max_right=content_right,
         label_font=detail_label_font,
         value_font=detail_value_font,
@@ -174,17 +236,17 @@ def _draw_token_main_metrics(
     入参：`draw` 是绘图对象；`metrics` 是最多两个主指标，约定为 Cost 与 Total；
     `origin` 是主指标区域左上角；`value_font`/`label_font` 是字体。
     返回：无返回值。
-    错误处理：文本过长会在各自较宽 slot 内截断，避免压到右侧 2x2 指标区。
+    错误处理：文本过长会在各自 slot 内截断，避免压到右侧趋势图。
     副作用：修改内存图像。
     """
 
     x, y = origin
-    slots = ((x, 235), (x + 275, 160))
-    for metric, (slot_x, slot_width) in zip(metrics, slots, strict=False):
+    slots = ((x, 155, _GOLD), (x + 184, 150, _TEXT))
+    for metric, (slot_x, slot_width, color) in zip(metrics, slots, strict=False):
         value = _fit_text(draw, metric.value, font=value_font, max_width=slot_width)
         label = _fit_text(draw, metric.label, font=label_font, max_width=slot_width)
-        draw.text((slot_x, y), value, fill=_GOLD, font=value_font)
-        draw.text((slot_x + 3, y + 50), label, fill=_MUTED, font=label_font)
+        draw.text((slot_x, y), value, fill=color, font=value_font)
+        draw.text((slot_x + 1, y + 35), label, fill=_MUTED, font=label_font)
 
 
 def _draw_token_detail_grid(
@@ -196,7 +258,7 @@ def _draw_token_detail_grid(
     label_font: ImageFont.ImageFont,
     value_font: ImageFont.ImageFont,
 ) -> None:
-    """把 token 辅助指标绘制成右侧 2x2 网格。
+    """把 token 辅助指标绘制成底部四列扫描行。
 
     入参：`draw` 是绘图对象；`lines` 是如 `Input 954K` 的格式化指标行；`origin`
     是网格左上角；`max_right` 是右边界；`label_font`/`value_font` 是字体。
@@ -206,18 +268,56 @@ def _draw_token_detail_grid(
     """
 
     x, y = origin
-    cell_width = max(110, (max_right - x) // 2)
-    row_gap = 50
+    cell_width = max(110, (max_right - x) // 4)
     for index, line in enumerate(lines[:4]):
-        col = index % 2
-        row = index // 2
-        cell_x = x + col * cell_width
-        cell_y = y + row * row_gap
+        cell_x = x + index * cell_width
+        cell_y = y
         label, value = _split_token_detail_line(line)
         label_text = _fit_text(draw, label, font=label_font, max_width=cell_width - 12)
         value_text = _fit_text(draw, value, font=value_font, max_width=cell_width - 12)
         draw.text((cell_x, cell_y), label_text, fill=_MUTED, font=label_font)
-        draw.text((cell_x, cell_y + 16), value_text, fill=_PRIMARY, font=value_font)
+        draw.text((cell_x, cell_y + 13), value_text, fill=_PRIMARY, font=value_font)
+
+
+def _draw_token_trend(
+    draw: ImageDraw.ImageDraw,
+    *,
+    values: tuple[float, ...],
+    bounds: tuple[int, int, int, int],
+    color: tuple[int, int, int],
+) -> None:
+    """在 Token touch bar 右侧绘制无网格的单条历史趋势线。
+
+    入参：`values` 是按当前周期聚合的总 Token 序列；`bounds` 是趋势可用矩形；`color` 是
+    当前周期的身份色。
+    返回：无。
+    错误处理：空趋势安静不绘制；单值趋势仅保留末点。
+    副作用：修改内存图像，不访问外部 I/O。
+    """
+
+    if not values:
+        return
+    left, top, right, bottom = bounds
+    min_value = min(values)
+    max_value = max(values)
+    span = max(max_value - min_value, 1.0)
+    points: list[tuple[float, float]] = []
+    if len(values) == 1:
+        points.append((right, (top + bottom) / 2))
+    else:
+        for index, value in enumerate(values):
+            x = left + (right - left) * index / (len(values) - 1)
+            normalized = (value - min_value) / span
+            y = bottom - normalized * (bottom - top)
+            points.append((x, y))
+    if len(points) > 1:
+        draw.line(points, fill=color, width=2, joint="curve")
+    last_x, last_y = points[-1]
+    radius = 4
+    draw.ellipse(
+        (last_x - radius, last_y - radius, last_x + radius, last_y + radius),
+        fill=color,
+    )
 
 
 def _split_token_detail_line(line: str) -> tuple[str, str]:

@@ -271,6 +271,18 @@ def _period_badge(period: CodexTokenPeriod) -> str:
     副作用：无。
     """
 
+    return usage_period_label(period)
+
+
+def usage_period_label(period: CodexTokenPeriod) -> str:
+    """返回 Token 用量周期的稳定短标签。
+
+    入参：`period` 是 ccusage 支持的统计周期。
+    返回：适合按键和 touch bar 共用的 `DAY`、`WEEK`、`MONTH` 或 `ALL`。
+    错误处理：未知枚举值按大写原始值降级。
+    副作用：无；只读取内存枚举。
+    """
+
     labels = {
         CodexTokenPeriod.TODAY: "DAY",
         CodexTokenPeriod.WEEK: "WEEK",
@@ -287,6 +299,18 @@ def _period_color(period: CodexTokenPeriod) -> tuple[int, int, int]:
     返回：RGB 颜色；未知枚举值降级为 today 青色。
     错误处理：无。
     副作用：无。
+    """
+
+    return usage_period_color(period)
+
+
+def usage_period_color(period: CodexTokenPeriod) -> tuple[int, int, int]:
+    """返回 Token 用量周期在所有硬件表面共用的身份色。
+
+    入参：`period` 是 ccusage 支持的统计周期。
+    返回：RGB 三元组；未知周期降级为 Day 青色。
+    错误处理：无。
+    副作用：无；只读取模块级颜色映射。
     """
 
     return _USAGE_PERIOD_COLORS.get(period, _USAGE_LINE)

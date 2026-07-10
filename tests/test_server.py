@@ -901,6 +901,25 @@ def test_codex_token_poller_updates_status_and_tokens_panel_frame() -> None:
     assert status["logical_panel"]["touchscreen_image_size"] == [800, 480]
 
 
+def test_token_snapshot_prewarm_caches_all_usage_period_panels() -> None:
+    """Token 快照更新后应预渲染四个 Usage 周期，切换时不再临时成图。
+
+    入参：无；测试直接向 daemon runtime 写入固定快照。
+    返回：无返回值；断言通过表示缓存诊断会显示四个 Token 面板已准备。
+    错误处理：缓存未预热、容量错误或状态未暴露时由 pytest 报告。
+    副作用：只修改测试 app 的内存 runtime，不访问 ccusage 或真实硬件。
+    """
+
+    app = create_app()
+    runtime = app.state.runtime
+    runtime.update_codex_token_usage(_token_snapshot(), updated_at=datetime.now(UTC))
+
+    cache = runtime.logical_panel_image_cache.diagnostics()
+
+    assert cache["token_entries"] == 4
+    assert cache["misses"] >= 4
+
+
 def test_hardware_input_endpoint_routes_touch_and_knob_to_logical_panel() -> None:
     """Verify low-level hardware input drives logical panel selection.
 

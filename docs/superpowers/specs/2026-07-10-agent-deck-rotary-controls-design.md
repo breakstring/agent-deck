@@ -214,6 +214,24 @@ Usage: Day <-> Week <-> Month <-> All
 
 当 `cycle_panel_content` 作用于 Brand 时，安静 no-op；它绝不能隐式切换到另一个 virtual panel。
 
+### Usage 面板信息层级与趋势
+
+Usage 的 `800x136` touch bar viewport 不复用按键的小尺寸排版，而采用紧凑的方向一信息层级：
+
+```text
+左侧：金额（固定金色） + 总 Token（白色）
+右侧：当前周期身份色的总 Token 历史曲线，仅最后一个点强调
+底部：Input / Output / Reasoning / Cache read 四项扫描细则
+右上：DAY / WEEK / MONTH / ALL 周期短标签，与曲线同色
+```
+
+不增加常驻标题、状态带、网格线、横轴线或全节点圆点。金额和 Token 不绘制双曲线：二者量纲不同，
+即便归一化也会制造不可靠的趋势相关暗示。
+
+趋势数据必须与 Usage 按键共用同一套 `ccusage` daily raw 聚合规则。它只表示总 Token 活跃度：
+Day 为最近 7 日、Week 为当前自然周、Month 为当前月、All 为最近 30 日；原始数据不足时安静降级为
+末点，不伪造完整曲线。
+
 ### 不做常驻状态带
 
 touch bar 不保留任何长期占用空间的旋钮文字说明。反馈按动作类别区分：
@@ -293,6 +311,15 @@ macOS 的内建屏与部分外接屏可能支持亮度调节，但不能假定�
 - 连续输入需要节流/合并，避免每个物理编码器抖动都触发一次昂贵的系统或 HID 写入。
 - 音频、系统显示器亮度和控制台亮度分别缓存最后确认值；短 TTL 或动作执行后主动刷新，不能长期相信本地写入结果。
 - 冷启动时读取 quota、Usage、音频和亮度可用状态；硬件下发优先使用已确认的缓存，后台再刷新。
+- quota 快照更新时预渲染 primary/secondary 两张基础面板；Usage 快照更新时预渲染 Day、Week、
+  Month、All 四张趋势基础面板。输入切换只能选择已缓存图、递增背景 revision，不得重新执行
+  `ccusage` 或在输入回调中聚合历史数据。
+- N4 Pro persistent renderer 仍是唯一 SDK 写入者。输入线程只能通知新的背景 revision；renderer 在
+  帧间等待中可被唤醒，并以 latest-wins 语义下发最新完整背景。连续热更新保留短合并间隔，避免
+  编码器快速旋转把 HID 队列塞满。
+- `/status.logical_panel` 应公开基础面板缓存命中/未命中、当前背景 revision 与最近成图耗时；
+  renderer timing 还应公开窗口内的背景热更新次数和耗时。SDK 没有像素已显示的确认回调，不能把
+  最终物理点亮时间伪报为可测指标。
 - 设备初始化、系统目标消失、SDK 写入失败或权限不足时，配置草稿不丢失，真机保留上一次成功状态，并在 GUI 中给出明确失败诊断。
 - Agent 反馈、审批、文本输入和任意 shell 始终不进入本阶段旋钮动作列表。
 

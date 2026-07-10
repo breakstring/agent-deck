@@ -115,7 +115,6 @@ from agent_deck.rendering.logical_panel import (
     cycle_panel_content,
     cycle_virtual_panel,
     message_panel_plan,
-    tokens_panel_plan,
 )
 from agent_deck.rendering.control_feedback import (
     ControlFeedback,
@@ -132,6 +131,7 @@ from agent_deck.rendering.rotary_surface import (
 )
 from agent_deck.rendering.logical_panel_touchscreen import (
     render_logical_panel_touchscreen,
+    render_token_usage_touchscreen,
 )
 from agent_deck.rendering.quota_touchscreen import render_quota_touchscreen
 from agent_deck.rendering.status_key import (
@@ -174,6 +174,9 @@ _RECENT_STREAMDOCK_INPUT_LIMIT = 30
 
 _RECENT_INTERACTION_LIMIT = 30
 """status 中保留多少条最近业务 interaction 诊断。"""
+
+_MAX_LOGICAL_PANEL_IMAGE_CACHE_ENTRIES = 10
+"""基础 logical panel 背景图的进程内缓存上限，覆盖品牌、2 个 quota 与 4 个 usage 周期。"""
 
 _BRAND_FEEDBACK_DURATION_SECONDS = 4.0
 """未配置主按键触发默认品牌反馈面板的持续秒数。"""
@@ -472,6 +475,149 @@ class StatusKeyImageCache:
         return image
 
 
+class LogicalPanelImageCache:
+    """缓存 logical panel 基础背景图，避免输入路径重复聚合和绘制。
+
+    入参：无；缓存 key 由 quota/token 的展示数据指纹和当前周期组成。
+    返回：普通 Python 对象，通过品牌、quota 与 usage 方法返回已完成的 800x480 Pillow 图像。
+    错误处理：渲染异常按原样传播；缓存未命中会在当前线程生成一张图。
+    副作用：仅保留进程内图片引用，不访问 ccusage、网络、文件或真实硬件。
+    """
+
+    def __init__(self) -> None:
+        """初始化空的基础面板图片缓存。
+
+        入参：无。
+        返回：无。
+        错误处理：无。
+        副作用：分配进程内字典和诊断计数器，不提前生成图像。
+        """
+
+        self._images: dict[tuple[object, ...], Any] = {}
+        self._hits = 0
+        self._misses = 0
+        self._prewarm_count = 0
+
+    def brand_image(self) -> Any:
+        """返回 Agent Deck 品牌基础面板，优先命中缓存。
+
+        入参：无。
+        返回：800x480 品牌背景图。
+        错误处理：品牌图生成异常按原样传播。
+        副作用：首次调用会创建并缓存品牌图。
+        """
+
+        return self._get_or_render(
+            ("brand",),
+            render_agent_deck_splash_touchscreen,
+        )
+
+    def quota_image(self, snapshot: CodexQuotaSnapshot, *, window: str) -> Any:
+        """返回指定 quota 窗口的基础面板，优先命中内容指纹缓存。
+
+        入参：`snapshot` 是 daemon 已确认的 quota 快照；`window` 是 primary 或 secondary。
+        返回：800x480 quota 背景图。
+        错误处理：未知窗口或渲染异常按原语义传播。
+        副作用：缓存未命中时生成并保存一张新图。
+        """
+
+        key = ("quota", window, *_quota_panel_fingerprint(snapshot))
+        return self._get_or_render(
+            key,
+            lambda: render_quota_touchscreen(snapshot, window=window),
+        )
+
+    def token_image(
+        self,
+        snapshot: CodexTokenUsageSnapshot,
+        *,
+        period: CodexTokenPeriod,
+    ) -> Any:
+        """返回指定 Token 周期的趋势基础面板，优先命中内容指纹缓存。
+
+        入参：`snapshot` 是 daemon 已确认的 ccusage 快照；`period` 是展示周期。
+        返回：带主指标、趋势和四项细则的 800x480 背景图。
+        错误处理：缺少周期或渲染异常按原语义传播。
+        副作用：缓存未命中时聚合现有 raw daily 并保存一张新图，不执行 ccusage。
+        """
+
+        key = (
+            "tokens",
+            period.value,
+            _token_usage_period_fingerprint(snapshot),
+            _token_usage_daily_fingerprint(snapshot),
+        )
+        return self._get_or_render(
+            key,
+            lambda: render_token_usage_touchscreen(snapshot, period=period),
+        )
+
+    def prewarm_quota(self, snapshot: CodexQuotaSnapshot) -> None:
+        """预渲染两个 quota 窗口，消除后续内容切换的首次绘制。
+
+        入参：`snapshot` 是刚刷新成功的 quota 快照。
+        返回：无。
+        错误处理：任一窗口渲染失败时按原样传播给 poller。
+        副作用：可能新增两张进程内背景图并递增预热计数。
+        """
+
+        for window in ("primary", "secondary"):
+            self.quota_image(snapshot, window=window)
+            self._prewarm_count += 1
+
+    def prewarm_tokens(self, snapshot: CodexTokenUsageSnapshot) -> None:
+        """预渲染四个 Token 周期，令旋钮切换只做缓存图选择。
+
+        入参：`snapshot` 是刚刷新成功的 ccusage 快照。
+        返回：无。
+        错误处理：任一周期缺失或渲染失败时按原样传播给 poller。
+        副作用：可能新增四张进程内背景图并递增预热计数。
+        """
+
+        for period in CodexTokenPeriod:
+            self.token_image(snapshot, period=period)
+            self._prewarm_count += 1
+
+    def diagnostics(self) -> dict[str, int]:
+        """返回基础面板缓存的最小诊断快照。
+
+        入参：无。
+        返回：总条目、三类条目数量、命中、未命中与预热次数。
+        错误处理：无。
+        副作用：无；不触发渲染。
+        """
+
+        keys = tuple(self._images)
+        return {
+            "entries": len(keys),
+            "brand_entries": sum(key[0] == "brand" for key in keys),
+            "quota_entries": sum(key[0] == "quota" for key in keys),
+            "token_entries": sum(key[0] == "tokens" for key in keys),
+            "hits": self._hits,
+            "misses": self._misses,
+            "prewarm_count": self._prewarm_count,
+        }
+
+    def _get_or_render(self, key: tuple[object, ...], renderer: Callable[[], Any]) -> Any:
+        """按内容 key 读取或创建基础面板图像。
+
+        入参：`key` 是内容指纹；`renderer` 只应创建内存图片。
+        返回：缓存命中或刚创建的 Pillow 图像。
+        错误处理：renderer 异常按原样传播，不保存失败值。
+        副作用：更新命中/未命中计数，未命中时修改缓存并按容量裁剪。
+        """
+
+        image = self._images.get(key)
+        if image is not None:
+            self._hits += 1
+            return image
+        self._misses += 1
+        image = renderer()
+        self._images[key] = image
+        while len(self._images) > _MAX_LOGICAL_PANEL_IMAGE_CACHE_ENTRIES:
+            self._images.pop(next(iter(self._images)))
+        return image
+
 @dataclass
 class _DaemonRuntime:
     """Hold all process-local daemon state used by the HTTP handlers.
@@ -502,6 +648,8 @@ class _DaemonRuntime:
     codex_token_usage_last_error: str | None
     logical_panel_selection: PanelSelection
     logical_panel_background_revision: int
+    logical_panel_last_render_duration_ms: float | None
+    hardware_background_notifier: Callable[[], None] | None
     streamdock_touch_tap_last_handled_monotonic: float | None
     streamdock_knob4_rotate_accumulator: int
     streamdock_input_event_count: int
@@ -524,6 +672,7 @@ class _DaemonRuntime:
     app_icon_cache: AppIconCache
     url_icon_cache: UrlIconCache
     status_key_image_cache: StatusKeyImageCache
+    logical_panel_image_cache: LogicalPanelImageCache
     streamdock_quota_touchscreen_result: StreamDockTouchscreenRenderResult | None
     streamdock_n4pro_renderer_result: StreamDockN4ProAnimationResult | None
     streamdock_n4pro_renderer_updated_at: datetime | None
@@ -651,6 +800,21 @@ class _DaemonRuntime:
             "logical_panel": _dump_model(self.logical_panel_selection),
             "render_count": self.surface.render_count,
         }
+
+    def set_hardware_background_notifier(
+        self,
+        notifier: Callable[[], None] | None,
+    ) -> None:
+        """设置由 persistent animator 提供的同会话背景更新唤醒器。
+
+        入参：`notifier` 只能通知已有 animator 读取最新 revision，不能直接访问 SDK；None 表示
+        当前 fake 或外部 renderer 不支持主动唤醒。
+        返回：无。
+        错误处理：设置阶段不调用 notifier，不传播硬件异常。
+        副作用：覆盖 runtime 内存回调；下一次面板 revision 变化时可能唤醒硬件帧循环。
+        """
+
+        self.hardware_background_notifier = notifier
 
     def _store_rotary_layout(self, layout: N4ProRotaryLayout) -> None:
         """把已验证 rotary layout 更新到 runtime 并按需持久化。
@@ -803,6 +967,7 @@ class _DaemonRuntime:
         self.codex_quota_snapshot = snapshot
         self.codex_quota_updated_at = updated_at
         self.codex_quota_last_error = None
+        self.logical_panel_image_cache.prewarm_quota(snapshot)
         image = self.render_current_logical_panel_image()
         self.prewarm_status_key_images()
         return image
@@ -824,6 +989,7 @@ class _DaemonRuntime:
         self.codex_token_usage_snapshot = snapshot
         self.codex_token_usage_updated_at = updated_at
         self.codex_token_usage_last_error = None
+        self.logical_panel_image_cache.prewarm_tokens(snapshot)
         self.prewarm_status_key_images()
         return self.render_current_logical_panel_image()
 
@@ -1658,14 +1824,14 @@ class _DaemonRuntime:
 
         if self._is_brand_feedback_active():
             base_image, base_source = (
-                render_agent_deck_splash_touchscreen(),
+                self.logical_panel_image_cache.brand_image(),
                 "agent_deck:brand_feedback",
             )
         else:
             active_kind = self.logical_panel_selection.active_kind
             if active_kind == PanelKind.QUOTA and self.codex_quota_snapshot is not None:
                 base_image, base_source = (
-                    render_quota_touchscreen(
+                    self.logical_panel_image_cache.quota_image(
                         self.codex_quota_snapshot,
                         window=self.logical_panel_selection.quota_window.value,
                     ),
@@ -1675,11 +1841,13 @@ class _DaemonRuntime:
                 active_kind == PanelKind.TOKENS
                 and self.codex_token_usage_snapshot is not None
             ):
-                plan = tokens_panel_plan(
-                    self.codex_token_usage_snapshot,
-                    period=self.logical_panel_selection.token_period,
+                base_image, base_source = (
+                    self.logical_panel_image_cache.token_image(
+                        self.codex_token_usage_snapshot,
+                        period=self.logical_panel_selection.token_period,
+                    ),
+                    "codex_tokens",
                 )
-                base_image, base_source = render_logical_panel_touchscreen(plan), "codex_tokens"
             elif active_kind == PanelKind.MESSAGE:
                 decision = self._current_pending_decision()
                 if decision is not None:
@@ -1689,9 +1857,15 @@ class _DaemonRuntime:
                         "decision_message",
                     )
                 else:
-                    base_image, base_source = render_agent_deck_splash_touchscreen(), "agent_deck:splash"
+                    base_image, base_source = (
+                        self.logical_panel_image_cache.brand_image(),
+                        "agent_deck:splash",
+                    )
             else:
-                base_image, base_source = render_agent_deck_splash_touchscreen(), "agent_deck:splash"
+                base_image, base_source = (
+                    self.logical_panel_image_cache.brand_image(),
+                    "agent_deck:splash",
+                )
 
         feedback = self._active_control_feedback()
         if feedback is not None:
@@ -1714,13 +1888,33 @@ class _DaemonRuntime:
         副作用：可能更新 fake surface 的 touchscreen image 和计数。
         """
 
+        started_at = time.perf_counter()
         built = self.build_current_logical_panel_background()
         if built is None:
             return None
         image, source = built
         self.surface.render_touchscreen_image(image, source=source)
         self.logical_panel_background_revision += 1
+        self.logical_panel_last_render_duration_ms = (
+            time.perf_counter() - started_at
+        ) * 1000
+        self._notify_hardware_background_update()
         return image
+
+    def _notify_hardware_background_update(self) -> None:
+        """通知已连接 persistent animator 读取最新 logical panel revision。
+
+        入参：无。
+        返回：无。
+        错误处理：通知器异常会被吞掉，避免一次硬件 wake 失败影响输入或 fake surface 状态。
+        副作用：真实 N4 Pro renderer 等待下一帧时可能被唤醒；不会在当前线程写 HID。
+        """
+
+        notifier = self.hardware_background_notifier
+        if notifier is None:
+            return
+        with suppress(Exception):
+            notifier()
 
     def current_hardware_background(self) -> tuple[int, Any | None]:
         """返回真实 renderer 可安全读取的最新 logical panel 背景 revision。
@@ -1968,6 +2162,9 @@ class _DaemonRuntime:
                 ),
                 "touchscreen_image_source": self.surface.last_touchscreen_image_source,
                 "control_feedback": _dump_optional_model(self._active_control_feedback()),
+                "image_cache": self.logical_panel_image_cache.diagnostics(),
+                "background_revision": self.logical_panel_background_revision,
+                "last_render_duration_ms": self.logical_panel_last_render_duration_ms,
             },
             "streamdock_n4pro_renderer": {
                 "last_result": _dump_optional_model(
@@ -2163,6 +2360,9 @@ def _build_default_n4pro_renderer_sink(
     background_setter = getattr(animator, "set_background_update_provider", None)
     if callable(background_setter):
         background_setter(runtime.current_hardware_background)
+    notifier = getattr(animator, "notify_background_update", None)
+    if callable(notifier):
+        runtime.set_hardware_background_notifier(notifier)
     return animator
 
 
@@ -2257,6 +2457,8 @@ def create_app(
         codex_token_usage_last_error=None,
         logical_panel_selection=PanelSelection(),
         logical_panel_background_revision=0,
+        logical_panel_last_render_duration_ms=None,
+        hardware_background_notifier=None,
         streamdock_touch_tap_last_handled_monotonic=None,
         streamdock_knob4_rotate_accumulator=0,
         streamdock_input_event_count=0,
@@ -2281,6 +2483,7 @@ def create_app(
         app_icon_cache=app_icon_cache,
         url_icon_cache=url_icon_cache,
         status_key_image_cache=StatusKeyImageCache(),
+        logical_panel_image_cache=LogicalPanelImageCache(),
         streamdock_quota_touchscreen_result=None,
         streamdock_n4pro_renderer_result=None,
         streamdock_n4pro_renderer_updated_at=None,
@@ -3233,6 +3436,32 @@ def _token_usage_period_fingerprint(
             snapshot.periods.items(),
             key=lambda item: item[0].value,
         )
+    )
+
+
+def _quota_panel_fingerprint(
+    snapshot: CodexQuotaSnapshot,
+) -> tuple[object, ...]:
+    """生成 quota touch bar 基础图的内容缓存指纹。
+
+    入参：`snapshot` 是当前 Codex quota 快照。
+    返回：覆盖计划名、两个窗口、重置时间和可用重置次数的不可变元组。
+    错误处理：无；adapter 已保证快照字段可读。
+    副作用：无；只读取内存快照。
+    """
+
+    return (
+        snapshot.plan_type,
+        snapshot.plan_short_label,
+        snapshot.plan_display_name,
+        snapshot.primary.used_percent,
+        snapshot.primary.window_duration_mins,
+        snapshot.primary.resets_at.isoformat(),
+        snapshot.secondary.used_percent,
+        snapshot.secondary.window_duration_mins,
+        snapshot.secondary.resets_at.isoformat(),
+        snapshot.credits_balance,
+        snapshot.reset_credits_available,
     )
 
 
