@@ -8,7 +8,7 @@ composer 合成到 SDK 可下发的 800x480 背景图。它不读取 Codex、不
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -44,12 +44,14 @@ _RESET_CREDIT: Final[tuple[int, int, int]] = (248, 213, 113)
 def render_quota_touchscreen(
     snapshot: CodexQuotaSnapshot,
     *,
+    window: Literal["primary", "secondary", "both"] = "both",
     size: tuple[int, int] = N4PRO_BACKGROUND_SIZE,
     touch_bar_rect: tuple[int, int, int, int] = N4PRO_TOUCH_BAR_RECT,
 ) -> Image.Image:
     """把 Codex quota 快照渲染为 N4 Pro 背景图。
 
-    入参：`snapshot` 是 Codex quota adapter 解析出的快照；`size` 是 SDK 背景图尺寸，
+    入参：`snapshot` 是 Codex quota adapter 解析出的快照；`window` 控制展示 5 小时、周或
+    兼容旧界面的双行内容；`size` 是 SDK 背景图尺寸，
     默认 N4 Pro 的 800x480；`touch_bar_rect` 是背景图中真实底部触摸条的安全绘制区域，
     格式为 `(left, top, right, bottom)`。
     返回：RGB `Image`，可保存为 JPEG 后通过 SDK `set_touchscreen_image` 下发；信息只绘制
@@ -59,18 +61,20 @@ def render_quota_touchscreen(
     """
 
     viewport = VirtualPanelViewport(*touch_bar_rect)
-    panel = render_quota_panel(snapshot, size=viewport.size)
+    panel = render_quota_panel(snapshot, window=window, size=viewport.size)
     return compose_n4pro_background(panel, viewport=viewport, background_size=size)
 
 
 def render_quota_panel(
     snapshot: CodexQuotaSnapshot,
     *,
+    window: Literal["primary", "secondary", "both"] = "both",
     size: tuple[int, int] = N4PRO_LOGICAL_PANEL_VIEWPORT.size,
 ) -> Image.Image:
     """把 Codex quota 快照渲染为底部虚拟 panel 图像。
 
-    入参：`snapshot` 是 Codex quota adapter 解析出的快照；`size` 是 panel 自身尺寸，
+    入参：`snapshot` 是 Codex quota adapter 解析出的快照；`window` 控制当前内容维度；`size`
+    是 panel 自身尺寸，
     默认使用 N4 Pro touch-bar viewport 尺寸。
     返回：RGB `Image`，只包含 panel 内容，不包含 N4 Pro 整屏背景。
     错误处理：Pillow 字体加载失败时自动退回默认字体；尺寸过小时抛 `ValueError`。
@@ -112,31 +116,44 @@ def render_quota_panel(
     )
 
     right_x = left + plan_width + 46
-    row_gap = max(48, (content_bottom - content_top - 38) // 2)
-    _draw_quota_row(
-        draw,
-        label="5hours:",
-        remaining_percent=_remaining_percent(snapshot.primary.used_percent),
-        reset_label=snapshot.primary_reset_label(),
-        origin=(right_x, content_top + 5),
-        max_right=content_right,
-        bar_color=_PRIMARY,
-        label_font=label_font,
-        value_font=value_font,
-        percent_font=percent_font,
-    )
-    _draw_quota_row(
-        draw,
-        label="weekly:",
-        remaining_percent=_remaining_percent(snapshot.secondary.used_percent),
-        reset_label=snapshot.secondary_reset_label(),
-        origin=(right_x, content_top + 5 + row_gap),
-        max_right=content_right,
-        bar_color=_SECONDARY,
-        label_font=label_font,
-        value_font=value_font,
-        percent_font=percent_font,
-    )
+    if window not in {"primary", "secondary", "both"}:
+        raise ValueError("quota window must be primary, secondary, or both")
+    rows = []
+    if window in {"primary", "both"}:
+        rows.append(
+            (
+                "5hours:",
+                _remaining_percent(snapshot.primary.used_percent),
+                snapshot.primary_reset_label(),
+                _PRIMARY,
+            )
+        )
+    if window in {"secondary", "both"}:
+        rows.append(
+            (
+                "weekly:",
+                _remaining_percent(snapshot.secondary.used_percent),
+                snapshot.secondary_reset_label(),
+                _SECONDARY,
+            )
+        )
+    row_gap = max(48, (content_bottom - content_top - 38) // max(1, len(rows)))
+    first_row_y = content_top + 5
+    if len(rows) == 1:
+        first_row_y = content_top + max(5, (content_bottom - content_top - 38) // 2)
+    for index, (label, remaining_percent, reset_label, color) in enumerate(rows):
+        _draw_quota_row(
+            draw,
+            label=label,
+            remaining_percent=remaining_percent,
+            reset_label=reset_label,
+            origin=(right_x, first_row_y + index * row_gap),
+            max_right=content_right,
+            bar_color=color,
+            label_font=label_font,
+            value_font=value_font,
+            percent_font=percent_font,
+        )
     return image
 
 

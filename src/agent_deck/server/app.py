@@ -11,6 +11,7 @@ Codex local-state/quota polling or real StreamDock rendering is enabled.
 from __future__ import annotations
 
 import asyncio
+import math
 import base64
 import binascii
 import time
@@ -40,6 +41,10 @@ from agent_deck.actions.local_targets import (
     LocalTargetActionResult,
     open_local_url,
 )
+from agent_deck.actions.system_controls import (
+    SystemControlExecutor,
+    create_default_system_control_executor,
+)
 from agent_deck.actions.url_icon_cache import (
     CachedUrlIcon,
     UrlIconCache,
@@ -68,6 +73,7 @@ from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
 from agent_deck.core.modes import DeckSelection
 from agent_deck.core.state import AgentState, AgentStateStore
 from agent_deck.hardware.fake import FakeHardwareSurface, HardwareInput
+from agent_deck.hardware.capabilities import get_device_profile
 from agent_deck.hardware.streamdock_n4pro import (
     StreamDockN4ProAnimationResult,
     StreamDockN4ProPersistentAnimator,
@@ -80,6 +86,11 @@ from agent_deck.hardware.streamdock_touchscreen import (
 from agent_deck.input.logical_panel import (
     panel_event_from_hardware_input,
     panel_event_from_streamdock_input_event,
+)
+from agent_deck.input.rotary import (
+    RotaryInputIntent,
+    rotary_input_from_hardware_input,
+    rotary_input_from_streamdock_input_event,
 )
 from agent_deck.input.interactions import (
     InteractionIntent,
@@ -96,12 +107,28 @@ from agent_deck.rendering.key_surface import (
 from agent_deck.rendering.layout import LayoutPlan, build_layout_plan
 from agent_deck.rendering.logical_panel import (
     LogicalPanelPlan,
+    PanelContentDirection,
     PanelInputEvent,
     PanelKind,
     PanelSelection,
     apply_panel_input,
+    cycle_panel_content,
+    cycle_virtual_panel,
     message_panel_plan,
     tokens_panel_plan,
+)
+from agent_deck.rendering.control_feedback import (
+    ControlFeedback,
+    ControlFeedbackKind,
+    feedback_is_active,
+    render_control_feedback_touchscreen,
+)
+from agent_deck.rendering.n4pro_panel import N4PRO_LOGICAL_PANEL_VIEWPORT
+from agent_deck.rendering.rotary_surface import (
+    N4ProRotaryLayout,
+    RotaryPressAction,
+    RotaryRotateAction,
+    default_n4pro_rotary_layout,
 )
 from agent_deck.rendering.logical_panel_touchscreen import (
     render_logical_panel_touchscreen,
@@ -117,6 +144,11 @@ from agent_deck.server.key_layout_store import (
     KeyLayoutStoreError,
     load_n4pro_key_layout,
     save_n4pro_key_layout,
+)
+from agent_deck.server.rotary_layout_store import (
+    RotaryLayoutStoreError,
+    load_n4pro_rotary_layout,
+    save_n4pro_rotary_layout,
 )
 
 CodexAppStateEventReader = Callable[[], tuple[NormalizedEvent, ...]]
@@ -134,8 +166,8 @@ LocalUrlActionExecutor = Callable[..., LocalTargetActionResult]
 _STREAMDOCK_TOUCH_TAP_DEBOUNCE_SECONDS = 0.45
 """真实 StreamDock touch bar 连续 touch_point 归并为一次 tap 的最短间隔。"""
 
-_STREAMDOCK_KNOB4_ROTATE_THRESHOLD = 2
-"""真实 StreamDock 第 4 旋钮累计多少个 rotate 事件后切换一次 token 周期。"""
+_STREAMDOCK_KNOB4_ROTATE_THRESHOLD = 1
+"""真实 StreamDock 第 4 旋钮每收到一个 rotate 事件即切换一次 token 周期。"""
 
 _RECENT_STREAMDOCK_INPUT_LIMIT = 30
 """status 中保留多少条最近真实 StreamDock 输入事件诊断。"""
@@ -145,6 +177,9 @@ _RECENT_INTERACTION_LIMIT = 30
 
 _BRAND_FEEDBACK_DURATION_SECONDS = 4.0
 """未配置主按键触发默认品牌反馈面板的持续秒数。"""
+
+_CONTROL_FEEDBACK_DURATION_SECONDS = 1.5
+"""音量、亮度、静音和错误 HUD 在停止输入后保留的秒数。"""
 
 _MAX_STATUS_KEY_IMAGE_CACHE_ENTRIES = 64
 """状态按键图片缓存最多保留多少张 Pillow image，避免长时间运行无限增长。"""
@@ -287,6 +322,39 @@ class KeyLayoutResponse(BaseModel):
     source: str
     path: str | None = None
     layout: N4ProKeyLayout
+
+
+class RotaryLayoutResponse(BaseModel):
+    """向 GUI 返回当前可编辑或已持久化的 N4 Pro 旋钮配置。
+
+    入参：`device_profile` 标识能力来源；`source` 说明默认、runtime 或 persisted；`path` 是
+    可选 JSON 路径；`layout` 是四个旋钮、灯光组和整体亮度的完整配置。
+    返回：frozen Pydantic model，可直接 FastAPI 序列化。
+    错误处理：字段非法由 Pydantic 报告。
+    副作用：模型本身不读写文件、系统或硬件。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    device_profile: str
+    source: str
+    path: str | None = None
+    layout: N4ProRotaryLayout
+
+
+class ConsoleConfigurationApplyRequest(BaseModel):
+    """描述一次“保存并应用”提交的主按键和旋钮完整草稿。
+
+    入参：`key_layout` 是完整 10 键主表面配置；`rotary_layout` 是四旋钮、灯圈组和整体亮度配置。
+    返回：frozen Pydantic model，确保任一子布局非法时在写入前返回 422。
+    错误处理：子模型字段非法由 FastAPI/Pydantic 报告。
+    副作用：模型本身不写文件、不访问硬件。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    key_layout: N4ProKeyLayout
+    rotary_layout: N4ProRotaryLayout
 
 
 class StatusKeyImageCache:
@@ -433,6 +501,7 @@ class _DaemonRuntime:
     codex_token_usage_updated_at: datetime | None
     codex_token_usage_last_error: str | None
     logical_panel_selection: PanelSelection
+    logical_panel_background_revision: int
     streamdock_touch_tap_last_handled_monotonic: float | None
     streamdock_knob4_rotate_accumulator: int
     streamdock_input_event_count: int
@@ -442,12 +511,16 @@ class _DaemonRuntime:
     last_interaction_action: dict[str, Any] | None
     recent_interactions: list[dict[str, Any]]
     brand_feedback_until_monotonic: float | None
+    control_feedback: ControlFeedback | None
+    last_rotary_input: RotaryInputIntent | None
+    last_rotary_action: dict[str, Any] | None
     focus_actions_enabled: bool
     local_actions_enabled: bool
     focus_action_executor: FocusActionExecutor
     local_app_catalog_reader: LocalAppCatalogReader
     local_app_action_executor: LocalAppActionExecutor
     local_url_action_executor: LocalUrlActionExecutor
+    system_control_executor: SystemControlExecutor
     app_icon_cache: AppIconCache
     url_icon_cache: UrlIconCache
     status_key_image_cache: StatusKeyImageCache
@@ -459,6 +532,14 @@ class _DaemonRuntime:
     key_layout_source: str | None
     key_layout_path: Path | None
     key_layout_last_error: str | None
+    rotary_layout: N4ProRotaryLayout | None
+    rotary_layout_source: str | None
+    rotary_layout_path: Path | None
+    rotary_layout_last_error: str | None
+    n4pro_last_applied_brightness_percent: int | None
+    n4pro_last_applied_lighting: tuple[str, str | None, bool] | None
+    n4pro_last_applied_led_brightness_percent: int | None
+    n4pro_session_output_last_error: str | None
 
     def apply_event(self, event: NormalizedEvent) -> dict[str, Any]:
         """Apply an event, render the latest layout, and return response data.
@@ -525,6 +606,101 @@ class _DaemonRuntime:
         self.prewarm_status_key_images(rendered_layout)
         return {
             "key_layout": _dump_model(self.current_key_layout_response()),
+            "layout": _dump_model(rendered_layout),
+            "render_count": self.surface.render_count,
+        }
+
+    def current_rotary_layout_response(self) -> RotaryLayoutResponse:
+        """返回 GUI 当前应编辑的 N4 Pro 旋钮、灯光与亮度配置。
+
+        入参：无。
+        返回：已有 runtime/persisted layout 时返回它；否则返回可改写的内置默认布局。
+        错误处理：内置 layout 构造失败会按 Pydantic 语义传播。
+        副作用：只读取 runtime 内存，不写文件或硬件。
+        """
+
+        if self.rotary_layout is None:
+            return RotaryLayoutResponse(
+                device_profile="mirabox.n4pro",
+                source="default",
+                path=str(self.rotary_layout_path) if self.rotary_layout_path else None,
+                layout=default_n4pro_rotary_layout(),
+            )
+        return RotaryLayoutResponse(
+            device_profile="mirabox.n4pro",
+            source=self.rotary_layout_source or "runtime",
+            path=str(self.rotary_layout_path) if self.rotary_layout_path else None,
+            layout=self.rotary_layout,
+        )
+
+    def update_rotary_layout(self, layout: N4ProRotaryLayout) -> dict[str, Any]:
+        """保存并应用一份 N4 Pro 旋钮、灯光和控制台亮度配置。
+
+        入参：`layout` 是 FastAPI/Pydantic 已校验的完整 rotary layout。
+        返回：JSON-safe rotary layout、能力快照、当前 logical panel 与预览刷新信息。
+        错误处理：路径写入失败按 `RotaryLayoutStoreError` 向 API handler 传播。
+        副作用：更新 runtime applied layout，必要时原子写 JSON，并重新渲染 fake panel；真实 N4
+        Pro 会在下一个同会话 renderer tick 读取该 applied state。
+        """
+
+        self._store_rotary_layout(layout)
+        self.render_current_logical_panel_image()
+        return {
+            "rotary_layout": _dump_model(self.current_rotary_layout_response()),
+            "capabilities": _dump_model(get_device_profile("mirabox.n4pro")),
+            "logical_panel": _dump_model(self.logical_panel_selection),
+            "render_count": self.surface.render_count,
+        }
+
+    def _store_rotary_layout(self, layout: N4ProRotaryLayout) -> None:
+        """把已验证 rotary layout 更新到 runtime 并按需持久化。
+
+        入参：`layout` 是完整 N4 Pro rotary 配置。
+        返回：无显式返回值。
+        错误处理：配置路径写入失败时抛 `RotaryLayoutStoreError`，调用方状态保持原布局。
+        副作用：成功时写用户级 JSON（若启用）并更新 runtime source/layout。
+        """
+
+        if self.rotary_layout_path is not None:
+            save_n4pro_rotary_layout(layout, self.rotary_layout_path)
+            source = "persisted"
+        else:
+            source = "runtime"
+        self.rotary_layout = layout
+        self.rotary_layout_source = source
+        self.rotary_layout_last_error = None
+
+    def update_console_configuration(
+        self,
+        request: ConsoleConfigurationApplyRequest,
+    ) -> dict[str, Any]:
+        """以一次 GUI 保存请求更新主按键和旋钮两个已应用配置域。
+
+        入参：`request` 的两个 layout 已在进入前完成 Pydantic 校验。
+        返回：两个 layout response、当前 renderer-neutral layout 和 render 计数。
+        错误处理：任一持久化写入失败时向 handler 抛出，runtime applied state 保留旧值。
+        副作用：可选地写两个用户级 JSON 文件；成功后统一刷新 key/panel 预览，真机在下个
+        persistent renderer tick 的同一设备会话中接收新状态。
+        """
+
+        if self.key_layout_path is not None:
+            save_n4pro_key_layout(request.key_layout, self.key_layout_path)
+        if self.rotary_layout_path is not None:
+            save_n4pro_rotary_layout(request.rotary_layout, self.rotary_layout_path)
+        self.key_layout = request.key_layout
+        self.key_layout_source = "persisted" if self.key_layout_path is not None else "runtime"
+        self.key_layout_last_error = None
+        self.rotary_layout = request.rotary_layout
+        self.rotary_layout_source = (
+            "persisted" if self.rotary_layout_path is not None else "runtime"
+        )
+        self.rotary_layout_last_error = None
+        rendered_layout = self.render_current()
+        self.prewarm_status_key_images(rendered_layout)
+        self.render_current_logical_panel_image()
+        return {
+            "key_layout": _dump_model(self.current_key_layout_response()),
+            "rotary_layout": _dump_model(self.current_rotary_layout_response()),
             "layout": _dump_model(rendered_layout),
             "render_count": self.surface.render_count,
         }
@@ -691,6 +867,256 @@ class _DaemonRuntime:
             "touchscreen_image_size": _image_size(self.surface.last_touchscreen_image),
         }
 
+    def apply_rotary_input(self, intent: RotaryInputIntent) -> dict[str, Any]:
+        """执行一条已按用户 binding 归一的旋钮 intent 并更新即时反馈。
+
+        入参：`intent` 是配置驱动的 rotate 或 press 输入；系统动作只会经
+        `system_control_executor` 受限边界执行。
+        返回：JSON-safe intent、action、logical panel selection 和当前 feedback 诊断。
+        错误处理：executor 失败转换为短暂错误反馈，不让硬件 callback 抛出系统异常。
+        副作用：可能更新 panel selection、系统控制、控制台亮度持久化和 fake touchscreen 图像。
+        """
+
+        self.last_rotary_input = intent
+        action: dict[str, Any]
+        if intent.rotate_action is not None:
+            action = self._apply_rotary_rotate_action(intent)
+        else:
+            action = self._apply_rotary_press_action(intent)
+        self.last_rotary_action = action
+        return {
+            "rotary_intent": _dump_model(intent),
+            "action": action,
+            "selection": _dump_model(self.logical_panel_selection),
+            "control_feedback": _dump_optional_model(self._active_control_feedback()),
+        }
+
+    def _apply_rotary_rotate_action(self, intent: RotaryInputIntent) -> dict[str, Any]:
+        """执行一条旋转通道 action，并为连续值创建短暂 HUD。
+
+        入参：`intent` 必须带 rotate action 和方向 -1/1。
+        返回：动作诊断；面板轮换成功不创建 HUD，系统动作按真实结果创建 value/error HUD。
+        错误处理：缺方向或未知 action 返回明确失败诊断。
+        副作用：可能更新 panel selection、调用系统 executor、保存控制台亮度并重绘面板。
+        """
+
+        action = intent.rotate_action
+        direction = intent.direction
+        if action is None or direction not in {-1, 1}:
+            return self._record_rotary_error("rotary input direction is invalid")
+        if action == RotaryRotateAction.CYCLE_VIRTUAL_PANEL:
+            self.logical_panel_selection = cycle_virtual_panel(
+                self.logical_panel_selection,
+                direction=(
+                    PanelContentDirection.NEXT
+                    if direction > 0
+                    else PanelContentDirection.PREVIOUS
+                ),
+            )
+            self.render_current_logical_panel_image()
+            return {
+                "status": "cycled",
+                "ok": True,
+                "action": action.value,
+                "active_kind": self.logical_panel_selection.active_kind.value,
+            }
+        if action == RotaryRotateAction.CYCLE_PANEL_CONTENT:
+            before = self.logical_panel_selection
+            self.logical_panel_selection = cycle_panel_content(
+                before,
+                direction=(
+                    PanelContentDirection.NEXT
+                    if direction > 0
+                    else PanelContentDirection.PREVIOUS
+                ),
+            )
+            self.render_current_logical_panel_image()
+            return {
+                "status": "noop" if before == self.logical_panel_selection else "cycled",
+                "ok": True,
+                "action": action.value,
+                "selection": _dump_model(self.logical_panel_selection),
+            }
+        if action == RotaryRotateAction.ADJUST_OUTPUT_VOLUME:
+            result = self.system_control_executor.adjust_output_volume(2 * direction)
+            return self._record_system_control_result(result, label="Output volume")
+        if action == RotaryRotateAction.ADJUST_INPUT_VOLUME:
+            result = self.system_control_executor.adjust_input_volume(2 * direction)
+            return self._record_system_control_result(result, label="Input volume")
+        if action == RotaryRotateAction.ADJUST_SYSTEM_DISPLAY_BRIGHTNESS:
+            result = self.system_control_executor.adjust_system_display_brightness(
+                self.current_rotary_layout_response().layout.system_display_id,
+                2 * direction,
+            )
+            return self._record_system_control_result(result, label="Display brightness")
+        if action == RotaryRotateAction.ADJUST_DECK_DISPLAY_BRIGHTNESS:
+            layout = self.current_rotary_layout_response().layout
+            updated_value = max(0, min(100, layout.console_brightness_percent + 2 * direction))
+            self._store_rotary_layout(
+                layout.model_copy(update={"console_brightness_percent": updated_value})
+            )
+            self._set_control_feedback(
+                ControlFeedbackKind.VALUE,
+                label="Console brightness",
+                value=f"{updated_value}%",
+            )
+            self.render_current_logical_panel_image()
+            return {
+                "status": "succeeded",
+                "ok": True,
+                "action": action.value,
+                "value_percent": updated_value,
+                "message": "控制台亮度已更新",
+            }
+        return self._record_rotary_error(f"unsupported rotary action: {action.value}")
+
+    def _apply_rotary_press_action(self, intent: RotaryInputIntent) -> dict[str, Any]:
+        """执行一条按下通道 action，并按确认的静音状态生成短暂 HUD。
+
+        入参：`intent` 必须带 press action。
+        返回：系统 executor 的标准诊断加上 action 标识。
+        错误处理：未知或缺少 press action 返回错误反馈。
+        副作用：可能修改系统静音状态并更新 fake touchscreen。
+        """
+
+        action = intent.press_action
+        if action == RotaryPressAction.TOGGLE_OUTPUT_MUTE:
+            result = self.system_control_executor.toggle_output_mute()
+            return self._record_system_control_result(result, label="Output")
+        if action == RotaryPressAction.TOGGLE_INPUT_MUTE:
+            result = self.system_control_executor.toggle_input_mute()
+            return self._record_system_control_result(result, label="Microphone")
+        return self._record_rotary_error("unsupported rotary press action")
+
+    def _record_system_control_result(self, result: Any, *, label: str) -> dict[str, Any]:
+        """把一个确认后的系统 executor 结果转换为 HUD 与 API 诊断。
+
+        入参：`result` 是 `SystemControlResult`；`label` 是供 HUD 展示的动作名称。
+        返回：JSON-safe action dict。
+        错误处理：失败结果转换为短暂 error HUD；不抛出系统操作异常。
+        副作用：更新 feedback 并重绘 fake logical panel。
+        """
+
+        result_data = _dump_model(result)
+        if not result.ok:
+            self._set_control_feedback(ControlFeedbackKind.ERROR, label=result.message)
+        elif result.value_percent is not None:
+            self._set_control_feedback(
+                ControlFeedbackKind.VALUE,
+                label=label,
+                value=f"{result.value_percent}%",
+            )
+        elif result.muted is not None:
+            self._set_control_feedback(
+                ControlFeedbackKind.MUTE,
+                label=f"{label} {'muted' if result.muted else 'unmuted'}",
+            )
+        self.render_current_logical_panel_image()
+        return result_data
+
+    def _record_rotary_error(self, message: str) -> dict[str, Any]:
+        """记录一条不执行副作用的旋钮错误反馈。
+
+        入参：`message` 是可展示的短错误说明。
+        返回：标准 `ok=False` action dict。
+        错误处理：无。
+        副作用：设置短暂 error HUD 并重绘 fake logical panel。
+        """
+
+        self._set_control_feedback(ControlFeedbackKind.ERROR, label=message)
+        self.render_current_logical_panel_image()
+        return {"status": "unsupported", "ok": False, "message": message}
+
+    def _set_control_feedback(
+        self,
+        kind: ControlFeedbackKind,
+        *,
+        label: str,
+        value: str | None = None,
+    ) -> None:
+        """覆盖当前短暂 HUD，并从当前时刻重新计算 1.5 秒显示期限。
+
+        入参：`kind`、`label` 和可选 `value` 是已经确认的动作反馈。
+        返回：无显式返回值。
+        错误处理：`ControlFeedback` 校验错误按原语义传播。
+        副作用：更新 runtime 内存 feedback，不直接写真实硬件。
+        """
+
+        self.control_feedback = ControlFeedback(
+            kind=kind,
+            label=label,
+            value=value,
+            expires_at_monotonic=time.monotonic() + _CONTROL_FEEDBACK_DURATION_SECONDS,
+        )
+
+    def _active_control_feedback(self) -> ControlFeedback | None:
+        """读取未过期的 HUD，并在过期后清理 runtime 引用。
+
+        入参：无。
+        返回：仍有效的 feedback，或 None。
+        错误处理：无。
+        副作用：过期时将 `control_feedback` 设为 None。
+        """
+
+        feedback = self.control_feedback
+        if feedback is None:
+            return None
+        if feedback_is_active(feedback, now_monotonic=time.monotonic()):
+            return feedback
+        self.control_feedback = None
+        return None
+
+    def apply_n4pro_session_outputs(self, device: object, initialized: bool) -> str | None:
+        """在 N4 Pro 已打开的统一 renderer 会话中应用整体亮度和唯一灯圈组输出。
+
+        入参：`device` 是已成功 open/init 的官方 SDK device；`initialized` 表示本轮刚 init，
+        因为 SDK init 会把亮度重置为 100，需要强制重新写入持久化值。
+        返回：所有失败信息拼接后的错误字符串，成功或无变更时返回 None。
+        错误处理：缺少 SDK 方法、返回 -1 或调用异常只记录错误，不影响本轮图像渲染。
+        副作用：仅在值变化或刚 init 时调用 `set_brightness`/`set_led_color`，不新建 HID 会话。
+        """
+
+        if initialized:
+            self.n4pro_last_applied_brightness_percent = None
+            self.n4pro_last_applied_lighting = None
+            self.n4pro_last_applied_led_brightness_percent = None
+        layout = self.current_rotary_layout_response().layout
+        errors: list[str] = []
+        desired_brightness = layout.console_brightness_percent
+        if self.n4pro_last_applied_brightness_percent != desired_brightness:
+            error = _set_n4pro_brightness(device, desired_brightness)
+            if error is None:
+                self.n4pro_last_applied_brightness_percent = desired_brightness
+            else:
+                errors.append(error)
+
+        desired_lighting = (
+            layout.lighting.mode.value,
+            layout.lighting.color,
+            layout.lighting.breathe,
+        )
+        if self.n4pro_last_applied_lighting != desired_lighting:
+            error = _set_n4pro_group_lighting(device, *desired_lighting)
+            if error is None:
+                self.n4pro_last_applied_lighting = desired_lighting
+            else:
+                errors.append(error)
+
+        desired_led_brightness = _n4pro_led_brightness_percent(
+            mode=layout.lighting.mode.value,
+            breathe=layout.lighting.breathe,
+        )
+        if self.n4pro_last_applied_led_brightness_percent != desired_led_brightness:
+            error = _set_n4pro_group_led_brightness(device, desired_led_brightness)
+            if error is None:
+                self.n4pro_last_applied_led_brightness_percent = desired_led_brightness
+            else:
+                errors.append(error)
+
+        error_text = "; ".join(errors) or None
+        self.n4pro_session_output_last_error = error_text
+        return error_text
+
     def apply_hardware_input(self, event: HardwareInput) -> dict[str, Any]:
         """Apply one low-level hardware input event through input routers.
 
@@ -699,6 +1125,24 @@ class _DaemonRuntime:
         错误处理：panel 渲染异常按原语义传播；无法映射的输入返回 handled=false。
         副作用：当输入映射到 logical panel event 时更新 selection 并可能渲染 fake touchscreen。
         """
+
+        if event.kind == "knob":
+            rotary_intent = rotary_input_from_hardware_input(
+                event,
+                self.current_rotary_layout_response().layout,
+            )
+            if rotary_intent is not None:
+                return {
+                    "handled": True,
+                    "panel_event": None,
+                    **self.apply_rotary_input(rotary_intent),
+                }
+            return {
+                "handled": False,
+                "panel_event": None,
+                "selection": _dump_model(self.logical_panel_selection),
+                "rotary_intent": None,
+            }
 
         panel_event = panel_event_from_hardware_input(event)
         if panel_event is None:
@@ -732,6 +1176,39 @@ class _DaemonRuntime:
         错误处理：panel 渲染异常按原语义传播；无法映射的输入返回 handled=false。
         副作用：当输入映射到 logical panel event 时更新 selection 并可能渲染 fake touchscreen。
         """
+
+        rotary_intent = rotary_input_from_streamdock_input_event(
+            event,
+            self.current_rotary_layout_response().layout,
+        )
+        if rotary_intent is not None:
+            result = self.apply_rotary_input(rotary_intent)
+            self._record_streamdock_input_event(
+                event,
+                panel_event=None,
+                handled=True,
+                debounced=False,
+                accumulated=False,
+            )
+            return {"handled": True, "panel_event": None, **result}
+
+        if _dump_event_field(getattr(event, "event_type", None)) in {
+            "knob_rotate",
+            "knob_press",
+        }:
+            self._record_streamdock_input_event(
+                event,
+                panel_event=None,
+                handled=False,
+                debounced=False,
+                accumulated=False,
+            )
+            return {
+                "handled": False,
+                "panel_event": None,
+                "selection": _dump_model(self.logical_panel_selection),
+                "rotary_intent": None,
+            }
 
         panel_event = panel_event_from_streamdock_input_event(event)
         if panel_event is None:
@@ -1180,26 +1657,53 @@ class _DaemonRuntime:
         """
 
         if self._is_brand_feedback_active():
-            return render_agent_deck_splash_touchscreen(), "agent_deck:brand_feedback"
-
-        active_kind = self.logical_panel_selection.active_kind
-        if active_kind == PanelKind.QUOTA and self.codex_quota_snapshot is not None:
-            return render_quota_touchscreen(self.codex_quota_snapshot), "codex_quota"
-        if (
-            active_kind == PanelKind.TOKENS
-            and self.codex_token_usage_snapshot is not None
-        ):
-            plan = tokens_panel_plan(
-                self.codex_token_usage_snapshot,
-                period=self.logical_panel_selection.token_period,
+            base_image, base_source = (
+                render_agent_deck_splash_touchscreen(),
+                "agent_deck:brand_feedback",
             )
-            return render_logical_panel_touchscreen(plan), "codex_tokens"
-        if active_kind == PanelKind.MESSAGE:
-            decision = self._current_pending_decision()
-            if decision is not None:
-                plan = _decision_message_panel_plan(decision)
-                return render_logical_panel_touchscreen(plan), "decision_message"
-        return render_agent_deck_splash_touchscreen(), "agent_deck:splash"
+        else:
+            active_kind = self.logical_panel_selection.active_kind
+            if active_kind == PanelKind.QUOTA and self.codex_quota_snapshot is not None:
+                base_image, base_source = (
+                    render_quota_touchscreen(
+                        self.codex_quota_snapshot,
+                        window=self.logical_panel_selection.quota_window.value,
+                    ),
+                    "codex_quota",
+                )
+            elif (
+                active_kind == PanelKind.TOKENS
+                and self.codex_token_usage_snapshot is not None
+            ):
+                plan = tokens_panel_plan(
+                    self.codex_token_usage_snapshot,
+                    period=self.logical_panel_selection.token_period,
+                )
+                base_image, base_source = render_logical_panel_touchscreen(plan), "codex_tokens"
+            elif active_kind == PanelKind.MESSAGE:
+                decision = self._current_pending_decision()
+                if decision is not None:
+                    plan = _decision_message_panel_plan(decision)
+                    base_image, base_source = (
+                        render_logical_panel_touchscreen(plan),
+                        "decision_message",
+                    )
+                else:
+                    base_image, base_source = render_agent_deck_splash_touchscreen(), "agent_deck:splash"
+            else:
+                base_image, base_source = render_agent_deck_splash_touchscreen(), "agent_deck:splash"
+
+        feedback = self._active_control_feedback()
+        if feedback is not None:
+            return (
+                render_control_feedback_touchscreen(
+                    feedback,
+                    base_image=base_image,
+                    viewport=N4PRO_LOGICAL_PANEL_VIEWPORT,
+                ),
+                f"control_feedback:{feedback.kind.value}",
+            )
+        return base_image, base_source
 
     def render_current_logical_panel_image(self) -> Any | None:
         """Render and record the current logical panel image when possible.
@@ -1215,7 +1719,25 @@ class _DaemonRuntime:
             return None
         image, source = built
         self.surface.render_touchscreen_image(image, source=source)
+        self.logical_panel_background_revision += 1
         return image
+
+    def current_hardware_background(self) -> tuple[int, Any | None]:
+        """返回真实 renderer 可安全读取的最新 logical panel 背景 revision。
+
+        入参：无；读取 daemon 已缓存的 fake touchscreen image。
+        返回：单调递增 revision 和当前 800x480 Pillow 图像；当短暂 HUD 已过期但缓存仍是反馈图时，
+        会先重绘基础 panel，再返回新的 revision。
+        错误处理：基础 panel 不可构建时返回现有缓存或 None，不直接访问 SDK。
+        副作用：HUD 过期时更新 fake surface 缓存和 revision；不创建硬件会话。
+        """
+
+        source = self.surface.last_touchscreen_image_source or ""
+        if source.startswith("control_feedback:") and self._active_control_feedback() is None:
+            self.render_current_logical_panel_image()
+        if self.surface.last_touchscreen_image is None:
+            self.render_current_logical_panel_image()
+        return self.logical_panel_background_revision, self.surface.last_touchscreen_image
 
     def _is_brand_feedback_active(self) -> bool:
         """判断 transient 品牌反馈面板是否仍在有效时间内。
@@ -1409,6 +1931,9 @@ class _DaemonRuntime:
             "layout": _dump_model(layout),
             "key_layout": _dump_model(self.current_key_layout_response()),
             "key_layout_last_error": self.key_layout_last_error,
+            "rotary_layout": _dump_model(self.current_rotary_layout_response()),
+            "rotary_layout_last_error": self.rotary_layout_last_error,
+            "hardware_capabilities": _dump_model(get_device_profile("mirabox.n4pro")),
             "render_count": self.surface.render_count,
             "pollers": {
                 "codex_app_state": {
@@ -1442,6 +1967,7 @@ class _DaemonRuntime:
                     self.surface.last_touchscreen_image
                 ),
                 "touchscreen_image_source": self.surface.last_touchscreen_image_source,
+                "control_feedback": _dump_optional_model(self._active_control_feedback()),
             },
             "streamdock_n4pro_renderer": {
                 "last_result": _dump_optional_model(
@@ -1451,11 +1977,23 @@ class _DaemonRuntime:
                     self.streamdock_n4pro_renderer_updated_at
                 ),
                 "last_error": self.streamdock_n4pro_renderer_last_error,
+                "session_output_last_error": self.n4pro_session_output_last_error,
+                "applied_console_brightness_percent": self.n4pro_last_applied_brightness_percent,
+                "applied_lighting": self.n4pro_last_applied_lighting,
+                "applied_led_brightness_percent": self.n4pro_last_applied_led_brightness_percent,
             },
             "streamdock_input": {
                 "event_count": self.streamdock_input_event_count,
                 "last_event": self.streamdock_last_input_event,
                 "recent_events": list(self.streamdock_recent_input_events),
+            },
+            "rotary": {
+                "last_intent": _dump_optional_model(self.last_rotary_input),
+                "last_action": self.last_rotary_action,
+                "system_display_targets": [
+                    _dump_model(target)
+                    for target in self.system_control_executor.list_display_targets()
+                ],
             },
             "deck_selection": _dump_model(self.selection),
             "interaction": {
@@ -1605,6 +2143,29 @@ class _DaemonRuntime:
         self.store.mark_decision_resolved(decision.agent_key)
 
 
+def _build_default_n4pro_renderer_sink(
+    runtime: _DaemonRuntime,
+) -> StreamDockN4ProRendererSink:
+    """创建默认 N4 Pro persistent renderer，并在同一会话挂接控制台输出回调。
+
+    入参：`runtime` 提供输入 callback 与已应用的亮度/灯光配置。
+    返回：可作为 renderer sink 调用的 persistent animator。
+    错误处理：构造不访问设备；被 monkeypatch 的旧 fake animator 若没有 setter 仍能用于现有测试。
+    副作用：仅创建 renderer 对象并保存回调引用，不 open/init 真实硬件。
+    """
+
+    animator = StreamDockN4ProPersistentAnimator(
+        input_callback=lambda _device, event: runtime.apply_streamdock_input_event(event)
+    )
+    setter = getattr(animator, "set_session_output_callback", None)
+    if callable(setter):
+        setter(runtime.apply_n4pro_session_outputs)
+    background_setter = getattr(animator, "set_background_update_provider", None)
+    if callable(background_setter):
+        background_setter(runtime.current_hardware_background)
+    return animator
+
+
 def create_app(
     *,
     poller_config: DaemonPollerConfig | None = None,
@@ -1619,10 +2180,12 @@ def create_app(
     local_app_catalog_reader: LocalAppCatalogReader = list_local_apps,
     local_app_action_executor: LocalAppActionExecutor = open_or_focus_local_app,
     local_url_action_executor: LocalUrlActionExecutor = open_local_url,
+    system_control_executor: SystemControlExecutor | None = None,
     app_icon_cache_path: Path | None = None,
     url_icon_cache_path: Path | None = None,
     url_icon_fetcher: UrlIconFetcher | None = None,
     key_layout_path: Path | None = None,
+    rotary_layout_path: Path | None = None,
 ) -> FastAPI:
     """Create the local daemon FastAPI app without binding sockets.
 
@@ -1642,8 +2205,9 @@ def create_app(
     支撑本机快捷动作执行，测试可替换；
     `app_icon_cache_path` 是 App 图标缓存根目录；`url_icon_cache_path` 是 URL favicon
     缓存根目录；两者默认使用用户级 Application Support；`url_icon_fetcher` 供测试替换网络请求；
-    `key_layout_path` 为 None 时 GUI 布局只保存在进程内，传入路径时启动会读该 JSON，
-    保存会写回该 JSON。
+    `key_layout_path` 与 `rotary_layout_path` 为 None 时相应 GUI 布局只保存在进程内，传入路径时
+    启动会读各自 JSON，保存会写回；`system_control_executor` 可注入 fake，默认按平台构造保守
+    executor。
     返回：配置好路由且持有 in-memory runtime 的 `FastAPI` ASGI app。
     错误处理：对象构造失败会直接抛出；poller 单次失败会记录到 status，不让 app 启动失败。
     副作用：总是分配内存对象并注册路由；只有显式启用 poller 时，lifespan startup 才会只读访问
@@ -1666,6 +2230,16 @@ def create_app(
                 initial_key_layout_source = "persisted"
         except KeyLayoutStoreError as exc:
             key_layout_last_error = str(exc)
+    initial_rotary_layout: N4ProRotaryLayout | None = None
+    initial_rotary_layout_source: str | None = None
+    rotary_layout_last_error: str | None = None
+    if rotary_layout_path is not None:
+        try:
+            initial_rotary_layout = load_n4pro_rotary_layout(rotary_layout_path)
+            if initial_rotary_layout is not None:
+                initial_rotary_layout_source = "persisted"
+        except RotaryLayoutStoreError as exc:
+            rotary_layout_last_error = str(exc)
     runtime = _DaemonRuntime(
         store=AgentStateStore(),
         broker=DecisionBroker(),
@@ -1682,6 +2256,7 @@ def create_app(
         codex_token_usage_updated_at=None,
         codex_token_usage_last_error=None,
         logical_panel_selection=PanelSelection(),
+        logical_panel_background_revision=0,
         streamdock_touch_tap_last_handled_monotonic=None,
         streamdock_knob4_rotate_accumulator=0,
         streamdock_input_event_count=0,
@@ -1691,12 +2266,18 @@ def create_app(
         last_interaction_action=None,
         recent_interactions=[],
         brand_feedback_until_monotonic=None,
+        control_feedback=None,
+        last_rotary_input=None,
+        last_rotary_action=None,
         focus_actions_enabled=resolved_poller_config.focus_actions_enabled,
         local_actions_enabled=resolved_poller_config.local_actions_enabled,
         focus_action_executor=focus_action_executor,
         local_app_catalog_reader=local_app_catalog_reader,
         local_app_action_executor=local_app_action_executor,
         local_url_action_executor=local_url_action_executor,
+        system_control_executor=(
+            system_control_executor or create_default_system_control_executor()
+        ),
         app_icon_cache=app_icon_cache,
         url_icon_cache=url_icon_cache,
         status_key_image_cache=StatusKeyImageCache(),
@@ -1708,14 +2289,18 @@ def create_app(
         key_layout_source=initial_key_layout_source,
         key_layout_path=key_layout_path,
         key_layout_last_error=key_layout_last_error,
+        rotary_layout=initial_rotary_layout,
+        rotary_layout_source=initial_rotary_layout_source,
+        rotary_layout_path=rotary_layout_path,
+        rotary_layout_last_error=rotary_layout_last_error,
+        n4pro_last_applied_brightness_percent=None,
+        n4pro_last_applied_lighting=None,
+        n4pro_last_applied_led_brightness_percent=None,
+        n4pro_session_output_last_error=None,
     )
     resolved_streamdock_n4pro_renderer_sink: StreamDockN4ProRendererSink = (
         streamdock_n4pro_renderer_sink
-        or StreamDockN4ProPersistentAnimator(
-            input_callback=lambda _device, event: runtime.apply_streamdock_input_event(
-                event
-            )
-        )
+        or _build_default_n4pro_renderer_sink(runtime)
     )
 
     @asynccontextmanager
@@ -1894,6 +2479,38 @@ def create_app(
 
         return _dump_model(runtime.current_key_layout_response())
 
+    @app.get("/ui/rotary-layout")
+    async def get_rotary_layout() -> dict[str, Any]:
+        """返回 GUI 当前可编辑的 N4 Pro 旋钮、灯光和亮度配置。
+
+        入参：无。
+        返回：默认、runtime 或 persisted rotary layout response。
+        错误处理：内置默认 layout 构造失败按 500 传播。
+        副作用：只读取 daemon 内存，不写配置或硬件。
+        """
+
+        return _dump_model(runtime.current_rotary_layout_response())
+
+    @app.get("/ui/control-capabilities")
+    async def get_control_capabilities() -> dict[str, Any]:
+        """返回当前 N4 Pro profile 和本机已确认系统显示器能力。
+
+        入参：无。
+        返回：硬件 capability profile、可控系统显示器和当前选中显示器 id。
+        错误处理：system executor 枚举异常按 FastAPI 500 处理。
+        副作用：可能读取系统显示器 capability；不写系统或硬件。
+        """
+
+        rotary = runtime.current_rotary_layout_response().layout
+        return {
+            "device_profile": _dump_model(get_device_profile("mirabox.n4pro")),
+            "system_display_targets": [
+                _dump_model(target)
+                for target in runtime.system_control_executor.list_display_targets()
+            ],
+            "selected_system_display_id": rotary.system_display_id,
+        }
+
     @app.get("/ui/apps")
     async def get_local_apps() -> dict[str, Any]:
         """Return local apps that can be assigned to quick-action keys.
@@ -2028,6 +2645,23 @@ def create_app(
             raise HTTPException(status_code=404, detail="url icon is not cached")
         return FileResponse(icon_path)
 
+    @app.put("/ui/configuration")
+    async def put_console_configuration(
+        request: ConsoleConfigurationApplyRequest,
+    ) -> dict[str, Any]:
+        """保存并应用 GUI 的主按键与旋钮草稿。
+
+        入参：`request` 同时携带完整 key/rotary layout，路由层先整体校验。
+        返回：两个已应用 layout response 和当前 projection。
+        错误处理：body 非法返回 422；任一 JSON 持久化失败返回 500，旧 runtime state 不被覆盖。
+        副作用：成功时更新 daemon applied 配置，真实硬件等待下一个统一 renderer tick 下发。
+        """
+
+        try:
+            return runtime.update_console_configuration(request)
+        except (KeyLayoutStoreError, RotaryLayoutStoreError) as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
     @app.put("/ui/key-layout")
     async def put_key_layout(layout: N4ProKeyLayout) -> dict[str, Any]:
         """Save the N4 Pro key layout in the current daemon runtime.
@@ -2042,6 +2676,22 @@ def create_app(
             return runtime.update_key_layout(layout)
         except KeyLayoutStoreError as exc:
             runtime.key_layout_last_error = str(exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.put("/ui/rotary-layout")
+    async def put_rotary_layout(layout: N4ProRotaryLayout) -> dict[str, Any]:
+        """保存并应用一份完整 N4 Pro rotary layout。
+
+        入参：`layout` 是完整四旋钮、灯圈组和整体亮度配置。
+        返回：已应用 rotary layout、N4 Pro capability 和逻辑面板预览诊断。
+        错误处理：请求体非法返回 422；JSON 持久化失败返回 500 并保留原 applied layout。
+        副作用：更新 runtime 和可选用户级 layout JSON；真实硬件在下一 renderer tick 应用。
+        """
+
+        try:
+            return runtime.update_rotary_layout(layout)
+        except RotaryLayoutStoreError as exc:
+            runtime.rotary_layout_last_error = str(exc)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/events")
@@ -2928,6 +3578,99 @@ def _dump_optional_model(model: BaseModel | None) -> dict[str, Any] | None:
     if model is None:
         return None
     return _dump_model(model)
+
+
+def _set_n4pro_brightness(device: object, percent: int) -> str | None:
+    """调用 N4 Pro SDK 的整体亮度 API，并把兼容错误归一为诊断文本。
+
+    入参：`device` 是已 open/init 的官方 SDK 对象；`percent` 是 0 到 100 的目标亮度。
+    返回：成功时 None；缺方法、SDK 返回 -1 或异常时返回错误说明。
+    错误处理：不抛 SDK 异常，避免控制台附加输出破坏主图像刷新。
+    副作用：成功时调用设备 `set_brightness(percent)`。
+    """
+
+    setter = getattr(device, "set_brightness", None)
+    if not callable(setter):
+        return "N4 Pro SDK does not expose set_brightness"
+    try:
+        result = setter(percent)
+    except Exception as exc:
+        return f"set_brightness failed: {type(exc).__name__}: {exc}"
+    if result == -1:
+        return "set_brightness failed: SDK returned -1"
+    return None
+
+
+def _set_n4pro_group_lighting(
+    device: object,
+    mode: str,
+    color: str | None,
+    breathe: bool,
+) -> str | None:
+    """调用 N4 Pro 单一灯圈组颜色 API，不伪造每旋钮独立写入。
+
+    入参：`device` 是已 open/init 的官方 SDK 对象；`mode` 是 off 或 color；`color` 是经模型
+    校验的 `#RRGGBB` 或 None；`breathe` 只用于完整接收持久化配置，亮度周期另由 LED brightness
+    API 写入。
+    返回：成功时 None；缺方法、模式非法、SDK 返回 -1 或异常时返回错误说明。
+    错误处理：不抛 SDK 异常，图像刷新仍可继续。
+    副作用：成功时调用一次 `set_led_color(r, g, b)`，off 发送全零。
+    """
+
+    setter = getattr(device, "set_led_color", None)
+    if not callable(setter):
+        return "N4 Pro SDK does not expose set_led_color"
+    if mode == "off":
+        red, green, blue = (0, 0, 0)
+    elif mode == "color" and color is not None:
+        red, green, blue = tuple(int(color[index : index + 2], 16) for index in (1, 3, 5))
+    else:
+        return "invalid N4 Pro lighting configuration"
+    try:
+        result = setter(red, green, blue)
+    except Exception as exc:
+        return f"set_led_color failed: {type(exc).__name__}: {exc}"
+    if result == -1:
+        return "set_led_color failed: SDK returned -1"
+    return None
+
+
+def _n4pro_led_brightness_percent(*, mode: str, breathe: bool) -> int:
+    """根据灯光模式计算当前 N4 Pro group LED 亮度。
+
+    入参：`mode` 是已校验的 off/color；`breathe` 仅在 color 下有效。
+    返回：关闭时为 0，常亮时为 100，呼吸时在 24 到 86 之间按 3.6 秒正弦周期平滑变化。
+    错误处理：未知 mode 按关闭处理，避免无效配置点亮设备。
+    副作用：读取 monotonic 时钟，不访问 SDK 或修改硬件。
+    """
+
+    if mode != "color":
+        return 0
+    if not breathe:
+        return 100
+    phase = (time.monotonic() % 3.6) / 3.6
+    return round(24 + ((math.sin((phase * math.tau) - (math.pi / 2)) + 1) / 2) * 62)
+
+
+def _set_n4pro_group_led_brightness(device: object, percent: int) -> str | None:
+    """调用 N4 Pro group LED 亮度 API，供可选软件呼吸效果复用。
+
+    入参：`device` 是已 open/init 的官方 SDK 对象；`percent` 必须是 0 到 100 的 group 灯圈亮度。
+    返回：成功时 None；SDK 缺少 API、返回 -1 或调用异常时返回诊断文本。
+    错误处理：不抛 SDK 异常，避免辅助灯光效果中断主图像刷新。
+    副作用：成功时调用一次 `set_led_brightness(percent)`。
+    """
+
+    setter = getattr(device, "set_led_brightness", None)
+    if not callable(setter):
+        return "N4 Pro SDK does not expose set_led_brightness"
+    try:
+        result = setter(percent)
+    except Exception as exc:
+        return f"set_led_brightness failed: {type(exc).__name__}: {exc}"
+    if result == -1:
+        return "set_led_brightness failed: SDK returned -1"
+    return None
 
 
 def _dump_datetime(value: datetime | None) -> str | None:

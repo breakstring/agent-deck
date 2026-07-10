@@ -172,43 +172,197 @@ class TouchCapability(BaseModel):
     notes: tuple[str, ...] = ()
 
 
-class RotaryCapability(BaseModel):
-    """描述旋钮输入能力。
+class RotaryControlCapability(BaseModel):
+    """描述一个物理旋钮位置可接收的独立输入通道。
 
-    入参：`count` 是旋钮数量；`has_press` 表示是否能读取旋钮按下；`notes` 记录映射限制。
-    返回：frozen Pydantic model。
-    错误处理：旋钮数量小于等于 0 时由校验拒绝。
-    副作用：仅保存内存数据。
+    入参：`id` 是稳定硬件位置 id；`supports_rotate` 和 `supports_press` 分别描述左右旋转和
+    按下是否可用。返回 frozen Pydantic model。空 id 由校验拒绝；该模型不监听 SDK 或设备。
     """
 
     model_config = ConfigDict(frozen=True)
 
-    count: int
-    has_press: bool = False
-    notes: tuple[str, ...] = ()
+    id: str
+    supports_rotate: bool = True
+    supports_press: bool = False
 
-    @field_validator("count")
+    @field_validator("id")
     @classmethod
-    def _validate_count(cls, value: int) -> int:
-        """校验旋钮数量必须为正数。
+    def _validate_id(cls, value: str) -> str:
+        """校验物理控制单元 id 非空。
 
-        入参：`value` 是旋钮数量。
-        返回：原始数量。
-        错误处理：小于等于 0 时抛出 ValueError。
+        入参：`value` 是调用方传入的稳定 id。
+        返回：去除首尾空白后的 id。
+        错误处理：空字符串抛出 ValueError。
         副作用：无。
         """
 
-        if value <= 0:
-            raise ValueError("rotary.count must be positive")
+        return _normalized_non_empty_string(value, field_name="rotary control id")
+
+
+class RotaryCapability(BaseModel):
+    """描述设备旋钮控制单元集合。
+
+    入参：`controls` 是按物理位置列出的旋钮能力；`notes` 记录 SDK/固件限制。`count` 与
+    `has_press` 作为兼容只读属性从 controls 派生，不再用于配置或 profile 构造。
+    返回：frozen Pydantic model。
+    错误处理：空集合、重复 id 或没有任何输入通道时由校验拒绝。
+    副作用：无；只保存内存 capability。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    controls: tuple[RotaryControlCapability, ...]
+    notes: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_controls(self) -> RotaryCapability:
+        """校验控制单元集合可被安全配置。
+
+        入参：当前已解析的 model。
+        返回：当前 model。
+        错误处理：空集合、重复 id 或完全不可输入的 control 抛出 ValueError。
+        副作用：无。
+        """
+
+        if not self.controls:
+            raise ValueError("rotary.controls must not be empty")
+        ids = [control.id for control in self.controls]
+        if len(ids) != len(set(ids)):
+            raise ValueError("rotary.controls must have unique ids")
+        if any(
+            not (control.supports_rotate or control.supports_press)
+            for control in self.controls
+        ):
+            raise ValueError("each rotary control must support rotate or press")
+        return self
+
+    @property
+    def count(self) -> int:
+        """返回旋钮控制单元数量的兼容读取视图。
+
+        入参：无。
+        返回：`controls` 的长度。
+        错误处理：无。
+        副作用：无。
+        """
+
+        return len(self.controls)
+
+    @property
+    def has_press(self) -> bool:
+        """返回任一旋钮是否支持按下的兼容读取视图。
+
+        入参：无。
+        返回：至少一个 control 支持按下时为 True。
+        错误处理：无。
+        副作用：无。
+        """
+
+        return any(control.supports_press for control in self.controls)
+
+
+class LightAddressability(StrEnum):
+    """描述一个灯光区域的实际 SDK 可寻址粒度。
+
+    入参：枚举值来自硬件 profile。
+    返回：作为 `LightZoneCapability.addressability` 的稳定限制。
+    错误处理：未知值由 Enum/Pydantic 拒绝。
+    副作用：无。
+    """
+
+    NONE = "none"
+    GLOBAL = "global"
+    GROUP = "group"
+    PER_CONTROL = "per_control"
+
+
+class LightZoneCapability(BaseModel):
+    """描述 SDK 可以真正写入的一组 LED 或背光输出。
+
+    入参：`id` 是稳定区域 id；`addressability` 是寻址粒度；`associated_control_ids` 只用于
+    在预览中关联物理控件；其余字段描述颜色、亮度和呼吸能力。
+    返回：frozen Pydantic model。
+    错误处理：空 id、重复关联 id 或 none 区域声明输出能力时抛 ValueError。
+    副作用：无；不控制 LED。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    addressability: LightAddressability
+    associated_control_ids: tuple[str, ...] = ()
+    supports_color: bool = False
+    supports_brightness: bool = False
+    supports_breathe: bool = False
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, value: str) -> str:
+        """校验灯光区域 id 非空。
+
+        入参：`value` 是区域 id。
+        返回：清理后的 id。
+        错误处理：空字符串抛出 ValueError。
+        副作用：无。
+        """
+
+        return _normalized_non_empty_string(value, field_name="light zone id")
+
+    @model_validator(mode="after")
+    def _validate_zone_shape(self) -> LightZoneCapability:
+        """校验区域寻址与输出能力保持一致。
+
+        入参：当前已解析 model。
+        返回：当前 model。
+        错误处理：重复关联 id 或 none 区域声明输出能力时抛 ValueError。
+        副作用：无。
+        """
+
+        if len(self.associated_control_ids) != len(set(self.associated_control_ids)):
+            raise ValueError("light zone associated_control_ids must be unique")
+        if self.addressability == LightAddressability.NONE and any(
+            (self.supports_color, self.supports_brightness, self.supports_breathe)
+        ):
+            raise ValueError("none light zone cannot support output")
+        return self
+
+
+class DisplayBrightnessCapability(BaseModel):
+    """描述设备显示亮度可写入的范围与粒度。
+
+    入参：`supports_set` 表示是否可以写亮度；`scope` 表示整体设备或可独立 surface。
+    返回：frozen Pydantic model。
+    错误处理：scope 不是两个稳定值时由 Pydantic 拒绝。
+    副作用：无；不调用 SDK。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    supports_set: bool = False
+    scope: str = "device_global"
+
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope(cls, value: str) -> str:
+        """校验亮度控制的硬件作用域。
+
+        入参：`value` 是 profile 定义的作用域。
+        返回：原值。
+        错误处理：非 `device_global` 或 `per_surface` 时抛出 ValueError。
+        副作用：无。
+        """
+
+        if value not in {"device_global", "per_surface"}:
+            raise ValueError("display brightness scope must be device_global or per_surface")
         return value
 
 
 class LightCapability(BaseModel):
     """描述 LED、背光或环境状态提示能力。
 
-    入参：`has_rgb_led`、`led_count`、`has_keyboard_backlight` 和 `notes` 描述可用灯光能力。
+    入参：遗留字段保留兼容旧 profile；`zones` 是 UI 和动作层必须使用的真实寻址输出单位。
     返回：frozen Pydantic model。
-    错误处理：`led_count` 为非正数时由校验拒绝。
+    错误处理：LED 数量非法或 zone id 重复时由校验拒绝。
     副作用：仅保存内存数据，不控制灯光。
     """
 
@@ -217,6 +371,7 @@ class LightCapability(BaseModel):
     has_rgb_led: bool = False
     led_count: int | None = None
     has_keyboard_backlight: bool = False
+    zones: tuple[LightZoneCapability, ...] = ()
     notes: tuple[str, ...] = ()
 
     @field_validator("led_count")
@@ -233,6 +388,21 @@ class LightCapability(BaseModel):
         if value is not None and value <= 0:
             raise ValueError("light.led_count must be positive")
         return value
+
+    @model_validator(mode="after")
+    def _validate_zones(self) -> LightCapability:
+        """校验灯光区域 id 唯一。
+
+        入参：当前已解析 model。
+        返回：当前 model。
+        错误处理：重复 zone id 抛出 ValueError。
+        副作用：无。
+        """
+
+        ids = [zone.id for zone in self.zones]
+        if len(ids) != len(set(ids)):
+            raise ValueError("light zones must have unique ids")
+        return self
 
 
 class DeviceCapabilityProfile(BaseModel):
@@ -257,6 +427,7 @@ class DeviceCapabilityProfile(BaseModel):
     touch: TouchCapability | None = None
     rotary: RotaryCapability | None = None
     light: LightCapability | None = None
+    display_brightness: DisplayBrightnessCapability | None = None
     safe_action_levels: frozenset[SafeActionLevel] = Field(
         default_factory=lambda: frozenset({SafeActionLevel.OBSERVE})
     )
@@ -450,8 +621,39 @@ _BUILT_IN_DEVICE_PROFILES = MappingProxyType(
                 has_swipe=True,
                 notes=("Touch coordinates are decoded from N4 Pro touch-bar packets.",),
             ),
-            rotary=RotaryCapability(count=4, has_press=True),
-            light=LightCapability(has_rgb_led=True),
+            rotary=RotaryCapability(
+                controls=tuple(
+                    RotaryControlCapability(
+                        id=f"knob_{index}",
+                        supports_rotate=True,
+                        supports_press=True,
+                    )
+                    for index in range(1, 5)
+                )
+            ),
+            light=LightCapability(
+                has_rgb_led=True,
+                led_count=4,
+                zones=(
+                    LightZoneCapability(
+                        id="rotary_ring_group",
+                        addressability=LightAddressability.GROUP,
+                        associated_control_ids=(
+                            "knob_1",
+                            "knob_2",
+                            "knob_3",
+                            "knob_4",
+                        ),
+                        supports_color=True,
+                        supports_brightness=True,
+                        supports_breathe=True,
+                    ),
+                ),
+            ),
+            display_brightness=DisplayBrightnessCapability(
+                supports_set=True,
+                scope="device_global",
+            ),
             safe_action_levels=_RICH_CONTEXT_ACTIONS,
             requires_single_session_composite_write=True,
             known_limitations=(
@@ -482,7 +684,16 @@ _BUILT_IN_DEVICE_PROFILES = MappingProxyType(
                 format="JPEG",
                 notes=("Background surface exists, but touch-point input is not modeled.",),
             ),
-            rotary=RotaryCapability(count=3, has_press=True),
+            rotary=RotaryCapability(
+                controls=tuple(
+                    RotaryControlCapability(
+                        id=f"knob_{index}",
+                        supports_rotate=True,
+                        supports_press=True,
+                    )
+                    for index in range(1, 4)
+                )
+            ),
             safe_action_levels=_LOW_RISK_ACTIONS,
         ),
         "mirabox.k1pro": _profile(
@@ -491,7 +702,16 @@ _BUILT_IN_DEVICE_PROFILES = MappingProxyType(
             family=ProfileFamily.KEYBOARD_COMPANION,
             key_count=6,
             key_image=KeyImageCapability(size=(64, 64), format="JPEG"),
-            rotary=RotaryCapability(count=3, has_press=True),
+            rotary=RotaryCapability(
+                controls=tuple(
+                    RotaryControlCapability(
+                        id=f"knob_{index}",
+                        supports_rotate=True,
+                        supports_press=True,
+                    )
+                    for index in range(1, 4)
+                )
+            ),
             light=LightCapability(has_keyboard_backlight=True),
             safe_action_levels=_LOW_RISK_ACTIONS,
             known_limitations=(
@@ -530,8 +750,14 @@ _BUILT_IN_DEVICE_PROFILES = MappingProxyType(
                 max_recommended_fps=10,
             ),
             rotary=RotaryCapability(
-                count=2,
-                has_press=False,
+                controls=tuple(
+                    RotaryControlCapability(
+                        id=f"knob_{index}",
+                        supports_rotate=True,
+                        supports_press=False,
+                    )
+                    for index in range(1, 3)
+                ),
                 notes=("Vendored SDK exposes rotation events only.",),
             ),
             light=LightCapability(has_rgb_led=True, led_count=6),

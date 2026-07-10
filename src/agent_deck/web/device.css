@@ -33,6 +33,7 @@
   --n4pro-rail-left: 6.2%;
   --n4pro-rail-right: 7.2%;
   --n4pro-led-color: 111, 213, 255;
+  --n4pro-led-opacity: 0.9;
 }
 
 .n4-pro::before {
@@ -338,7 +339,7 @@
     0 0 0 1px rgba(var(--n4pro-led-color), 0.18),
     0 0 14px rgba(var(--n4pro-led-color), 0.48),
     0 0 34px rgba(var(--n4pro-led-color), 0.34);
-  opacity: 0.9;
+  opacity: var(--n4pro-led-opacity);
   pointer-events: none;
 }
 
@@ -377,6 +378,15 @@
   align-items: center;
 }
 
+.knob-strip.breathing .led {
+  animation: n4pro-led-breathe 3.6s ease-in-out infinite;
+}
+
+@keyframes n4pro-led-breathe {
+  0%, 100% { opacity: 0.24; }
+  50% { opacity: var(--n4pro-led-opacity); }
+}
+
 .knob-cell {
   position: relative;
   display: grid;
@@ -386,4 +396,47 @@
   width: 100%;
   height: 100%;
   min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.knob-cell:hover .knob,
+.knob-cell:focus-visible .knob,
+.knob-cell.selected .knob {
+  opacity: 1;
+  border-color: rgba(111, 213, 255, 0.8);
+  box-shadow:
+    0 0 0 2px rgba(111, 213, 255, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.16),
+    0 12px 22px rgba(0, 0, 0, 0.42);
+}
+
+.lighting-control {
+  position: absolute;
+  right: 6.2%;
+  top: 3.4%;
+  bottom: auto;
+  z-index: 3;
+  min-width: 96px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid rgba(111, 213, 255, 0.42);
+  border-radius: 6px;
+  background: rgba(17, 37, 48, 0.92);
+  color: rgba(232, 245, 252, 0.9);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  cursor: pointer;
+}
+
+.lighting-control:hover,
+.lighting-control:focus-visible,
+.lighting-control.selected {
+  border-color: rgba(111, 213, 255, 0.72);
+  color: #eef5fb;
+  background: rgba(29, 58, 70, 0.82);
 }

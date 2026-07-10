@@ -24,6 +24,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from agent_deck.hardware.streamdock_probe import _prepend_sdk_path_from_env
 
 StreamDockInputCallback = Callable[[object, object], None]
+StreamDockN4ProSessionOutputCallback = Callable[[object, bool], str | None]
+StreamDockN4ProBackgroundUpdateProvider = Callable[[], tuple[int, Image.Image | None]]
 
 
 class StreamDockN4ProDeviceLike(Protocol):
@@ -161,6 +163,7 @@ class StreamDockN4ProAnimationResult(BaseModel):
     frames_rendered: int = 0
     key_count: int = 0
     timing_seconds: dict[str, float] = Field(default_factory=dict)
+    session_output_error: str | None = None
     error: str | None = None
 
 
@@ -182,6 +185,7 @@ class StreamDockN4ProPersistentAnimator:
         manager: StreamDockN4ProManagerLike | None = None,
         temp_dir: Path | None = None,
         input_callback: StreamDockInputCallback | None = None,
+        session_output_callback: StreamDockN4ProSessionOutputCallback | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -189,7 +193,8 @@ class StreamDockN4ProPersistentAnimator:
 
         入参：`manager` 是可选设备管理器；`temp_dir` 是临时背景文件目录；
         `input_callback` 是可选 SDK input 回调，会在首次 open/init 后注册到 key 和 touch bar；
-        `sleep`/`monotonic` 用于帧节奏和诊断。
+        `session_output_callback` 在同一已打开会话中应用亮度/灯光等非图像输出；`sleep`/`monotonic`
+        用于帧节奏和诊断。
         返回：无显式返回值。
         错误处理：构造阶段不访问 SDK，不抛硬件错误。
         副作用：仅保存依赖到实例字段。
@@ -198,11 +203,43 @@ class StreamDockN4ProPersistentAnimator:
         self._manager = manager
         self._temp_dir = temp_dir
         self._input_callback = input_callback
+        self._session_output_callback = session_output_callback
+        self._background_update_provider: StreamDockN4ProBackgroundUpdateProvider | None = None
+        self._last_background_revision: int | None = None
         self._sleep = sleep
         self._monotonic = monotonic
         self._device: StreamDockN4ProDeviceLike | None = None
         self._device_type: str | None = None
         self._path: str | None = None
+
+    def set_session_output_callback(
+        self,
+        callback: StreamDockN4ProSessionOutputCallback | None,
+    ) -> None:
+        """设置在每轮 render 的同一 N4 Pro 会话内调用的附加输出回调。
+
+        入参：`callback` 接收 SDK device 与本轮是否刚完成 init；返回 None 或可记录的错误文本。
+        返回：无显式返回值。
+        错误处理：本方法不调用 callback，不在设置阶段访问硬件。
+        副作用：覆盖实例内存中的 callback 引用；下一轮 render 生效。
+        """
+
+        self._session_output_callback = callback
+
+    def set_background_update_provider(
+        self,
+        provider: StreamDockN4ProBackgroundUpdateProvider | None,
+    ) -> None:
+        """设置可在同一帧循环中读取最新 touch bar 背景 revision 的 provider。
+
+        入参：`provider` 返回单调递增 revision 与对应 800x480 图像；None 表示维持调用方传入的
+        初始背景。provider 只能读取 daemon 已缓存的图像，不能直接访问 SDK。
+        返回：无显式返回值。
+        错误处理：设置阶段不调用 provider，因此不会抛 provider 内部异常。
+        副作用：覆盖实例内存 provider；下一轮和当前活跃帧循环的下一帧生效。
+        """
+
+        self._background_update_provider = provider
 
     def __call__(
         self,
@@ -245,11 +282,23 @@ class StreamDockN4ProPersistentAnimator:
         started_at = self._monotonic()
         temp_paths: list[Path] = []
         try:
+            was_open = self._device is not None
             device = self._ensure_open_device(timing=timing, started_at=started_at)
             if isinstance(device, StreamDockN4ProAnimationResult):
                 return device
 
+            session_output_error = self._apply_session_output(
+                device,
+                initialized=not was_open,
+            )
+
             background_result: object | None = None
+            initial_background_revision = self._read_background_revision()
+            if initial_background_revision is not None:
+                revision, provider_image = initial_background_revision
+                if provider_image is not None:
+                    background_image = provider_image
+                self._last_background_revision = revision
             after_open_init = self._monotonic()
             after_background = after_open_init
             if background_image is not None:
@@ -301,8 +350,30 @@ class StreamDockN4ProPersistentAnimator:
             frames_rendered = 0
             playback_started_at = after_static
             next_frame_at = playback_started_at
-            if normalized_frames:
+            if normalized_frames or self._background_update_provider is not None:
                 for frame_index in range(frame_budget):
+                    updated_background_result, background_update_error = (
+                        self._write_pending_background_update(device, temp_paths=temp_paths)
+                    )
+                    if background_update_error is not None:
+                        self.close()
+                        return StreamDockN4ProAnimationResult(
+                            ok=False,
+                            device_type=self._device_type,
+                            path=self._path,
+                            background_result=_stringify_optional(background_result),
+                            frames_rendered=frames_rendered,
+                            key_count=key_count,
+                            error=background_update_error,
+                        )
+                    if updated_background_result is not None:
+                        background_result = updated_background_result
+                    frame_session_output_error = self._apply_session_output(
+                        device,
+                        initialized=False,
+                    )
+                    if frame_session_output_error is not None:
+                        session_output_error = frame_session_output_error
                     for key, paths in normalized_frames.items():
                         frame_path = paths[frame_index % len(paths)]
                         key_result = device.set_key_image(key, str(frame_path))
@@ -353,6 +424,7 @@ class StreamDockN4ProPersistentAnimator:
                 frames_rendered=frames_rendered,
                 key_count=key_count,
                 timing_seconds=timing,
+                session_output_error=session_output_error,
             )
         except Exception as exc:
             self.close()
@@ -379,12 +451,83 @@ class StreamDockN4ProPersistentAnimator:
         self._device = None
         self._device_type = None
         self._path = None
+        self._last_background_revision = None
         if device is None:
             return
         try:
             device.close(notify=False)
         except Exception:
             pass
+
+    def _apply_session_output(
+        self,
+        device: StreamDockN4ProDeviceLike,
+        *,
+        initialized: bool,
+    ) -> str | None:
+        """在当前 open/init 会话中调用可选控制台输出回调。
+
+        入参：`device` 是已打开 N4 Pro；`initialized` 表示本轮刚完成 init，供回调恢复亮度。
+        返回：callback 返回的错误文本，或捕获异常转换后的文本；没有 callback 时为 None。
+        错误处理：callback 的任意异常只记录文本，不能中断背景/按键渲染。
+        副作用：callback 可能写 N4 Pro 亮度或 LED，但不新建 HID 会话。
+        """
+
+        callback = self._session_output_callback
+        if callback is None:
+            return None
+        try:
+            return callback(device, initialized)
+        except Exception as exc:
+            return f"{type(exc).__name__}: {exc}"
+
+    def _read_background_revision(self) -> tuple[int, Image.Image | None] | None:
+        """读取可选 provider 给出的当前背景 revision，并把异常降级为本轮无热更新。
+
+        入参：无；provider 由 daemon 注入，只应返回缓存图像。
+        返回：无 provider 时为 None；provider 正常时为 `(revision, image)`。
+        错误处理：provider 异常在此处吞掉，避免输入侧的缓存问题关闭真实设备会话。
+        副作用：可能读取 daemon 内存图像，不访问 SDK 或文件系统。
+        """
+
+        provider = self._background_update_provider
+        if provider is None:
+            return None
+        try:
+            return provider()
+        except Exception:
+            return None
+
+    def _write_pending_background_update(
+        self,
+        device: StreamDockN4ProDeviceLike,
+        *,
+        temp_paths: list[Path],
+    ) -> tuple[object | None, str | None]:
+        """在活跃帧循环内下发 revision 已变化的完整背景图。
+
+        入参：`device` 是当前已 open/init 的 N4 Pro；`temp_paths` 收集本轮临时 JPEG 以便统一清理。
+        返回：未变化时返回 `(None, None)`；成功时返回 SDK 结果；provider/SDK 异常返回错误文本。
+        错误处理：provider 无图或读取异常保持当前背景；SDK 写入失败返回错误供调用方关闭会话并记录。
+        副作用：revision 变化时调用一次 `set_frame_background`，不创建第二个 HID 会话。
+        """
+
+        pending = self._read_background_revision()
+        if pending is None:
+            return None, None
+        revision, image = pending
+        if revision == self._last_background_revision or image is None:
+            return None, None
+        try:
+            background_path = _save_temp_jpeg(image, temp_dir=self._temp_dir)
+            temp_paths.append(background_path)
+            result = device.set_frame_background(str(background_path))
+        except Exception as exc:
+            return None, f"set_frame_background update failed: {type(exc).__name__}: {exc}"
+        if result == -1:
+            return result, "set_frame_background update failed: SDK returned -1"
+        self._last_background_revision = revision
+        return result, None
 
     def _ensure_open_device(
         self,

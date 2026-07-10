@@ -40,6 +40,41 @@ tmux 脚本会在 detached session `agent-deckd` 中启动 daemon，方便随时
 并默认执行真实硬件渲染。当前配置里的默认设备 profile 是 `n4pro`，所以 Codex 状态按钮动画
 和底部 quota 背景会在同一次硬件写入里共存。
 
+## N4 Pro 配置页
+
+打开 <http://127.0.0.1:8765/> 可以配置主按键、4 个旋钮和控制台灯光。所有编辑先只改变网页中的
+硬件预览；只有点击“保存并应用”后，daemon 才会共同保存主按键和旋钮布局，并在下一次统一 N4 Pro
+renderer tick 中下发。
+
+- 每个旋钮只配置“左右旋转”用途，可重复绑定或保持暂不设定；按下语义由用途隐式决定。
+- 旋转动作包括 virtual panel/内容轮换、输出/输入音量、系统显示器亮度和控制台整体亮度；连续动作
+  固定每格 `2%`。
+- 输出音量旋钮按下会切换输出静音，输入音量旋钮按下会切换麦克风静音；其他旋钮按下不执行动作。系统音频操作会先读取当前状态。
+- 手动 panel 顺序为 `Brand -> Quota -> Usage -> Brand`；Quota 内容切换 5h/Week，Usage 内容
+  切换 Day/Week/Month/All；Brand 内容切换保持安静无操作。
+- N4 Pro 当前的 4 个旋钮灯圈是一个 `rotary_ring_group`，不能分别设置颜色。配置页只提供关闭或
+  基础色和可选柔和呼吸；呼吸使用同一 LED group 的亮度周期，最终平滑度仍需真机确认。
+
+旋钮配置默认保存在：
+
+```text
+~/Library/Application Support/AgentDeck/n4pro-rotary-layout.json
+```
+
+可以用 `AGENT_DECK_N4PRO_ROTARY_LAYOUT` 覆盖这个路径，便于测试或隔离不同本机配置。
+
+真实硬件 smoke 前，可先用下面命令启动纯 GUI/fake 模式，它不会接管 N4 Pro：
+
+```bash
+scripts/agent-deckd-tmux.sh restart --disable-hardware-renderer
+```
+
+恢复真实 N4 Pro renderer：
+
+```bash
+scripts/agent-deckd-tmux.sh restart
+```
+
 `run.sh` 的 PID 和日志默认写到：
 
 ```text

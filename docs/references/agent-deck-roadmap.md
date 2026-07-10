@@ -147,13 +147,16 @@ flowchart LR
     渲染到底部 N4 Pro touch-bar viewport，并默认交给真实硬件 renderer 下发。这个 viewport
     是 Agent Deck 的 logical panel，不是 quota 专用屏；第一批 panel kind 为 `quota`、
     `tokens`、`pets`、`message`，其中 `message` 承载审批详情、host context 或系统提示等复杂文字。
-    当前真实 touch bar tap/click 只在已有实质内容的 `quota` 和 `tokens` 之间切换；`pets` 和
-    `message` 待内容接入后再加入默认切换顺序。daemon 默认启用 token usage poller，tokens 面板通过
+    当前手动轮换顺序为 `brand -> quota -> tokens -> brand`；`pets` 和 `message` 仍不进入普通
+    轮换。daemon 默认启用 token usage poller，tokens 面板通过
     `ccusage codex daily --compact --json` 读取 Codex token usage，聚合 today/week/month/all。
     `/logical-panel/input` 提供归一化 panel 事件入口，`/hardware/input` 提供低层 `HardwareInput`
-    入口并把 N4 Pro touch point / knob4 rotate 映射到 panel event；默认 persistent N4 Pro renderer
-    在同一 SDK 设备会话中注册 key/touch callbacks，旋钮 4 在真实链路中累计两个同向 rotate
-    事件后切换一个统计周期，避免一格旋转就快速跳变。
+    入口。旋钮事件按用户保存的 per-control rotate binding 映射为 intent；按下静音语义从输出/输入
+    音量用途隐式派生，不再硬编码为
+    knob 4 token 周期切换；Quota 内容切换 5h/Week，Usage 内容切换 Day/Week/Month/All，Brand
+    内容切换安静 no-op。连续系统控制固定每格 2%。默认 persistent N4 Pro renderer 在同一 SDK
+    设备会话中注册 key/touch callbacks，并同时恢复控制台整体亮度、应用唯一 `rotary_ring_group`
+    基础色，避免多次 `init()` 造成清屏或亮度复位。
     `/status` 的 `streamdock_input.recent_events` 和 `interaction.recent` 保留最近输入与
     业务 intent/action 的小型 ring buffer，用于真实硬件现场调试按键序列。
     实测 N4 Pro 的 10 个主物理按键在 SDK button event 中上报为 `key=11..20`，

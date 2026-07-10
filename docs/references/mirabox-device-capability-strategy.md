@@ -90,6 +90,10 @@ Agent Deck 当前已经在 N4 Pro 上验证了按键、背景屏和 quota virtua
   background 的底部 viewport，这是一种已验证的 composite 写法；后续 profile 层应继续把
   “逻辑窗口”与“具体下发 surface”分开，以便选择 secondary screen slot、touch display viewport
   或其他设备 surface。
+- N4 Pro SDK 没有局部 touch-bar 绘制、文字 overlay 或原生 OSD API。连续旋钮反馈不能等待下一次
+  renderer tick，也不能为此另开一个 HID 会话；应由 persistent renderer 在既有帧循环中检测背景
+  revision，并用同一 `set_frame_background` 路径合并下发最新完整背景。secondary screen soft-key
+  虽可写独立 `176x112` 图像，但未完成物理布局 smoke 前不得拿来替代 touch-bar HUD。
 
 ## 设备能力 profile
 
@@ -210,9 +214,15 @@ Agent Deck 当前已经在 N4 Pro 上验证了按键、背景屏和 quota virtua
   当前 quota 画到 800x480 background 的底部 viewport，是为了与主按键图层共存并规避多次
   SDK `init()` 清屏；这不妨碍后续把同一逻辑窗口映射到 secondary screen soft-key slot 或
   touch display 的局部 viewport。
-- N4 Pro 上 logical panel 的跨面板切换默认由 touch bar 自身的 tap/click 事件承载，避免占用下方
-  旋钮。旋钮 1 可用于确认，旋钮 2 可用于面板内滚动，tokens 面板中旋钮 4 可用于切换统计周期；
-  具体事件仍应先进入 intent，不直接执行动作。
+- N4 Pro 的 rotary 不再有固定产品角色。每个物理位置都按 `supports_rotate`、`supports_press`
+  公开能力，用户可把任意旋钮配置为 virtual panel/内容轮换、音量或亮度动作，并可让多个位置复用
+  同一动作；当前产品不把按下公开成独立配置，输出/输入音量的按下分别隐式切换输出/麦克风静音，其他
+  用途按下无动作。具体事件仍应先进入 intent，不直接执行动作。
+- 手动 logical panel 固定轮换 `Brand -> Quota -> Usage -> Brand`；内容轮换只作用于 Quota 的
+  5h/Week 和 Usage 的 Day/Week/Month/All，Brand 保持安静 no-op。
+- 当前 N4 Pro SDK 的高层 RGB 调用只能作为一个 `rotary_ring_group` 使用，不能把 4 个物理灯圈伪装成
+  独立颜色。基础色、group LED 亮度周期和整体控制台亮度在 persistent renderer 的同一 open/init
+  会话中写入；`init()` 后必须恢复用户已保存的控制台亮度。
 
 ### `keyboard_companion`
 
@@ -452,9 +462,17 @@ background_size
 background_format
 has_touch_points
 has_swipe
-rotary_count
-has_rotary_press
-has_rgb_led
+rotary_controls[].id
+rotary_controls[].supports_rotate
+rotary_controls[].supports_press
+light_zones[].id
+light_zones[].addressability
+light_zones[].associated_control_ids
+light_zones[].supports_color
+light_zones[].supports_brightness
+light_zones[].supports_breathe
+display_brightness.supports_set
+display_brightness.scope
 has_keyboard_backlight
 supports_key_animation
 supports_background_animation

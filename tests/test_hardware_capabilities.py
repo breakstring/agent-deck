@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from agent_deck.hardware.capabilities import (
     DeviceCapabilityProfile,
+    LightAddressability,
     ProfileFamily,
     SafeActionLevel,
     built_in_device_profiles,
@@ -42,8 +43,30 @@ def test_n4pro_profile_expresses_rich_touch_rotary_capabilities() -> None:
     assert profile.rotary is not None
     assert profile.rotary.count == 4
     assert profile.rotary.has_press is True
+    assert tuple(control.id for control in profile.rotary.controls) == (
+        "knob_1",
+        "knob_2",
+        "knob_3",
+        "knob_4",
+    )
+    assert all(control.supports_rotate for control in profile.rotary.controls)
+    assert all(control.supports_press for control in profile.rotary.controls)
     assert profile.light is not None
     assert profile.light.has_rgb_led is True
+    assert len(profile.light.zones) == 1
+    assert profile.light.zones[0].id == "rotary_ring_group"
+    assert profile.light.zones[0].addressability == LightAddressability.GROUP
+    assert profile.light.zones[0].associated_control_ids == (
+        "knob_1",
+        "knob_2",
+        "knob_3",
+        "knob_4",
+    )
+    assert profile.light.zones[0].supports_color is True
+    assert profile.light.zones[0].supports_breathe is True
+    assert profile.display_brightness is not None
+    assert profile.display_brightness.supports_set is True
+    assert profile.display_brightness.scope == "device_global"
     assert profile.requires_single_session_composite_write is True
     assert profile.supports_action(SafeActionLevel.DECIDE) is True
     assert profile.supports_action(SafeActionLevel.INPUT) is False

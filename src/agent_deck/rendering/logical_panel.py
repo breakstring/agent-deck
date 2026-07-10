@@ -25,6 +25,7 @@ class PanelKind(StrEnum):
     副作用：无；声明枚举不访问外部资源。
     """
 
+    BRAND = "brand"
     QUOTA = "quota"
     TOKENS = "tokens"
     PETS = "pets"
@@ -32,6 +33,7 @@ class PanelKind(StrEnum):
 
 
 PANEL_KIND_ORDER: tuple[PanelKind, ...] = (
+    PanelKind.BRAND,
     PanelKind.QUOTA,
     PanelKind.TOKENS,
     PanelKind.PETS,
@@ -40,14 +42,48 @@ PANEL_KIND_ORDER: tuple[PanelKind, ...] = (
 """Agent Deck 当前已建模的 logical panel 类型稳定顺序。"""
 
 ACTIVE_PANEL_KIND_ORDER: tuple[PanelKind, ...] = (
+    PanelKind.BRAND,
     PanelKind.QUOTA,
     PanelKind.TOKENS,
 )
-"""touch bar 点击切换真实 logical panel 时当前开放的稳定顺序。
+"""手动轮换真实 logical panel 时当前开放的稳定顺序。
 
-`pets` 和 `message` 已进入内容模型，但尚未接入真实展示内容。真实链路先只暴露
-`quota` 与 `tokens`，避免用户切到空占位面板。
+Brand 是正常待机与归位面板；`pets` 和 `message` 不进入手动轮换，后续只能由明确的上下文
+覆盖策略展示，避免用户切到空占位或审批内容。
 """
+
+
+class PanelContentDirection(StrEnum):
+    """描述 virtual panel 或 panel 内内容的一次环形切换方向。
+
+    入参：枚举值由配置驱动的旋钮 intent 转换而来。
+    返回：作为 panel selection reducer 的方向约束。
+    错误处理：未知字符串由 Pydantic/Enum 拒绝。
+    副作用：声明枚举不执行输入或渲染。
+    """
+
+    PREVIOUS = "previous"
+    NEXT = "next"
+
+
+class QuotaWindow(StrEnum):
+    """描述 Quota virtual panel 当前展示的订阅窗口。
+
+    入参：枚举值来自 `PanelSelection` 的内容轮换状态。
+    返回：作为 quota renderer 的稳定窗口标识。
+    错误处理：未知字符串由 Pydantic/Enum 拒绝。
+    副作用：无。
+    """
+
+    PRIMARY = "primary"
+    SECONDARY = "secondary"
+
+
+QUOTA_WINDOW_ORDER: tuple[QuotaWindow, ...] = (
+    QuotaWindow.PRIMARY,
+    QuotaWindow.SECONDARY,
+)
+"""Quota panel 内容切换时采用的 5 小时、周窗口固定顺序。"""
 
 
 class PanelInputRole(StrEnum):
@@ -120,7 +156,8 @@ class PanelSelection(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    active_kind: PanelKind = PanelKind.QUOTA
+    active_kind: PanelKind = PanelKind.BRAND
+    quota_window: QuotaWindow = QuotaWindow.PRIMARY
     token_period: CodexTokenPeriod = CodexTokenPeriod.TODAY
 
 
@@ -372,51 +409,73 @@ def apply_panel_input(
     """
 
     if event == PanelInputEvent.TOUCH_TAP:
-        return selection.model_copy(
-            update={
-                "active_kind": _next_active_panel_kind(selection.active_kind)
-            }
-        )
-
-    if selection.active_kind != PanelKind.TOKENS:
-        return selection
+        return cycle_virtual_panel(selection, direction=PanelContentDirection.NEXT)
 
     if event == PanelInputEvent.KNOB_4_ROTATE_RIGHT:
-        return selection.model_copy(
-            update={
-                "token_period": _next_cyclic_value(
-                    TOKEN_PERIOD_ORDER,
-                    selection.token_period,
-                    step=1,
-                )
-            }
-        )
+        return cycle_panel_content(selection, direction=PanelContentDirection.NEXT)
     if event == PanelInputEvent.KNOB_4_ROTATE_LEFT:
-        return selection.model_copy(
-            update={
-                "token_period": _next_cyclic_value(
-                    TOKEN_PERIOD_ORDER,
-                    selection.token_period,
-                    step=-1,
-                )
-            }
-        )
+        return cycle_panel_content(selection, direction=PanelContentDirection.PREVIOUS)
 
     return selection
 
 
-def _next_active_panel_kind(current: PanelKind) -> PanelKind:
-    """返回真实链路当前开放的下一个 panel kind。
+def cycle_virtual_panel(
+    selection: PanelSelection,
+    *,
+    direction: PanelContentDirection,
+) -> PanelSelection:
+    """按固定 Brand、Quota、Usage 顺序切换手动 virtual panel。
 
-    入参：`current` 是当前 active kind，可能来自旧状态或手动构造。
-    返回：`ACTIVE_PANEL_KIND_ORDER` 中的下一个值；若当前值尚未开放，则回到 `quota`。
-    错误处理：无。
-    副作用：无。
+    入参：`selection` 是当前不可变选择状态；`direction` 指定上一个或下一个面板。
+    返回：active kind 更新后的新 selection；非手动 panel 会回到 Brand 再移动。
+    错误处理：无；未知当前 kind 按安全归位规则处理。
+    副作用：无；不渲染、不访问硬件。
     """
 
+    step = 1 if direction == PanelContentDirection.NEXT else -1
+    current = selection.active_kind
     if current not in ACTIVE_PANEL_KIND_ORDER:
-        return ACTIVE_PANEL_KIND_ORDER[0]
-    return _next_cyclic_value(ACTIVE_PANEL_KIND_ORDER, current, step=1)
+        current = PanelKind.BRAND
+    return selection.model_copy(
+        update={"active_kind": _next_cyclic_value(ACTIVE_PANEL_KIND_ORDER, current, step=step)}
+    )
+
+
+def cycle_panel_content(
+    selection: PanelSelection,
+    *,
+    direction: PanelContentDirection,
+) -> PanelSelection:
+    """切换当前面板内部的内容维度，不跨越到其他 virtual panel。
+
+    入参：`selection` 是当前选择状态；`direction` 指定向前或向后环形移动。
+    返回：Quota 更新 5h/Week 窗口、Usage 更新统计周期；Brand 和其他 panel 原样返回。
+    错误处理：无；内容缺省值已由 Pydantic 枚举保证。
+    副作用：无；不执行系统或硬件动作。
+    """
+
+    step = 1 if direction == PanelContentDirection.NEXT else -1
+    if selection.active_kind == PanelKind.QUOTA:
+        return selection.model_copy(
+            update={
+                "quota_window": _next_cyclic_value(
+                    QUOTA_WINDOW_ORDER,
+                    selection.quota_window,
+                    step=step,
+                )
+            }
+        )
+    if selection.active_kind == PanelKind.TOKENS:
+        return selection.model_copy(
+            update={
+                "token_period": _next_cyclic_value(
+                    TOKEN_PERIOD_ORDER,
+                    selection.token_period,
+                    step=step,
+                )
+            }
+        )
+    return selection
 
 
 def _default_rotary_controls() -> tuple[PanelControlHint, ...]:

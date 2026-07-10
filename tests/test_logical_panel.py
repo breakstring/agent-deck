@@ -20,12 +20,15 @@ from agent_deck.adapters.codex_tokens import (
 )
 from agent_deck.rendering.logical_panel import (
     LogicalPanelPlan,
+    PanelContentDirection,
     PanelInputEvent,
     PanelInputIntent,
     PanelInputRole,
     PanelKind,
     PanelSelection,
     apply_panel_input,
+    cycle_panel_content,
+    cycle_virtual_panel,
     message_panel_plan,
     pets_panel_plan,
     quota_panel_plan,
@@ -43,11 +46,53 @@ def test_panel_kind_matches_initial_product_categories() -> None:
     """
 
     assert {kind.value for kind in PanelKind} == {
+        "brand",
         "quota",
         "tokens",
         "pets",
         "message",
     }
+
+
+def test_manual_panel_cycle_includes_brand_and_returns_to_brand() -> None:
+    """手动轮换应遵守 Brand、Quota、Usage 的固定闭环顺序。
+
+    入参：无；测试从 Brand selection 连续向前推进。
+    返回：无返回值；断言通过表示 Brand 是正常待机面板而不是临时占位。
+    错误处理：顺序或环回错误时由 pytest 报告。
+    副作用：仅创建内存模型。
+    """
+
+    selection = PanelSelection(active_kind=PanelKind.BRAND)
+
+    selection = cycle_virtual_panel(selection, direction=PanelContentDirection.NEXT)
+    assert selection.active_kind == PanelKind.QUOTA
+    selection = cycle_virtual_panel(selection, direction=PanelContentDirection.NEXT)
+    assert selection.active_kind == PanelKind.TOKENS
+    selection = cycle_virtual_panel(selection, direction=PanelContentDirection.NEXT)
+    assert selection.active_kind == PanelKind.BRAND
+
+
+def test_panel_content_cycle_changes_quota_and_tokens_but_brand_is_silent_noop() -> None:
+    """内容轮换只作用于 Quota/Usage，Brand 必须保持安静无变化。
+
+    入参：无；测试分别构造 Brand、Quota 和 Tokens selection。
+    返回：无返回值；断言通过表示一个绑定不会隐式切换到别的 virtual panel。
+    错误处理：窗口/周期或 Brand no-op 语义错误时由 pytest 报告。
+    副作用：仅创建内存模型。
+    """
+
+    brand = PanelSelection(active_kind=PanelKind.BRAND)
+    quota = PanelSelection(active_kind=PanelKind.QUOTA)
+    tokens = PanelSelection(active_kind=PanelKind.TOKENS)
+
+    assert cycle_panel_content(brand, direction=PanelContentDirection.NEXT) == brand
+    assert cycle_panel_content(
+        quota, direction=PanelContentDirection.NEXT
+    ).quota_window == "secondary"
+    assert cycle_panel_content(
+        tokens, direction=PanelContentDirection.NEXT
+    ).token_period == CodexTokenPeriod.WEEK
 
 
 def test_quota_panel_plan_preserves_quota_semantics_and_rotary_controls() -> None:
@@ -153,10 +198,10 @@ def test_panel_plan_is_frozen_and_rejects_empty_content() -> None:
 
 
 def test_touch_tap_cycles_between_active_logical_panels() -> None:
-    """touch bar 点击应只在当前真实开放的 logical panel 之间循环切换。
+    """touch bar 点击应在 Brand、Quota、Usage 三个手动面板之间循环切换。
 
     入参：无；测试内从默认 selection 开始连续应用 touch tap。
-    返回：无返回值；断言通过代表空占位 panel 不进入真实切换链路。
+    返回：无返回值；断言通过代表 Brand 是手动轮换的一部分，空占位 panel 不进入切换链路。
     错误处理：切换顺序或环回错误时由 pytest 报告。
     副作用：仅创建内存模型。
     """
@@ -164,28 +209,29 @@ def test_touch_tap_cycles_between_active_logical_panels() -> None:
     selection = PanelSelection()
 
     selection = apply_panel_input(selection, PanelInputEvent.TOUCH_TAP)
+    assert selection.active_kind == PanelKind.QUOTA
+    selection = apply_panel_input(selection, PanelInputEvent.TOUCH_TAP)
     assert selection.active_kind == PanelKind.TOKENS
     selection = apply_panel_input(selection, PanelInputEvent.TOUCH_TAP)
-    assert selection.active_kind == PanelKind.QUOTA
+    assert selection.active_kind == PanelKind.BRAND
 
 
-def test_knob4_changes_token_period_only_on_tokens_panel() -> None:
-    """第 4 旋钮应只在 tokens 面板内切换统计周期。
+def test_knob4_cycles_quota_window_or_token_period_without_changing_panel() -> None:
+    """旧 knob 4 兼容事件应在当前面板内切换内容，不应隐式切面板。
 
     入参：无；测试内分别在 quota 和 tokens 面板应用 knob4 事件。
-    返回：无返回值；断言通过代表一格旋转事件对应一个周期切换。
-    错误处理：非 tokens 面板被误改或周期环回错误时由 pytest 报告。
+    返回：无返回值；断言通过代表 Quota/Usage 分别切换自身内容，Brand 保持 no-op。
+    错误处理：窗口/周期或面板类型被错误改动时由 pytest 报告。
     副作用：仅创建内存模型。
     """
 
     quota_selection = PanelSelection(active_kind=PanelKind.QUOTA)
-    assert (
-        apply_panel_input(
-            quota_selection,
-            PanelInputEvent.KNOB_4_ROTATE_RIGHT,
-        )
-        == quota_selection
+    quota_selection = apply_panel_input(
+        quota_selection,
+        PanelInputEvent.KNOB_4_ROTATE_RIGHT,
     )
+    assert quota_selection.active_kind == PanelKind.QUOTA
+    assert quota_selection.quota_window == "secondary"
 
     token_selection = PanelSelection(
         active_kind=PanelKind.TOKENS,

@@ -25,6 +25,7 @@ from agent_deck.actions.app_icon_cache import AppIconCache
 from agent_deck.actions.apps import LocalAppActionResult, LocalAppInfo
 from agent_deck.actions.focus import FocusActionResult
 from agent_deck.actions.local_targets import LocalTargetActionResult
+from agent_deck.actions.system_controls import InMemorySystemControlExecutor
 from agent_deck.actions.url_icon_cache import UrlIconCache
 from agent_deck.adapters.codex_app_state import CodexAppActiveSession
 from agent_deck.adapters.codex_quota import CodexQuotaSnapshot
@@ -46,6 +47,8 @@ from agent_deck.rendering.key_surface import (
     default_n4pro_key_layout,
 )
 from agent_deck.rendering.layout import build_layout_plan
+from agent_deck.rendering.logical_panel import PanelKind
+from agent_deck.rendering.rotary_surface import default_n4pro_rotary_layout
 from agent_deck.server.app import DaemonPollerConfig, create_app
 
 
@@ -532,6 +535,212 @@ def test_codex_app_state_poller_applies_active_sessions() -> None:
     assert status["layout"]["keys"][5]["visual"]["variant_id"] == "working"
 
 
+def test_rotary_layout_api_saves_group_lighting_and_exposes_profile_capabilities() -> None:
+    """旋钮 GUI API 应保存完整 layout，并把 N4 Pro 灯光限制作为一个 group 暴露。
+
+    入参：无；测试先读取默认 layout，再提交颜色灯光草稿作为已应用配置。
+    返回：无返回值；断言通过表示 GUI 可以据 API 正确同步四个预览灯圈，不会推断 per-control LED。
+    错误处理：HTTP body、capability 或 layout 回显错误时由 pytest 报告。
+    副作用：只修改测试 daemon 的内存 layout，不访问真实 N4 Pro。
+    """
+
+    layout = default_n4pro_rotary_layout().model_dump(mode="json")
+    layout["lighting"] = {"mode": "color", "color": "#35c9ff"}
+    with TestClient(create_app()) as client:
+        initial = client.get("/ui/rotary-layout")
+        apply_response = client.put("/ui/rotary-layout", json=layout)
+        capabilities = client.get("/ui/control-capabilities")
+
+    assert initial.status_code == 200
+    assert initial.json()["source"] == "default"
+    assert apply_response.status_code == 200
+    assert apply_response.json()["rotary_layout"]["layout"]["lighting"] == {
+        "mode": "color",
+        "color": "#35C9FF",
+        "breathe": False,
+    }
+    zones = capabilities.json()["device_profile"]["light"]["zones"]
+    assert zones == [
+        {
+            "id": "rotary_ring_group",
+            "addressability": "group",
+                "associated_control_ids": ["knob_1", "knob_2", "knob_3", "knob_4"],
+                "supports_color": True,
+                "supports_brightness": True,
+                "supports_breathe": True,
+        }
+    ]
+
+
+def test_configuration_api_applies_key_and_rotary_layouts_in_one_request() -> None:
+    """保存并应用 API 应同时接受主按键和旋钮草稿，而不是让 GUI 发两次独立请求。
+
+    入参：无；测试提交默认 key layout 和修改过的 rotary layout。
+    返回：无返回值；断言通过表示 Web 只在用户按保存后共同更新两个 applied state。
+    错误处理：HTTP 路由、嵌套模型或响应回显不一致时由 pytest 报告。
+    副作用：只更新测试 daemon 内存，不访问真实硬件。
+    """
+
+    rotary = default_n4pro_rotary_layout().model_dump(mode="json")
+    rotary["controls"][1]["rotate_action"] = "adjust_output_volume"
+    with TestClient(create_app()) as client:
+        response = client.put(
+            "/ui/configuration",
+            json={
+                "key_layout": default_n4pro_key_layout().model_dump(mode="json"),
+                "rotary_layout": rotary,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["key_layout"]["layout"]["keys"][0]["index"] == 0
+    assert response.json()["rotary_layout"]["layout"]["controls"][1]["rotate_action"] == (
+        "adjust_output_volume"
+    )
+
+
+def test_rotary_input_executes_confirmed_system_control_and_renders_transient_hud() -> None:
+    """已应用旋钮 binding 应通过 executor 执行并显示短暂 HUD。
+
+    入参：无；测试把旋钮 2 绑定到输出音量，并注入内存 executor。
+    返回：无返回值；断言通过表示 router 不直接写系统，只有 executor 确认成功后才显示 value HUD。
+    错误处理：binding、固定 2% 步进、反馈来源或状态诊断错误时由 pytest 报告。
+    副作用：只修改 fake executor 和测试 daemon 内存。
+    """
+
+    executor = InMemorySystemControlExecutor(output_volume_percent=48)
+    layout = default_n4pro_rotary_layout().model_dump(mode="json")
+    layout["controls"][1]["rotate_action"] = "adjust_output_volume"
+    with TestClient(create_app(system_control_executor=executor)) as client:
+        client.put("/ui/rotary-layout", json=layout)
+        response = client.post(
+            "/hardware/input",
+            json=_hardware_input(
+                kind="knob",
+                index=2,
+                value={"action": "rotate", "direction": "right"},
+            ),
+        )
+        status = client.get("/status").json()
+
+    assert response.status_code == 200
+    assert response.json()["handled"] is True
+    assert response.json()["action"]["value_percent"] == 50
+    assert executor.output_volume_percent == 50
+    assert status["logical_panel"]["touchscreen_image_source"] == "control_feedback:value"
+    assert status["logical_panel"]["control_feedback"]["value"] == "50%"
+
+
+def test_configured_streamdock_content_rotation_uses_each_detent_without_accumulation() -> None:
+    """配置驱动的 StreamDock 内容旋转应每格切换一次，不再等待两格累计。
+
+    入参：无；测试把 runtime 放入 Usage panel，并直接传入默认已配置 knob 4 右旋事件。
+    返回：无返回值；断言通过表示 token 周期从 Day 立即进入 Week。
+    错误处理：累计阈值仍为两格或 selection 变化错误时由 pytest 报告。
+    副作用：只修改测试 daemon 内存状态。
+    """
+
+    app = create_app()
+    runtime = app.state.runtime
+    runtime.logical_panel_selection = runtime.logical_panel_selection.model_copy(
+        update={"active_kind": PanelKind.TOKENS}
+    )
+
+    response = runtime.apply_streamdock_input_event(
+        _sdk_event(
+            event_type="knob_rotate",
+            knob_id="knob_4",
+            direction="right",
+        )
+    )
+
+    assert response["handled"] is True
+    assert response["selection"]["token_period"] == "week"
+
+
+def test_n4pro_session_output_restores_applied_brightness_and_writes_one_group_color() -> None:
+    """N4 Pro init 后应在同一会话恢复亮度，并只写一次 group LED 颜色。
+
+    入参：无；测试注入最小 SDK-like device，并提交非默认控制台亮度和基础色。
+    返回：无返回值；断言通过表示 renderer 不需要额外 open/init 才能更新灯光或亮度。
+    错误处理：SDK 方法调用参数或 applied output 缓存错误时由 pytest 报告。
+    副作用：只修改 fake device 和测试 runtime 内存。
+    """
+
+    class FakeDevice:
+        """记录 session output SDK 写入的最小替身。
+
+        入参：无。
+        返回：可被 runtime 调用的 fake 设备。
+        错误处理：无。
+        副作用：保存调用记录。
+        """
+
+        def __init__(self) -> None:
+            """初始化空调用记录。
+
+            入参：无。
+            返回：无显式返回值。
+            错误处理：无。
+            副作用：创建内存列表。
+            """
+
+            self.calls: list[tuple[str, tuple[int, ...]]] = []
+
+        def set_brightness(self, percent: int) -> int:
+            """记录控制台亮度写入。
+
+            入参：`percent` 是整体亮度。
+            返回：0 表示成功。
+            错误处理：无。
+            副作用：追加调用记录。
+            """
+
+            self.calls.append(("brightness", (percent,)))
+            return 0
+
+        def set_led_color(self, red: int, green: int, blue: int) -> int:
+            """记录唯一旋钮灯圈组 RGB 写入。
+
+            入参：RGB 三通道整数。
+            返回：0 表示成功。
+            错误处理：无。
+            副作用：追加调用记录。
+            """
+
+            self.calls.append(("led", (red, green, blue)))
+            return 0
+
+        def set_led_brightness(self, percent: int) -> int:
+            """记录唯一旋钮灯圈组亮度写入。
+
+            入参：`percent` 是 0 到 100 的灯圈组亮度。
+            返回：0 表示成功。
+            错误处理：无。
+            副作用：追加调用记录。
+            """
+
+            self.calls.append(("led_brightness", (percent,)))
+            return 0
+
+    layout = default_n4pro_rotary_layout().model_dump(mode="json")
+    layout["console_brightness_percent"] = 64
+    layout["lighting"] = {"mode": "color", "color": "#35c9ff"}
+    app = create_app()
+    runtime = app.state.runtime
+    runtime.update_rotary_layout(type(default_n4pro_rotary_layout()).model_validate(layout))
+    device = FakeDevice()
+
+    assert runtime.apply_n4pro_session_outputs(device, initialized=True) is None
+    assert runtime.apply_n4pro_session_outputs(device, initialized=False) is None
+
+    assert device.calls == [
+        ("brightness", (64,)),
+        ("led", (53, 201, 255)),
+        ("led_brightness", (100,)),
+    ]
+
+
 def test_codex_quota_poller_updates_status_and_touchscreen_frame() -> None:
     """Verify daemon quota poller refreshes snapshot and virtual touch panel.
 
@@ -642,7 +851,7 @@ def test_codex_token_poller_updates_status_and_tokens_panel_frame() -> None:
     """Verify daemon token poller refreshes snapshot and touch tap shows tokens.
 
     入参：无；测试内注入 fake token reader，并用 logical panel input 模拟 touch bar 点击。
-    返回：无返回值；断言通过代表 token usage 能进入 daemon runtime 并渲染 tokens 面板。
+    返回：无返回值；断言通过代表 token usage 可在 Brand -> Quota -> Usage 手动轮换后渲染。
     错误处理：reader 未调用、status 未暴露或 panel 未切换/渲染时由 pytest 报告。
     副作用：只在内存中生成 Pillow 图像，不执行 ccusage 或访问真实 N4 Pro。
     """
@@ -672,6 +881,10 @@ def test_codex_token_poller_updates_status_and_tokens_panel_frame() -> None:
             "/logical-panel/input",
             json={"event": "touch.tap"},
         )
+        switch_response = client.post(
+            "/logical-panel/input",
+            json={"event": "touch.tap"},
+        )
         status = client.get("/status").json()
 
     assert calls == 1
@@ -692,8 +905,8 @@ def test_hardware_input_endpoint_routes_touch_and_knob_to_logical_panel() -> Non
     """Verify low-level hardware input drives logical panel selection.
 
     入参：无；测试内先注入 token snapshot，再 POST touch/knob hardware input。
-    返回：无返回值；断言通过代表 fake/真实监听器可复用同一低层输入入口。
-    错误处理：HTTP 状态、panel 切换或 token 周期变化错误时由 pytest 报告。
+    返回：无返回值；断言通过代表 fake/真实监听器复用同一触控入口，并让旋钮读取用户 binding。
+    错误处理：HTTP 状态、panel 切换或 quota 内容变化错误时由 pytest 报告。
     副作用：只修改测试 app 的内存 runtime，不访问真实硬件。
     """
 
@@ -725,9 +938,10 @@ def test_hardware_input_endpoint_routes_touch_and_knob_to_logical_panel() -> Non
     assert touch_response.json()["panel_event"] == "touch.tap"
     assert knob_response.status_code == 200
     assert knob_response.json()["handled"] is True
-    assert knob_response.json()["panel_event"] == "knob_4.rotate_right"
-    assert status["logical_panel"]["selection"]["active_kind"] == "tokens"
-    assert status["logical_panel"]["selection"]["token_period"] == "week"
+    assert knob_response.json()["panel_event"] is None
+    assert knob_response.json()["rotary_intent"]["rotate_action"] == "cycle_panel_content"
+    assert status["logical_panel"]["selection"]["active_kind"] == "quota"
+    assert status["logical_panel"]["selection"]["quota_window"] == "secondary"
 
 
 def test_hardware_key_selects_agent_and_reports_missing_focus_target() -> None:
@@ -1126,7 +1340,7 @@ def test_brand_feedback_panel_expires_back_to_current_logical_panel(
 ) -> None:
     """品牌反馈过期后后台 renderer 应恢复当前 logical panel。
 
-    入参：`monkeypatch` 固定 monotonic 时间；测试内先准备 quota panel，再触发品牌反馈。
+    入参：`monkeypatch` 固定 monotonic 时间；测试内先准备 quota 数据，再触发品牌反馈。
     返回：无返回值；断言通过代表 transient override 不会永久覆盖原面板。
     错误处理：反馈源或过期恢复源错误时由 pytest 报告。
     副作用：只修改测试 app 内存 runtime，不访问真实硬件。
@@ -1151,7 +1365,7 @@ def test_brand_feedback_panel_expires_back_to_current_logical_panel(
     assert getattr(feedback_image, "size") == (800, 480)
     assert feedback_source == "agent_deck:brand_feedback"
     assert getattr(restored_image, "size") == (800, 480)
-    assert restored_source == "codex_quota"
+    assert restored_source == "agent_deck:splash"
 
 
 def test_streamdock_n4pro_key_images_include_app_bindings(tmp_path: Path) -> None:
@@ -1488,6 +1702,7 @@ def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
         "key_count": 1,
         "ok": True,
         "path": "n4pro-path",
+        "session_output_error": None,
         "timing_seconds": {},
     }
     assert status["streamdock_n4pro_renderer"]["last_error"] is None
@@ -1662,11 +1877,10 @@ def test_default_n4pro_renderer_input_callback_routes_sdk_events(
         )
         status = client.get("/status").json()
 
-    assert first_knob_response["handled"] is False
-    assert first_knob_response["accumulated"] is True
+    assert first_knob_response["handled"] is True
     assert second_knob_response["handled"] is True
-    assert status["logical_panel"]["selection"]["active_kind"] == "tokens"
-    assert status["logical_panel"]["selection"]["token_period"] == "week"
+    assert status["logical_panel"]["selection"]["active_kind"] == "quota"
+    assert status["logical_panel"]["selection"]["quota_window"] == "primary"
     assert status["streamdock_input"]["event_count"] == 4
     assert status["streamdock_input"]["last_event"] == {
         "count": 4,
@@ -1677,7 +1891,7 @@ def test_default_n4pro_renderer_input_callback_routes_sdk_events(
         "state": None,
         "x": None,
         "y": None,
-        "panel_event": "knob_4.rotate_right",
+        "panel_event": None,
         "handled": True,
         "debounced": False,
         "accumulated": False,

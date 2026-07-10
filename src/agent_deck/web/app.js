@@ -43,9 +43,26 @@ const fallbackKeys = Array.from({ length: 10 }, (_, index) => {
   return { index, role: "agent", kind: "agent", slot: index - 4, dirty: false };
 });
 
+const fallbackRotaryLayout = {
+  controls: [
+    { control_id: "knob_1", rotate_action: "cycle_virtual_panel" },
+    { control_id: "knob_2", rotate_action: "unassigned" },
+    { control_id: "knob_3", rotate_action: "unassigned" },
+    { control_id: "knob_4", rotate_action: "cycle_panel_content" },
+  ],
+  lighting: { mode: "off", color: null, breathe: false },
+  console_brightness_percent: 100,
+  system_display_id: null,
+};
+
 const state = {
   keys: fallbackKeys,
   selectedIndex: 0,
+  selectedSurface: "key",
+  selectedKnobId: "knob_1",
+  rotaryLayout: structuredClone(fallbackRotaryLayout),
+  rotaryLayoutSource: "default",
+  controlCapabilities: null,
   appQuery: "",
   dirty: false,
   status: null,
@@ -60,6 +77,8 @@ const state = {
 
 const el = {
   keyGrid: document.getElementById("keyGrid"),
+  knobStrip: document.getElementById("knobStrip"),
+  lightingControl: document.getElementById("lightingControl"),
   selectedEyebrow: document.getElementById("selectedEyebrow"),
   selectedTitle: document.getElementById("selectedTitle"),
   selectedSubtitle: document.getElementById("selectedSubtitle"),
@@ -221,6 +240,36 @@ function applyKeyLayoutResponse(response) {
   state.dirty = false;
 }
 
+/** 将 daemon rotary layout 复制成可编辑草稿，不会改变已应用的真实硬件状态。 */
+function applyRotaryLayoutResponse(response) {
+  if (!response?.layout?.controls) return;
+  state.rotaryLayoutSource = response.source || "runtime";
+  state.rotaryLayout = structuredClone(response.layout);
+}
+
+/** 返回一个旋钮位置的草稿 binding。 */
+function rotaryBinding(controlId) {
+  return state.rotaryLayout.controls.find((binding) => binding.control_id === controlId) || null;
+}
+
+/** 将 HTML 十六进制基础色转换成设备预览用的 `r, g, b` CSS 三元组。 */
+function rgbForLightingPreview() {
+  const color = state.rotaryLayout.lighting?.color;
+  if (state.rotaryLayout.lighting?.mode !== "color" || !/^#[0-9a-f]{6}$/i.test(color || "")) {
+    return "111, 213, 255";
+  }
+  return [1, 3, 5]
+    .map((offset) => Number.parseInt(color.slice(offset, offset + 2), 16))
+    .join(", ");
+}
+
+/** 返回旋钮按下由当前旋转用途隐式决定的说明，不把它暴露成独立配置。 */
+function impliedPressDescription(rotateAction) {
+  if (rotateAction === "adjust_output_volume") return "切换输出静音";
+  if (rotateAction === "adjust_input_volume") return "切换麦克风静音";
+  return "不执行动作";
+}
+
 function bindingFromUiKey(key) {
   if (key.kind === "app") {
     return {
@@ -314,7 +363,7 @@ function renderKeyFace(key) {
 function renderKeys() {
   el.keyGrid.innerHTML = state.keys
     .map((key) => {
-      const selected = key.index === state.selectedIndex ? " selected" : "";
+      const selected = state.selectedSurface === "key" && key.index === state.selectedIndex ? " selected" : "";
       const dirty = key.dirty ? " dirty" : "";
       return `
         <button class="deck-key${selected}${dirty}" data-key="${key.index}" type="button" aria-label="Key ${key.index + 1} ${keyLabel(key)}">
@@ -327,9 +376,34 @@ function renderKeys() {
   el.keyGrid.querySelectorAll(".deck-key").forEach((button) => {
     button.addEventListener("click", () => {
       state.selectedIndex = Number(button.dataset.key);
+      state.selectedSurface = "key";
       render();
     });
   });
+}
+
+/**
+ * 渲染 N4 Pro 四个可配置旋钮的选中态和当前灯圈组草稿预览。
+ * 当前 profile 的灯光为 group，因此四个 `.led` 必须同步更新，不能显示独立颜色。
+ */
+function renderKnobs() {
+  const ledColor = rgbForLightingPreview();
+  const ledOpacity = state.rotaryLayout.lighting?.mode === "color" ? "0.9" : "0";
+  el.knobStrip.style.setProperty("--n4pro-led-color", ledColor);
+  el.knobStrip.style.setProperty("--n4pro-led-opacity", ledOpacity);
+  el.knobStrip.classList.toggle("breathing", state.rotaryLayout.lighting?.breathe === true && ledOpacity !== "0");
+  el.knobStrip.querySelectorAll(".knob-cell").forEach((button) => {
+    const selected = state.selectedSurface === "rotary" && button.dataset.knob === state.selectedKnobId;
+    button.classList.toggle("selected", selected);
+    button.setAttribute("aria-pressed", String(selected));
+    button.onclick = () => {
+      state.selectedSurface = "rotary";
+      state.selectedKnobId = button.dataset.knob;
+      render();
+    };
+  });
+  el.lightingControl.classList.toggle("selected", state.selectedSurface === "lighting");
+  el.lightingControl.setAttribute("aria-pressed", String(state.selectedSurface === "lighting"));
 }
 
 function choiceButton(kind, title, meta) {
@@ -377,7 +451,7 @@ function renderUrlIconControls(key) {
   `;
 }
 
-function renderInspector() {
+function renderKeyInspector() {
   const key = state.keys[state.selectedIndex];
   el.selectedEyebrow.textContent = `Key ${key.index + 1}`;
   el.selectedTitle.textContent = keyLabel(key);
@@ -489,10 +563,162 @@ function renderInspector() {
 }
 
 /**
+ * 返回旋钮动作下拉框所需的稳定中文文案；系统显示器亮度仅在 capability scan 有目标时显示。
+ */
+function rotateActionOptions() {
+  const options = [
+    ["unassigned", "暂不设定"],
+    ["cycle_virtual_panel", "切换虚拟面板"],
+    ["cycle_panel_content", "切换面板内容"],
+    ["adjust_output_volume", "调节输出音量"],
+    ["adjust_input_volume", "调节输入音量"],
+    ["adjust_deck_display_brightness", "调节控制台屏幕亮度"],
+  ];
+  if ((state.controlCapabilities?.system_display_targets || []).length > 0) {
+    options.splice(5, 0, ["adjust_system_display_brightness", "调节系统显示器亮度"]);
+  }
+  return options;
+}
+
+/**
+ * 生成选中指定枚举动作的原生下拉项 HTML。
+ */
+function actionOptionsHtml(options, current) {
+  return options
+    .map(([value, label]) => `<option value="${escapeAttr(value)}"${value === current ? " selected" : ""}>${escapeHtml(label)}</option>`)
+    .join("");
+}
+
+/**
+ * 渲染单个旋钮检查器；按下语义从旋转用途派生，不允许组合出难以理解的跨用途动作。
+ */
+function renderRotaryInspector() {
+  const controlId = state.selectedKnobId;
+  const binding = rotaryBinding(controlId);
+  const capability = state.controlCapabilities?.device_profile?.rotary?.controls?.find((item) => item.id === controlId);
+  const controlNumber = controlId?.replace("knob_", "") || "";
+  el.selectedEyebrow.textContent = `旋钮 ${controlNumber}`;
+  el.selectedTitle.textContent = "旋钮配置";
+  el.selectedSubtitle.textContent = "设置左右旋转用途；按下语义会依据音量用途自动决定，修改只更新预览。";
+  if (!binding) {
+    el.inspectorBody.innerHTML = '<p class="control-note">当前硬件 profile 未提供这个旋钮。</p>';
+    return;
+  }
+  const supportsPress = capability?.supports_press !== false;
+  el.inspectorBody.innerHTML = `
+    <div class="field-group">
+      <label class="text-field" for="rotateAction"><span>左右旋转</span>
+        <select id="rotateAction" class="select-input">${actionOptionsHtml(rotateActionOptions(), binding.rotate_action)}</select>
+      </label>
+    </div>
+    <div class="field-group"><div class="field-label">当前能力</div>
+      ${detailRow("旋转", capability?.supports_rotate === false ? "不支持" : "支持")}
+      ${detailRow("按下", supportsPress ? impliedPressDescription(binding.rotate_action) : "不支持")}
+    </div>
+  `;
+  document.getElementById("rotateAction")?.addEventListener("change", (event) => {
+    binding.rotate_action = event.target.value;
+    markRotaryDirty();
+    render();
+  });
+}
+
+/**
+ * 渲染独立的控制台灯光入口；N4 Pro 预览始终以一个 group 同步四个灯圈。
+ */
+function renderLightingInspector() {
+  const lighting = state.rotaryLayout.lighting || { mode: "off", color: null, breathe: false };
+  const targets = state.controlCapabilities?.system_display_targets || [];
+  el.selectedEyebrow.textContent = "控制台灯光";
+  el.selectedTitle.textContent = "旋钮灯圈组";
+  el.selectedSubtitle.textContent = "N4 Pro 当前只能统一设置四个旋钮灯圈；颜色编辑会立即更新预览。";
+  el.inspectorBody.innerHTML = `
+    <div class="field-group">
+      <label class="text-field" for="lightingMode"><span>灯光</span>
+        <select id="lightingMode" class="select-input">
+          <option value="off"${lighting.mode === "off" ? " selected" : ""}>关闭</option>
+          <option value="color"${lighting.mode === "color" ? " selected" : ""}>指定颜色</option>
+        </select>
+      </label>
+    </div>
+    ${lighting.mode === "color" ? `
+      <div class="field-group">
+        <div class="field-label">基础色</div>
+        <div class="color-setting">
+          <input id="lightingColor" class="color-input" type="color" value="${escapeAttr(lighting.color || "#35C9FF")}" aria-label="灯圈基础色">
+          <span class="detail-row"><span>预览</span><span>${escapeHtml((lighting.color || "#35C9FF").toUpperCase())}</span></span>
+        </div>
+      </div>` : ""}
+    ${lighting.mode === "color" ? `
+      <label class="switch-field" for="lightingBreathe">
+        <span><strong>柔和呼吸</strong><small>四个灯圈以同一基础色同步变化</small></span>
+        <input id="lightingBreathe" type="checkbox"${lighting.breathe ? " checked" : ""}>
+      </label>` : ""}
+    ${targets.length ? `
+      <div class="field-group">
+        <label class="text-field" for="systemDisplayTarget"><span>系统显示器亮度目标</span>
+          <select id="systemDisplayTarget" class="select-input">
+            <option value="">未选择</option>
+            ${targets.map((target) => `<option value="${escapeAttr(target.id)}"${target.id === state.rotaryLayout.system_display_id ? " selected" : ""}>${escapeHtml(target.label)}</option>`).join("")}
+          </select>
+        </label>
+      </div>` : ""}
+  `;
+  document.getElementById("lightingMode")?.addEventListener("change", (event) => {
+    const mode = event.target.value;
+    state.rotaryLayout.lighting = mode === "color"
+      ? { mode: "color", color: lighting.color || "#35C9FF", breathe: lighting.breathe === true }
+      : { mode: "off", color: null, breathe: false };
+    markRotaryDirty();
+    render();
+  });
+  document.getElementById("lightingColor")?.addEventListener("input", (event) => {
+    state.rotaryLayout.lighting = { mode: "color", color: event.target.value.toUpperCase(), breathe: lighting.breathe === true };
+    markRotaryDirty();
+    render();
+  });
+  document.getElementById("lightingBreathe")?.addEventListener("change", (event) => {
+    state.rotaryLayout.lighting = {
+      mode: "color",
+      color: lighting.color || "#35C9FF",
+      breathe: event.target.checked,
+    };
+    markRotaryDirty();
+    render();
+  });
+  document.getElementById("systemDisplayTarget")?.addEventListener("change", (event) => {
+    state.rotaryLayout.system_display_id = event.target.value || null;
+    markRotaryDirty();
+    render();
+  });
+}
+
+/**
+ * 根据当前设备预览选中的表面渲染 key、旋钮或独立灯光设置检查器。
+ */
+function renderInspector() {
+  if (state.selectedSurface === "rotary") {
+    renderRotaryInspector();
+    return;
+  }
+  if (state.selectedSurface === "lighting") {
+    renderLightingInspector();
+    return;
+  }
+  renderKeyInspector();
+}
+
+/**
  * 标记当前 GUI 预览已偏离 daemon 配置；只影响保存按钮和状态提示，不直接下发硬件。
  */
 function markDirty(key) {
   key.dirty = true;
+  state.dirty = true;
+  renderSyncState();
+}
+
+/** 标记旋钮、灯光或系统显示器目标草稿已变化，硬件保持当前已应用状态。 */
+function markRotaryDirty() {
   state.dirty = true;
   renderSyncState();
 }
@@ -678,6 +904,7 @@ function renderSyncState() {
 
 function render() {
   renderKeys();
+  renderKnobs();
   renderInspector();
   renderRuntime();
   renderSyncState();
@@ -691,6 +918,7 @@ function isEditingInspectorField() {
 
 function renderPassiveRuntimeRefresh() {
   renderKeys();
+  renderKnobs();
   renderRuntime();
   renderSyncState();
   if (!isEditingInspectorField()) {
@@ -729,6 +957,30 @@ async function loadKeyLayout() {
     render();
   } catch (error) {
     el.toast.textContent = `布局读取失败：${error.message}`;
+  }
+}
+
+/** 从 daemon 读取已应用的旋钮布局，用于初始化 GUI 草稿。 */
+async function loadRotaryLayout() {
+  try {
+    const response = await fetch("/ui/rotary-layout", { cache: "no-store" });
+    if (!response.ok) throw new Error(`rotary layout ${response.status}`);
+    applyRotaryLayoutResponse(await response.json());
+    render();
+  } catch (error) {
+    el.toast.textContent = `旋钮配置读取失败：${error.message}`;
+  }
+}
+
+/** 读取硬件 profile 与本机系统控制 capability，借此过滤不可用动作。 */
+async function loadControlCapabilities() {
+  try {
+    const response = await fetch("/ui/control-capabilities", { cache: "no-store" });
+    if (!response.ok) throw new Error(`control capabilities ${response.status}`);
+    state.controlCapabilities = await response.json();
+    render();
+  } catch (error) {
+    el.toast.textContent = `控制能力读取失败：${error.message}`;
   }
 }
 
@@ -960,19 +1212,23 @@ async function saveAndApply() {
   renderSyncState();
   el.toast.textContent = "";
   try {
-    const response = await fetch("/ui/key-layout", {
+    const response = await fetch("/ui/configuration", {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        keys: state.keys
-          .slice()
-          .sort((a, b) => a.index - b.index)
-          .map(bindingFromUiKey),
+        key_layout: {
+          keys: state.keys
+            .slice()
+            .sort((a, b) => a.index - b.index)
+            .map(bindingFromUiKey),
+        },
+        rotary_layout: state.rotaryLayout,
       }),
     });
     if (!response.ok) throw new Error(`save ${response.status}`);
     const body = await response.json();
     applyKeyLayoutResponse(body.key_layout);
+    applyRotaryLayoutResponse(body.rotary_layout);
     state.keys.forEach((key) => {
       key.dirty = false;
     });
@@ -997,6 +1253,10 @@ el.saveButton.addEventListener("click", saveAndApply);
 el.themeToggle?.addEventListener("click", () => {
   applyTheme(state.theme === "light" ? "dark" : "light", { persist: true });
 });
+el.lightingControl?.addEventListener("click", () => {
+  state.selectedSurface = "lighting";
+  render();
+});
 el.closeAppModal.addEventListener("click", closeAppModal);
 el.appModal.addEventListener("click", (event) => {
   if (event.target === el.appModal) closeAppModal();
@@ -1010,6 +1270,8 @@ el.refreshApps.addEventListener("click", refreshAppIcons);
 async function boot() {
   await loadAppCatalog();
   await loadKeyLayout();
+  await loadRotaryLayout();
+  await loadControlCapabilities();
   await refreshStatus();
   render();
 }

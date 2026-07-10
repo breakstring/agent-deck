@@ -68,12 +68,13 @@ Reasoning:
               <div class="touchbar">
                 <img src="/assets/n4pro_splash_command_core.png" alt="Agent Deck touch bar brand panel" width="800" height="480" fetchpriority="high" />
               </div>
-              <div class="knob-strip" aria-hidden="true">
-                <div class="knob-cell"><div class="knob"></div><div class="led"></div></div>
-                <div class="knob-cell"><div class="knob"></div><div class="led"></div></div>
-                <div class="knob-cell"><div class="knob"></div><div class="led"></div></div>
-                <div class="knob-cell"><div class="knob"></div><div class="led"></div></div>
+              <div id="knobStrip" class="knob-strip" aria-label="N4 Pro 旋钮配置">
+                <button class="knob-cell" type="button" data-knob="knob_1" aria-label="旋钮 1"><span class="knob"></span><span class="led"></span></button>
+                <button class="knob-cell" type="button" data-knob="knob_2" aria-label="旋钮 2"><span class="knob"></span><span class="led"></span></button>
+                <button class="knob-cell" type="button" data-knob="knob_3" aria-label="旋钮 3"><span class="knob"></span><span class="led"></span></button>
+                <button class="knob-cell" type="button" data-knob="knob_4" aria-label="旋钮 4"><span class="knob"></span><span class="led"></span></button>
               </div>
+              <button id="lightingControl" class="lighting-control" type="button" aria-label="旋钮灯圈灯光设置">旋钮灯光</button>
             </div>
           </div>
         </section>
@@ -113,6 +114,6 @@ Reasoning:
       </div>
     </div>
 
-    <script src="/web/app.js?v=20260709-theme"></script>
+    <script src="/web/app.js?v=20260710-rotary-feedback"></script>
   </body>
 </html>

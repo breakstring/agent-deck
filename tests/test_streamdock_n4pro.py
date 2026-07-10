@@ -159,6 +159,42 @@ class FakeN4ProUnifiedDevice:
         self.touch_bar_callback = callback
         self.calls.append(("set_touch_bar_callback", None))
 
+    def set_brightness(self, percent: int) -> int:
+        """记录控制台整体亮度写入。
+
+        入参：`percent` 是 0 到 100 亮度。
+        返回：0 表示 fake SDK 成功。
+        错误处理：无。
+        副作用：记录调用。
+        """
+
+        self.calls.append(("set_brightness", percent))
+        return 0
+
+    def set_led_color(self, red: int, green: int, blue: int) -> int:
+        """记录 N4 Pro RGB 灯圈组颜色写入。
+
+        入参：`red`、`green`、`blue` 是 0 到 255 色值。
+        返回：0 表示 fake SDK 成功。
+        错误处理：无。
+        副作用：记录调用。
+        """
+
+        self.calls.append(("set_led_color", (red, green, blue)))
+        return 0
+
+    def set_led_brightness(self, percent: int) -> int:
+        """记录 N4 Pro RGB 灯圈组亮度写入。
+
+        入参：`percent` 是 0 到 100 的 group LED 亮度。
+        返回：0 表示 fake SDK 成功。
+        错误处理：无。
+        副作用：记录调用。
+        """
+
+        self.calls.append(("set_led_brightness", percent))
+        return 0
+
 
 class FakeOtherUnifiedDevice(FakeN4ProUnifiedDevice):
     """测试用非 N4 Pro 设备 fake。
@@ -245,6 +281,118 @@ def test_render_images_to_n4pro_writes_background_and_keys_once(
     assert device.calls[-1] == ("close", False)
     assert device.paths_seen
     assert all(not path.exists() for path in device.paths_seen)
+
+
+def test_persistent_animator_runs_session_output_once_per_render_without_reopening(
+    tmp_path: Path,
+) -> None:
+    """长连接 animator 应在同一设备会话内执行附加输出，并标明首轮 init。
+
+    入参：`tmp_path` 提供临时图片目录。
+    返回：无返回值；断言通过表示控制台亮度/LED 可复用背景和按键同一 HID 会话。
+    错误处理：callback 次数、初始化标识或设备 reopen 错误时由 pytest 报告。
+    副作用：只调用 fake device 并写 pytest 临时图片。
+    """
+
+    device = FakeN4ProUnifiedDevice()
+    manager = FakeUnifiedManager([device])
+    callbacks: list[bool] = []
+    animator = StreamDockN4ProPersistentAnimator(manager=manager, temp_dir=tmp_path)
+    animator.set_session_output_callback(
+        lambda _device, initialized: callbacks.append(initialized) or None
+    )
+    background = Image.new("RGB", (800, 480), (1, 2, 3))
+
+    first = animator(
+        background_image=background,
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+    second = animator(
+        background_image=background,
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+
+    assert first.ok is True
+    assert second.ok is True
+    assert callbacks == [True, False]
+    assert [name for name, _ in device.calls].count("open") == 1
+    assert [name for name, _ in device.calls].count("init") == 1
+
+
+def test_persistent_animator_refreshes_session_output_for_each_animation_frame(
+    tmp_path: Path,
+) -> None:
+    """带按键动画时，persistent animator 应在同一会话逐帧刷新附加输出。
+
+    入参：`tmp_path` 提供一张最小按键帧；session callback 只记录调用次数。
+    返回：无返回值；断言通过表示软件呼吸灯可以在现有帧循环内平滑更新亮度。
+    错误处理：帧循环漏调 callback 或重新打开设备时由 pytest 报告。
+    副作用：只操作 fake device 和 pytest 临时图片。
+    """
+
+    frame = tmp_path / "frame.png"
+    Image.new("RGB", (96, 96), (10, 20, 30)).save(frame)
+    device = FakeN4ProUnifiedDevice()
+    callbacks: list[bool] = []
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=FakeUnifiedManager([device]),
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+    animator.set_session_output_callback(
+        lambda _device, initialized: callbacks.append(initialized) or None
+    )
+
+    result = animator(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={1: (frame,)},
+        duration_seconds=0.2,
+        fps=10,
+    )
+
+    assert result.ok is True
+    assert callbacks == [True, False, False]
+    assert [name for name, _ in device.calls].count("open") == 1
+
+
+def test_persistent_animator_writes_a_new_background_revision_during_active_frame_loop(
+    tmp_path: Path,
+) -> None:
+    """长连接动画循环应在不重开设备的前提下立即下发更新后的背景 revision。
+
+    入参：`tmp_path` 提供最小按键帧；provider 先返回初始背景 revision，随后返回更新后的 revision。
+    返回：无返回值；断言通过表示旋钮反馈不必等待下一次 3 秒 renderer tick。
+    错误处理：背景 revision 未检测、额外 open 或 frame background 写入次数错误时由 pytest 报告。
+    副作用：仅操作 fake device 和 pytest 临时图片。
+    """
+
+    frame = tmp_path / "frame.png"
+    Image.new("RGB", (96, 96), (10, 20, 30)).save(frame)
+    device = FakeN4ProUnifiedDevice()
+    initial = Image.new("RGB", (800, 480), (1, 2, 3))
+    updated = Image.new("RGB", (800, 480), (4, 5, 6))
+    revisions = iter(((1, initial), (2, updated), (2, updated)))
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=FakeUnifiedManager([device]),
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+    animator.set_background_update_provider(lambda: next(revisions))
+
+    result = animator(
+        background_image=initial,
+        key_frame_paths={1: (frame,)},
+        duration_seconds=0.2,
+        fps=10,
+    )
+
+    assert result.ok is True
+    assert [name for name, _ in device.calls].count("set_frame_background") == 2
+    assert [name for name, _ in device.calls].count("open") == 1
 
 
 def test_animate_key_images_on_n4pro_keeps_one_device_session(
