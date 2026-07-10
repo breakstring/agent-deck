@@ -56,7 +56,6 @@ To take ownership of an N4 Pro, first quit the official MiraBox/StreamDock appli
 - [Contributing guide (English)](CONTRIBUTING.md)
 - [贡献指南（中文）](CONTRIBUTING.zh-CN.md)
 - [Project roadmap](docs/references/agent-deck-roadmap.md): upcoming direction and scope.
-- [Overall design](docs/superpowers/specs/2026-06-12-agent-deck-analysis.md): event, state, layout, and hardware boundaries.
 
 ## Running the Daemon
 

@@ -56,7 +56,6 @@ scripts/agent-deckd-tmux.sh stop
 - [贡献指南（中文）](CONTRIBUTING.zh-CN.md)
 - [Contributing guide (English)](CONTRIBUTING.md)
 - [项目路线图](docs/references/agent-deck-roadmap.md)：后续方向和边界。
-- [总体设计](docs/superpowers/specs/2026-06-12-agent-deck-analysis.md)：事件、状态、布局与硬件分层。
 
 ## 运行方式
 

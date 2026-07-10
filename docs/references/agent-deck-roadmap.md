@@ -26,14 +26,14 @@ flowchart LR
 
 阶段顺序表示建议依赖，不代表固定时间表。每次迭代可以按当前需求重新调整。
 
-## P0：文档与项目骨架
+## P0：文档与项目骨架 (已完成)
 
 目标：
 
-- 明确需求、MVP 设计和路线图。
-- 初始化项目仓库。
-- 选择第一版技术栈。
-- 写出可执行 implementation plan。
+- [x] 明确需求、MVP 设计和路线图。
+- [x] 初始化项目仓库。
+- [x] 选择第一版技术栈。
+- [x] 写出可执行 implementation plan。
 
 交付：
 
@@ -48,10 +48,10 @@ flowchart LR
 
 验收：
 
-- 用户确认 spec。
-- 有明确下一步实现计划。
+- [x] 用户确认 spec。
+- [x] 有明确下一步实现计划。
 
-## P1：macOS + N4 Pro + Codex MVP
+## P1：macOS + N4 Pro + Codex MVP (已完成)
 
 目标：
 
@@ -229,18 +229,18 @@ flowchart LR
 
 P1 验收清单：
 
-- 无硬件时 fake hardware 测试通过。
-- 有 N4 Pro 时 `doctor` 能识别设备。
-- `doctor` 能识别或提示官方 Stream Dock 软件占用设备的情况。
-- Codex turn 状态能显示到 slot。
-- PermissionRequest 能在硬件上显示并返回 allow/deny。
-- Codex App Plan Mode `request_user_input` 未完成时能被只读扫描为 `waiting_user`。
-- Codex App 最近有效会话能被只读扫描同步到 daemon，并按 running/idle/waiting 状态显示到 slot。
-- Codex quota 能自动刷新到 daemon runtime，并显示到 N4 Pro 底部虚拟视窗。
-- 启用统一 N4 Pro renderer 后，Codex 会话状态按钮和底部 quota 背景能在同一次硬件写入链路中共存。
-- 超时默认策略按配置执行。
-- 拔插设备服务不崩溃。
-- `pytest` 通过。
+- [x] 无硬件时 fake hardware 测试通过。
+- [x] 有 N4 Pro 时 `doctor` 能识别设备。
+- [x] `doctor` 能识别或提示官方 Stream Dock 软件占用设备的情况。
+- [x] Codex turn 状态能显示到 slot。
+- [x] PermissionRequest 能在硬件上显示并返回 allow/deny。
+- [x] Codex App Plan Mode `request_user_input` 未完成时能被只读扫描为 `waiting_user`。
+- [x] Codex App 最近有效会话能被只读扫描同步到 daemon，并按 running/idle/waiting 状态显示到 slot。
+- [x] Codex quota 能自动刷新到 daemon runtime，并显示到 N4 Pro 底部虚拟视窗。
+- [x] 启用统一 N4 Pro renderer 后，Codex 会话状态按钮和底部 quota 背景能在同一次硬件写入链路中共存。
+- [x] 超时默认策略按配置执行。
+- [x] 拔插设备服务不崩溃。
+- [x] `pytest` 通过。
 
 ## P2：Claude Code Adapter
 
@@ -466,15 +466,13 @@ P4 关键设计点：
 
 下一次进入实现前，建议先做两件事：
 
-1. 确认 P1 开放问题中的默认策略。
-2. 写 implementation plan，把 P1 拆成小 PR/commit 节点。
+1. 确认 P2（Claude Code Adapter）在 N4 Pro 物理屏幕/按键上的槽位分配与交互策略。
+2. 收集 Claude Code hooks 样例数据以编写事件转换测试用例。
 
 建议第一个实现节点：
 
-- 用 `uv` 初始化 Python 项目。
-- 建立 core event/state/decision 的纯内存模型。
-- 建立 fake hardware。
-- 建立 DeckMode 和 layout plan。
-- 用模拟 Codex 事件跑通状态到 fake surface 的测试。
+- 收集并整理 Claude Code Hook Payload 样本（如 SessionStart, PreToolUse, Notification, Stop 等）。
+- 在 `src/agent_deck/adapters/` 下实现 `claude_code` adapter 基础转换逻辑，把 Claude 钩子事件转换为内部 `NormalizedEvent`。
+- 编写 Mock 测试跑通 Claude 事件到 state reducer 和 layout 的映射链路。
 
 这个节点不依赖真实 N4 Pro，也不修改 Codex 配置，风险最低。
