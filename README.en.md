@@ -57,31 +57,34 @@ To take ownership of an N4 Pro, first quit the official MiraBox/StreamDock appli
 - [贡献指南（中文）](CONTRIBUTING.zh-CN.md)
 - [Project roadmap](docs/references/agent-deck-roadmap.md): upcoming direction and scope.
 
-## Running the Daemon
+## Command Line Tools
 
-The tmux launcher is the recommended way to manage a persistent daemon:
+The project provides three main CLI entry points (run via `uv run`):
+- **`agent-deckd`**: The core daemon service, responsible for driving the hardware displays and receiving agent telemetry events.
+- **`agent-deckctl`**: Administrative tool for environment diagnosis (`doctor`), runtime state inspection, and event simulation.
+- **`agent-deck-codex-hook`**: Integration hook helper for Codex to synchronize turn states and feedback approval decisions.
 
-```bash
-scripts/agent-deckd-tmux.sh start
-scripts/agent-deckd-tmux.sh status
-scripts/agent-deckd-tmux.sh logs
-scripts/agent-deckd-tmux.sh restart
-scripts/agent-deckd-tmux.sh attach
-scripts/agent-deckd-tmux.sh stop
-```
+## Process Management
 
-You can also use the root `run.sh` process manager or run the daemon directly:
+You can manage the persistent background process using the provided helper scripts:
 
-```bash
-uv run agent-deckd --host 127.0.0.1 --port 8765
-```
+- **Tmux Mode** (Recommended for easy log checking and session attaching):
+  ```bash
+  # Start, stop, view status, check logs, attach to session, or restart
+  scripts/agent-deckd-tmux.sh [start|stop|status|logs|attach|restart]
+  ```
 
-## Security and Privacy Boundaries
+- **Standard Background Mode** (For environments without tmux):
+  ```bash
+  # Use the root helper script
+  ./run.sh [start|stop|status|logs|restart]
+  ```
 
-- Hardware input is first reduced to a business intent and is then executed by the action layer. Hardware drivers must not directly execute shell commands or inject text into an agent.
-- The default Codex approval mode in `agent-deck.toml` is `passthrough`, so Codex keeps its native approval UI.
-- Full user prompts are not collected by default. Configured application paths, URLs, and cached icons remain local.
-- `agent-deckctl doctor` is read-only. Do not call `device.init()` from diagnostic code because it can wake, clear, or refresh a physical device.
+- **Foreground Debug Mode**:
+  ```bash
+  uv run agent-deckd --host 127.0.0.1 --port 8765
+  ```
+
 
 ## License
 

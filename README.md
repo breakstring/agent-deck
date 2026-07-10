@@ -57,31 +57,34 @@ scripts/agent-deckd-tmux.sh stop
 - [Contributing guide (English)](CONTRIBUTING.md)
 - [项目路线图](docs/references/agent-deck-roadmap.md)：后续方向和边界。
 
-## 运行方式
+## CLI 主要命令
 
-推荐使用 tmux 管理常驻 daemon：
+项目提供了三个主要的 CLI 入口（通过 `uv run` 执行）：
+- **`agent-deckd`**：核心后台 Daemon 服务，负责驱动硬件显示并接收外部 Agent 遥测。
+- **`agent-deckctl`**：运维管理工具，支持环境诊断 (`doctor`)、运行状态查看和事件模拟。
+- **`agent-deck-codex-hook`**：Codex 专属集成钩子，负责同步 turn 状态并安全反馈硬件端做出的审批决策。
 
-```bash
-scripts/agent-deckd-tmux.sh start
-scripts/agent-deckd-tmux.sh status
-scripts/agent-deckd-tmux.sh logs
-scripts/agent-deckd-tmux.sh restart
-scripts/agent-deckd-tmux.sh attach
-scripts/agent-deckd-tmux.sh stop
-```
+## 运行管理
 
-也可以使用项目根目录的 `run.sh` 管理普通后台进程，或直接运行：
+你可以使用项目内置的脚本来管理常驻后台进程：
 
-```bash
-uv run agent-deckd --host 127.0.0.1 --port 8765
-```
+- **Tmux 托管模式**（推荐，便于查看日志和进程 attach）：
+  ```bash
+  # 启动/停止/查看状态/查看日志/附加到会话
+  scripts/agent-deckd-tmux.sh [start|stop|status|logs|attach|restart]
+  ```
 
-## 安全与隐私边界
+- **普通后台模式**（在没有安装 tmux 的环境）：
+  ```bash
+  # 使用内置的运行脚本
+  ./run.sh [start|stop|status|logs|restart]
+  ```
 
-- 硬件输入会先归约为业务 intent，再由 action 层执行；硬件 driver 不应直接执行 shell 或向 Agent 注入文本。
-- 默认 `agent-deck.toml` 中的 Codex 审批模式为 `passthrough`，仍由 Codex 提供原生审批 UI。
-- 不默认采集完整用户 prompt。配置的应用路径、网址和图标缓存仅存储在本机。
-- `agent-deckctl doctor` 是只读诊断；不要在诊断脚本中调用真实 SDK 的 `device.init()`，因为该调用可能唤醒、清空或刷新设备。
+- **前台直接运行**（常用于调试）：
+  ```bash
+  uv run agent-deckd --host 127.0.0.1 --port 8765
+  ```
+
 
 ## 授权协议
 
