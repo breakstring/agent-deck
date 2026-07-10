@@ -1,19 +1,66 @@
 # Agent Deck
 
-Agent Deck 是一个面向本机 AI Agents 的硬件控制台项目。目标是把妙联宝 N4 Pro 等设备用作 Agent 状态面板和安全交互入口。
+**[English](README.en.md)**
 
-当前项目处于设计与骨架初始化阶段。主要文档：
+Agent Deck 是一个本机运行的 AI Agent 硬件控制台桥接项目。它把 Agent 的状态、用量与可配置操作映射到妙联宝设备，同时保留可在浏览器中使用的本地配置界面。
 
-- `docs/superpowers/specs/2026-06-12-agent-deck-analysis.md`
-- `docs/superpowers/specs/2026-06-12-agent-deck-mvp-design.md`
-- `docs/references/agent-deck-roadmap.md`
-- `docs/references/stream-dock-scenes-research-2026-06-12.md`
+当前公开版本聚焦于 **macOS + MiraBox N4 Pro + Codex**。项目已经具备可实际使用的主路径，但仍处于 `0.x` 快速迭代阶段；其他操作系统、硬件型号和 Agent 平台尚未作出兼容性承诺。
 
-Python 项目使用 `uv` 管理。
+## 你可以用它做什么
 
-## 本地启动
+- 在 N4 Pro 的 10 个 LCD 按键上配置本地应用、网址、Agent 状态和订阅/用量视图。
+- 在底部虚拟面板中轮换品牌图、订阅额度与 Token/金额统计；使用趋势由本地缓存预渲染，减少切换等待。
+- 配置 4 个旋钮的旋转动作，例如切换面板或周期、调节系统输入/输出音量、显示器亮度和控制台屏幕亮度。
+- 配置旋钮灯光颜色和可选呼吸效果，并在 Web 配置页实时预览。
+- 读取 Codex 本地状态、quota 和 `ccusage` 数据；可选择安装 Codex hook 集成。默认审批模式保持 Codex 原生审批界面，不会把审批控制权交给硬件。
+- 没有连接真实硬件时，以 fake hardware 模式运行配置 UI 和核心服务。
 
-开发和协作调试时，推荐使用 tmux 启动脚本：
+## 当前支持范围
+
+| 维度 | 当前状态 |
+| --- | --- |
+| 操作系统 | macOS 为已验证目标。Windows/Linux 目前不属于正式支持范围。 |
+| 真实硬件 | MiraBox N4 Pro。其他 StreamDock/MiraBox 型号保留架构扩展空间，但尚未作为可用目标发布。 |
+| Agent | Codex 的本地 App/CLI 状态与 hook 集成。 |
+| Python | Python 3.11 或更高版本。 |
+| 用量趋势 | 可选依赖 Bun 的 `bunx` 与 `ccusage`；缺失时，其他功能仍可运行，但 Token/金额趋势不可用。 |
+
+## 快速开始
+
+完整步骤、硬件接管和排障请阅读 [使用指南](docs/guides/using-agent-deck.zh-CN.md)。下面是使用 fake hardware 启动本地配置页的最短路径：
+
+```bash
+git clone https://github.com/breakstring/agent-deck.git
+cd agent-deck
+uv sync --all-groups
+
+# 检查本机环境与设备线索
+uv run agent-deckctl doctor
+
+# 以不接管真实设备的方式启动
+scripts/agent-deckd-tmux.sh start --disable-hardware-renderer
+```
+
+然后打开 [http://127.0.0.1:8765/](http://127.0.0.1:8765/)。停止服务：
+
+```bash
+scripts/agent-deckd-tmux.sh stop
+```
+
+如果希望接管 N4 Pro，请先退出官方 MiraBox/StreamDock 应用，并在启动前通过 `doctor` 确认设备线索。macOS 上 SDK 动态库不兼容时，需要将 `AGENT_DECK_STREAMDOCK_SDK_PATH` 指向官方 Python SDK；具体做法见[真实硬件运行](docs/guides/using-agent-deck.zh-CN.md#真实硬件运行)。
+
+## 文档
+
+- [使用指南（中文）](docs/guides/using-agent-deck.zh-CN.md)：安装依赖、启动、配置、硬件、Codex 集成与排障。
+- [Usage guide (English)](docs/guides/using-agent-deck.en.md)
+- [贡献指南（中文）](CONTRIBUTING.zh-CN.md)
+- [Contributing guide (English)](CONTRIBUTING.md)
+- [项目路线图](docs/references/agent-deck-roadmap.md)：后续方向和边界。
+- [总体设计](docs/superpowers/specs/2026-06-12-agent-deck-analysis.md)：事件、状态、布局与硬件分层。
+
+## 运行方式
+
+推荐使用 tmux 管理常驻 daemon：
 
 ```bash
 scripts/agent-deckd-tmux.sh start
@@ -21,101 +68,40 @@ scripts/agent-deckd-tmux.sh status
 scripts/agent-deckd-tmux.sh logs
 scripts/agent-deckd-tmux.sh restart
 scripts/agent-deckd-tmux.sh attach
+scripts/agent-deckd-tmux.sh stop
 ```
 
-tmux 脚本会在 detached session `agent-deckd` 中启动 daemon，方便随时查看日志或 attach
-到进程。它最终执行的仍然是仓库根目录下的 `agent-deckd --host 127.0.0.1 --port 8765`，
-因此同样会读取当前目录的 `agent-deck.toml`，并按配置接管 N4 Pro 硬件渲染。
-
-仓库根目录也提供了普通后台启动脚本：
+也可以使用项目根目录的 `run.sh` 管理普通后台进程，或直接运行：
 
 ```bash
-./run.sh
+uv run agent-deckd --host 127.0.0.1 --port 8765
 ```
 
-`run.sh` 更适合作为普通本机后台入口：它不依赖 tmux，会把 PID 和日志写到固定位置，便于
-用 `./run.sh status`、`./run.sh logs` 和 `./run.sh restart` 管理。
+## 安全与隐私边界
 
-两种启动方式都会启动同一个 `agent-deckd`：监听 `127.0.0.1:8765`，读取 `agent-deck.toml`，
-并默认执行真实硬件渲染。当前配置里的默认设备 profile 是 `n4pro`，所以 Codex 状态按钮动画
-和底部 quota 背景会在同一次硬件写入里共存。
+- 硬件输入会先归约为业务 intent，再由 action 层执行；硬件 driver 不应直接执行 shell 或向 Agent 注入文本。
+- 默认 `agent-deck.toml` 中的 Codex 审批模式为 `passthrough`，仍由 Codex 提供原生审批 UI。
+- 不默认采集完整用户 prompt。配置的应用路径、网址和图标缓存仅存储在本机。
+- `agent-deckctl doctor` 是只读诊断；不要在诊断脚本中调用真实 SDK 的 `device.init()`，因为该调用可能唤醒、清空或刷新设备。
 
-## N4 Pro 配置页
+## 授权协议
 
-打开 <http://127.0.0.1:8765/> 可以配置主按键、4 个旋钮和控制台灯光。所有编辑先只改变网页中的
-硬件预览；只有点击“保存并应用”后，daemon 才会共同保存主按键和旋钮布局，并在下一次统一 N4 Pro
-renderer tick 中下发。
+本项目的核心代码采用 **[MIT 许可证](LICENSE)** 进行授权。你可以自由地使用、修改和分发该软件。
 
-- 每个旋钮只配置“左右旋转”用途，可重复绑定或保持暂不设定；按下语义由用途隐式决定。
-- 旋转动作包括 virtual panel/内容轮换、输出/输入音量、系统显示器亮度和控制台整体亮度；连续动作
-  固定每格 `2%`。
-- 输出音量旋钮按下会切换输出静音，输入音量旋钮按下会切换麦克风静音；其他旋钮按下不执行动作。系统音频操作会先读取当前状态。
-- 手动 panel 顺序为 `Brand -> Quota -> Usage -> Brand`；Quota 内容切换 5h/Week，Usage 内容
-  切换 Day/Week/Month/All；Brand 内容切换保持安静无操作。
-- N4 Pro 当前的 4 个旋钮灯圈是一个 `rotary_ring_group`，不能分别设置颜色。配置页只提供关闭或
-  基础色和可选柔和呼吸；呼吸使用同一 LED group 的亮度周期，最终平滑度仍需真机确认。
+### 第三方组件及授权
 
-旋钮配置默认保存在：
+本项目的 `vendor/` 目录下包含以下第三方组件：
+- **streamdock-python-sdk**：用于与妙联宝/StreamDock 控制台设备进行通信的 Python SDK。
+  - **原始仓库**: [MiraboxSpace/StreamDock-Plugin-SDK](https://github.com/MiraboxSpace/StreamDock-Plugin-SDK)
+  - **授权协议**: [MIT 许可证](vendor/streamdock-python-sdk/LICENSE)
 
-```text
-~/Library/Application Support/AgentDeck/n4pro-rotary-layout.json
-```
 
-可以用 `AGENT_DECK_N4PRO_ROTARY_LAYOUT` 覆盖这个路径，便于测试或隔离不同本机配置。
-
-真实硬件 smoke 前，可先用下面命令启动纯 GUI/fake 模式，它不会接管 N4 Pro：
+## 开发与验证
 
 ```bash
-scripts/agent-deckd-tmux.sh restart --disable-hardware-renderer
+uv run pytest -q
+uv run agent-deckctl version
+git diff --check
 ```
 
-恢复真实 N4 Pro renderer：
-
-```bash
-scripts/agent-deckd-tmux.sh restart
-```
-
-`run.sh` 的 PID 和日志默认写到：
-
-```text
-~/Library/Application Support/AgentDeck/agent-deckd.pid
-~/Library/Logs/AgentDeck/agent-deckd.log
-```
-
-常用命令：
-
-```bash
-./run.sh status
-./run.sh logs
-./run.sh stop
-./run.sh restart
-./run.sh --foreground
-```
-
-需要临时覆盖 daemon 参数时，可以直接把通用参数追加到脚本后面，例如：
-
-```bash
-./run.sh --disable-hardware-renderer
-```
-
-如果要前台观察启动输出，可以使用：
-
-```bash
-./run.sh --foreground --disable-hardware-renderer
-```
-
-默认硬件渲染节奏是 `render_interval_seconds = 3.0`、`fps = 10`，对应当前 30 帧的
-N4 Pro Codex 动画资产；这样每次下发按钮图标时能播放一个完整 working 动画周期，而不是
-只反复看到前几帧。daemon 的渲染循环会把硬件播放耗时计入这个周期，正常情况下不会在
-一次完整动画结束后再额外等待一个完整 interval。
-
-`agent-deck.toml` 还控制 Codex 权限审批 hook 的运行策略。默认：
-
-```toml
-[codex.permission_request]
-mode = "passthrough"
-```
-
-这表示即使系统级 Codex managed hooks 已安装，Agent Deck 也不会替 Codex 做 allow/deny 决策，
-Codex 会继续显示原生审批界面。只有改成 `mode = "handle"` 时，PermissionRequest 才会进入
-Agent Deck 的 decision broker；改成 `mode = "deny"` 则会直接拒绝。
+真实设备验证属于显式手动 smoke，不会纳入自动化测试。详见[贡献指南](CONTRIBUTING.zh-CN.md)。
