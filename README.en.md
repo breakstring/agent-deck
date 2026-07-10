@@ -85,6 +85,15 @@ You can manage the persistent background process using the provided helper scrip
   uv run agent-deckd --host 127.0.0.1 --port 8765
   ```
 
+## Agent Integration (Hooks Setup)
+
+You can configure the telemetry hooks for Codex using the CLI tool:
+1. **Detection**: Run `uv run agent-deckctl codex-detect --enable-integration` to check your environment.
+2. **Dry-run**: Run `uv run agent-deckctl codex-install` to preview the hook configurations.
+3. **Apply**: Run `uv run agent-deckctl codex-install --apply` to automatically install the hooks to your Codex settings.
+
+For advanced configurations, please refer to the [Usage Guide](docs/guides/using-agent-deck.en.md).
+
 
 ## License
 

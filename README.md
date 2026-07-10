@@ -85,6 +85,15 @@ scripts/agent-deckd-tmux.sh stop
   uv run agent-deckd --host 127.0.0.1 --port 8765
   ```
 
+## 智能体集成 (Hooks 配置)
+
+项目通过命令行工具支持对 Codex 的一键集成配置：
+1. **环境检测**：运行 `uv run agent-deckctl codex-detect --enable-integration` 获取配置建议。
+2. **预览配置 (Dry-run)**：运行 `uv run agent-deckctl codex-install` 预览待写入的 hooks 设置。
+3. **应用集成**：运行 `uv run agent-deckctl codex-install --apply` 自动完成本地 Codex 系统的 hooks 配置。
+
+更多高级配置及硬件排障，请参考 [使用指南](docs/guides/using-agent-deck.zh-CN.md)。
+
 
 ## 授权协议
 
