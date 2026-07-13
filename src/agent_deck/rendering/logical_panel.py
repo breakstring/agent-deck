@@ -440,7 +440,9 @@ def cycle_panel_content(
     """切换当前面板内部的内容维度，不跨越到其他 virtual panel。
 
     入参：`selection` 是当前选择状态；`direction` 指定向前或向后环形移动。
-    返回：Quota 在实际可用窗口之间切换、Usage 更新统计周期；Brand 和其他 panel 原样返回。
+    返回：Quota 在实际可用窗口之间切换、Usage 更新统计周期；当 Quota 当前为
+    `auto` 或过期窗口时，先按第一个实际窗口定位后继续向指定方向切换；Brand 和其他
+    panel 原样返回。
     错误处理：无；内容缺省值已由 Pydantic 枚举保证。
     副作用：无；不执行系统或硬件动作。
     """
@@ -452,7 +454,7 @@ def cycle_panel_content(
             return selection
         current = selection.quota_window
         if current not in order:
-            return selection.model_copy(update={"quota_window": order[0]})
+            current = order[0]
         return selection.model_copy(
             update={
                 "quota_window": _next_cyclic_value(

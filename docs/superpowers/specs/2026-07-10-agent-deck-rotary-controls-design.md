@@ -311,15 +311,16 @@ macOS 的内建屏与部分外接屏可能支持亮度调节，但不能假定�
 - 连续输入需要节流/合并，避免每个物理编码器抖动都触发一次昂贵的系统或 HID 写入。
 - 音频、系统显示器亮度和控制台亮度分别缓存最后确认值；短 TTL 或动作执行后主动刷新，不能长期相信本地写入结果。
 - 冷启动时读取 quota、Usage、音频和亮度可用状态；硬件下发优先使用已确认的缓存，后台再刷新。
-- quota 快照更新时预渲染 primary/secondary 两张基础面板；Usage 快照更新时预渲染 Day、Week、
-  Month、All 四张趋势基础面板。输入切换只能选择已缓存图、递增背景 revision，不得重新执行
-  `ccusage` 或在输入回调中聚合历史数据。
-- N4 Pro persistent renderer 仍是唯一 SDK 写入者。输入线程只能通知新的背景 revision；renderer 在
-  帧间等待中可被唤醒，并以 latest-wins 语义下发最新完整背景。连续热更新保留短合并间隔，避免
-  编码器快速旋转把 HID 队列塞满。
+- quota 快照更新时预渲染任意数量的可见额度窗口；Usage 快照更新时预渲染 Day、Week、Month、All
+  四张趋势基础面板。状态型主键复用同一快照并预渲染为 112x112 图片。输入切换只能选择已缓存图、
+  递增对应 revision，不得重新执行 `ccusage` 或在输入回调中聚合历史数据。
+- N4 Pro persistent renderer 仍是唯一 SDK 写入者。输入线程只能通知新的背景或静态主键 revision；
+  renderer 在帧间等待中可被唤醒，并以 latest-wins 语义下发最新完整背景或仅发生变化的静态键图。
+  连续热更新保留短合并间隔，避免编码器快速旋转或按键连击把 HID 队列塞满。
 - `/status.logical_panel` 应公开基础面板缓存命中/未命中、当前背景 revision 与最近成图耗时；
-  renderer timing 还应公开窗口内的背景热更新次数和耗时。SDK 没有像素已显示的确认回调，不能把
-  最终物理点亮时间伪报为可测指标。
+  `/status.streamdock_n4pro_renderer.static_key_surface` 应公开静态键 revision、最近变化键数和状态图
+  缓存命中/未命中。renderer timing 还应公开窗口内背景与静态键的热更新次数和耗时。SDK 没有像素
+  已显示的确认回调，不能把最终物理点亮时间伪报为可测指标。
 - 设备初始化、系统目标消失、SDK 写入失败或权限不足时，配置草稿不丢失，真机保留上一次成功状态，并在 GUI 中给出明确失败诊断。
 - Agent 反馈、审批、文本输入和任意 shell 始终不进入本阶段旋钮动作列表。
 

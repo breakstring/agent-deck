@@ -323,6 +323,50 @@ def test_persistent_animator_runs_session_output_once_per_render_without_reopeni
     assert [name for name, _ in device.calls].count("init") == 1
 
 
+def test_persistent_animator_reopens_when_n4pro_reenumerates(
+    tmp_path: Path,
+) -> None:
+    """N4 Pro 的 USB 路径变化后，persistent animator 应释放旧句柄并重连新设备。
+
+    入参：`tmp_path` 提供临时背景目录；fake manager 先枚举路径 A，随后模拟设备重新枚举为路径 B。
+    返回：无返回值；断言通过表示旧 HID 句柄不会在重枚举后继续接收按键、背景或 LED 写入。
+    错误处理：未关闭路径 A、没有打开/初始化路径 B，或 reconnect timing 缺失时由 pytest 报告。
+    副作用：仅写 pytest 临时图片并操作 fake device，不访问真实 N4 Pro。
+    """
+
+    original = FakeN4ProUnifiedDevice(path="n4pro-path-a")
+    replacement = FakeN4ProUnifiedDevice(path="n4pro-path-b")
+    manager = FakeUnifiedManager([original])
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=manager,
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+    background = Image.new("RGB", (800, 480), (1, 2, 3))
+
+    first = animator(
+        background_image=background,
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+    manager.devices = [replacement]
+    second = animator(
+        background_image=background,
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+
+    assert first.ok is True
+    assert second.ok is True
+    assert second.path == "n4pro-path-b"
+    assert second.timing_seconds["device_reconnected"] == 1.0
+    assert ("close", False) in original.calls
+    assert [name for name, _ in replacement.calls].count("open") == 1
+    assert [name for name, _ in replacement.calls].count("init") == 1
+
+
 def test_persistent_animator_refreshes_session_output_for_each_animation_frame(
     tmp_path: Path,
 ) -> None:
@@ -395,6 +439,55 @@ def test_persistent_animator_writes_a_new_background_revision_during_active_fram
     assert [name for name, _ in device.calls].count("open") == 1
     assert result.timing_seconds["background_hot_updates"] == 1.0
     assert result.timing_seconds["background_hot_update"] >= 0.0
+
+
+def test_persistent_animator_writes_static_key_diff_during_active_frame_loop(
+    tmp_path: Path,
+) -> None:
+    """长连接动画循环应在同一会话内立即写入状态键的最新差异图。
+
+    入参：`tmp_path` 提供最小 agent 动画帧；静态键 provider 先给出初始 revision，再给出一个
+    只包含键 1 的新图片 revision。
+    返回：无返回值；断言通过表示物理状态键切换不必等待下一轮 renderer tick。
+    错误处理：revision 未识别、静态键被重复写入或没有与下一帧一起 refresh 时由 pytest 报告。
+    副作用：仅操作 fake device 和 pytest 临时图片，不访问真实 N4 Pro。
+    """
+
+    frame = tmp_path / "frame.png"
+    Image.new("RGB", (96, 96), (10, 20, 30)).save(frame)
+    device = FakeN4ProUnifiedDevice()
+    initial = Image.new("RGB", (112, 112), (1, 2, 3))
+    updated = Image.new("RGB", (112, 112), (4, 5, 6))
+    revisions = iter(((1, {1: initial}), (2, {1: updated}), (2, {1: updated})))
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=FakeUnifiedManager([device]),
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+    animator.set_key_image_update_provider(lambda: next(revisions))
+
+    result = animator(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={2: (frame,)},
+        key_images={1: initial},
+        duration_seconds=0.2,
+        fps=10,
+    )
+
+    assert result.ok is True
+    assert [entry for entry in device.calls if entry == ("set_key_image", 1)] == [
+        ("set_key_image", 1),
+        ("set_key_image", 1),
+    ]
+    assert [entry for entry in device.calls if entry == ("set_key_image", 2)] == [
+        ("set_key_image", 2),
+        ("set_key_image", 2),
+    ]
+    assert [name for name, _ in device.calls].count("refresh") == 2
+    assert [name for name, _ in device.calls].count("open") == 1
+    assert result.timing_seconds["key_hot_updates"] == 1.0
+    assert result.timing_seconds["key_hot_keys"] == 1.0
+    assert result.timing_seconds["key_hot_update"] >= 0.0
 
 
 def test_persistent_animator_background_notification_wakes_frame_wait(

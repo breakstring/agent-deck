@@ -91,7 +91,7 @@ def test_panel_content_cycle_changes_quota_and_tokens_but_brand_is_silent_noop()
         quota,
         direction=PanelContentDirection.NEXT,
         available_quota_windows=("codex:primary", "codex:secondary"),
-    ).quota_window == "codex:primary"
+    ).quota_window == "codex:secondary"
     assert cycle_panel_content(
         tokens, direction=PanelContentDirection.NEXT
     ).token_period == CodexTokenPeriod.WEEK
@@ -234,7 +234,7 @@ def test_knob4_cycles_quota_window_or_token_period_without_changing_panel() -> N
         available_quota_windows=("codex:primary", "codex:secondary"),
     )
     assert quota_selection.active_kind == PanelKind.QUOTA
-    assert quota_selection.quota_window == "codex:primary"
+    assert quota_selection.quota_window == "codex:secondary"
 
     token_selection = PanelSelection(
         active_kind=PanelKind.TOKENS,

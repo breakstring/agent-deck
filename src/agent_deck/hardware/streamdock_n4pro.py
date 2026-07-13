@@ -28,6 +28,7 @@ StreamDockInputCallback = Callable[[object, object], None]
 StreamDockN4ProSessionOutputCallback = Callable[[object, bool], str | None]
 StreamDockN4ProBackgroundUpdateProvider = Callable[[], tuple[int, Image.Image | None]]
 StreamDockN4ProBackgroundWaiter = Callable[[float], bool]
+StreamDockN4ProKeyImageUpdateProvider = Callable[[], tuple[int, Mapping[int, Image.Image]]]
 
 _MIN_BACKGROUND_UPDATE_INTERVAL_SECONDS = 0.04
 """连续输入时同会话背景热更新的最短间隔，超过此频率时只保留最新 revision。"""
@@ -177,7 +178,7 @@ class StreamDockN4ProPersistentAnimator:
 
     入参：`manager` 可注入 fake 或官方 DeviceManager；`temp_dir` 控制临时背景 JPEG 目录；
     `sleep` 和 `monotonic` 仅供测试替换。实例会在第一次调用时 open/init N4 Pro，并在后续
-    调用中复用同一个设备会话，直到显式调用 `close()`。
+    调用中复用同一个设备会话，直到显式调用 `close()` 或 SDK 枚举显示 N4 Pro 已更换 USB 路径。
     返回：实例本身是 callable，签名兼容 `animate_key_images_on_n4pro`。
     错误处理：设备枚举/open/init 或 SDK 下发失败时返回 `ok=False`；显式 close 会吞掉 SDK
     close 异常，避免 daemon shutdown 失败。
@@ -213,6 +214,9 @@ class StreamDockN4ProPersistentAnimator:
         self._background_update_provider: StreamDockN4ProBackgroundUpdateProvider | None = None
         self._last_background_revision: int | None = None
         self._last_background_update_monotonic: float | None = None
+        self._key_image_update_provider: StreamDockN4ProKeyImageUpdateProvider | None = None
+        self._last_key_image_revision: int | None = None
+        self._last_key_images: dict[int, Image.Image] = {}
         self._background_update_event = Event()
         self._background_wait = background_wait or (
             self._background_update_event.wait if sleep is time.sleep else None
@@ -252,8 +256,23 @@ class StreamDockN4ProPersistentAnimator:
 
         self._background_update_provider = provider
 
+    def set_key_image_update_provider(
+        self,
+        provider: StreamDockN4ProKeyImageUpdateProvider | None,
+    ) -> None:
+        """设置静态主按键的热更新 provider。
+
+        入参：`provider` 返回单调递增 revision 与当前完整静态键图映射；映射不得包含当前由动画帧
+        控制的 agent 键。animator 会基于上次已写图片引用计算本次仅需下发的差异。
+        返回：无显式返回值。
+        错误处理：设置阶段不读取 provider，也不访问 SDK。
+        副作用：覆盖实例内存 provider；当前活跃帧循环会在下次检查 revision 时使用新值。
+        """
+
+        self._key_image_update_provider = provider
+
     def notify_background_update(self) -> None:
-        """通知持久 animator 有新的背景 revision 可在同会话内尽快下发。
+        """通知持久 animator 有新的背景或静态键 revision 可在同会话内尽快下发。
 
         入参：无；调用方必须已经把新图写入 provider 可读的 daemon 内存缓存。
         返回：无。
@@ -304,14 +323,14 @@ class StreamDockN4ProPersistentAnimator:
         started_at = self._monotonic()
         temp_paths: list[Path] = []
         try:
-            was_open = self._device is not None
+            previous_device = self._device
             device = self._ensure_open_device(timing=timing, started_at=started_at)
             if isinstance(device, StreamDockN4ProAnimationResult):
                 return device
 
             session_output_error = self._apply_session_output(
                 device,
-                initialized=not was_open,
+                initialized=device is not previous_device,
             )
 
             background_result: object | None = None
@@ -321,6 +340,14 @@ class StreamDockN4ProPersistentAnimator:
                 if provider_image is not None:
                     background_image = provider_image
                 self._last_background_revision = revision
+            initial_key_image_revision = self._read_key_image_revision()
+            if initial_key_image_revision is not None:
+                initial_key_revision, initial_key_images = initial_key_image_revision
+                if initial_key_images:
+                    normalized_key_images = dict(initial_key_images)
+                self._last_key_image_revision = initial_key_revision
+                self._last_key_images = dict(normalized_key_images)
+            key_count = len(set(normalized_frames) | set(normalized_key_images))
             after_open_init = self._monotonic()
             after_background = after_open_init
             if background_image is not None:
@@ -372,9 +399,16 @@ class StreamDockN4ProPersistentAnimator:
             frames_rendered = 0
             background_hot_updates = 0
             background_hot_update_seconds = 0.0
+            key_hot_updates = 0
+            key_hot_update_seconds = 0.0
+            key_hot_keys = 0
             playback_started_at = after_static
             next_frame_at = playback_started_at
-            if normalized_frames or self._background_update_provider is not None:
+            if (
+                normalized_frames
+                or self._background_update_provider is not None
+                or self._key_image_update_provider is not None
+            ):
                 for frame_index in range(frame_budget):
                     background_update_started_at = self._monotonic()
                     background_updated, updated_background_result, background_update_error = (
@@ -400,6 +434,32 @@ class StreamDockN4ProPersistentAnimator:
                             background_result = updated_background_result
                         background_hot_updates += 1
                         background_hot_update_seconds += background_update_elapsed
+                    key_update_started_at = self._monotonic()
+                    key_updated, updated_key_count, key_update_error = (
+                        self._write_pending_key_image_update(
+                            device,
+                            temp_paths=temp_paths,
+                        )
+                    )
+                    key_update_elapsed = _elapsed_seconds(
+                        key_update_started_at,
+                        self._monotonic(),
+                    )
+                    if key_update_error is not None:
+                        self.close()
+                        return StreamDockN4ProAnimationResult(
+                            ok=False,
+                            device_type=self._device_type,
+                            path=self._path,
+                            background_result=_stringify_optional(background_result),
+                            frames_rendered=frames_rendered,
+                            key_count=key_count,
+                            error=key_update_error,
+                        )
+                    if key_updated:
+                        key_hot_updates += 1
+                        key_hot_update_seconds += key_update_elapsed
+                        key_hot_keys += updated_key_count
                     frame_session_output_error = self._apply_session_output(
                         device,
                         initialized=False,
@@ -448,6 +508,9 @@ class StreamDockN4ProPersistentAnimator:
             )
             timing["background_hot_updates"] = float(background_hot_updates)
             timing["background_hot_update"] = background_hot_update_seconds
+            timing["key_hot_updates"] = float(key_hot_updates)
+            timing["key_hot_update"] = key_hot_update_seconds
+            timing["key_hot_keys"] = float(key_hot_keys)
             timing["close"] = 0.0
             timing["total"] = _elapsed_seconds(started_at, self._monotonic())
             return StreamDockN4ProAnimationResult(
@@ -487,6 +550,8 @@ class StreamDockN4ProPersistentAnimator:
         self._path = None
         self._last_background_revision = None
         self._last_background_update_monotonic = None
+        self._last_key_image_revision = None
+        self._last_key_images = {}
         self._background_update_event.clear()
         if device is None:
             return
@@ -534,6 +599,25 @@ class StreamDockN4ProPersistentAnimator:
         except Exception:
             return None
 
+    def _read_key_image_revision(
+        self,
+    ) -> tuple[int, Mapping[int, Image.Image]] | None:
+        """读取静态按键 provider 的最新 revision，并将异常降级为本帧无更新。
+
+        入参：无。
+        返回：无 provider 时为 None；正常时返回 revision 与当前完整静态键图映射。
+        错误处理：provider 异常被吞掉，避免一次缓存读取失败关闭真实设备会话。
+        副作用：只读取 daemon 内存中的 revision 与 Pillow 图像引用，不访问 SDK。
+        """
+
+        provider = self._key_image_update_provider
+        if provider is None:
+            return None
+        try:
+            return provider()
+        except Exception:
+            return None
+
     def _write_pending_background_update(
         self,
         device: StreamDockN4ProDeviceLike,
@@ -573,8 +657,51 @@ class StreamDockN4ProPersistentAnimator:
         self._last_background_update_monotonic = self._monotonic()
         return True, result, None
 
+    def _write_pending_key_image_update(
+        self,
+        device: StreamDockN4ProDeviceLike,
+        *,
+        temp_paths: list[Path],
+    ) -> tuple[bool, int, str | None]:
+        """在活跃帧循环内下发 revision 已变化的静态键图。
+
+        入参：`device` 是当前已 open/init 的 N4 Pro；`temp_paths` 收集本轮 PNG 以便统一清理。
+        返回：依次为是否写入、写入键数和可选错误文本；没有新 revision 时返回 `(False, 0, None)`。
+        错误处理：provider 缺失或异常降级为无更新；非法键或 SDK 写入失败返回错误，调用方关闭会话。
+        副作用：revision 变化时只比较并调用本次完整映射中发生变化的键的 `set_key_image`，由同一帧
+        的 `refresh` 可见化，不会新建 HID 会话。
+        """
+
+        pending = self._read_key_image_revision()
+        if pending is None:
+            return False, 0, None
+        revision, key_images = pending
+        if revision == self._last_key_image_revision:
+            return False, 0, None
+        normalized_images = dict(key_images)
+        invalid_keys = sorted(key for key in normalized_images if key not in range(1, 16))
+        if invalid_keys:
+            return False, 0, f"key image update keys must be in range 1..15: {invalid_keys}"
+        changed_images = {
+            key: image
+            for key, image in normalized_images.items()
+            if self._last_key_images.get(key) is not image
+        }
+        try:
+            for key, image in changed_images.items():
+                key_path = _save_temp_png(image, temp_dir=self._temp_dir)
+                temp_paths.append(key_path)
+                result = device.set_key_image(key, str(key_path))
+                if result == -1:
+                    return False, 0, f"set_key_image update failed for key {key}: SDK returned -1"
+        except Exception as exc:
+            return False, 0, f"set_key_image update failed: {type(exc).__name__}: {exc}"
+        self._last_key_image_revision = revision
+        self._last_key_images = normalized_images
+        return bool(changed_images), len(changed_images), None
+
     def _wait_for_next_frame(self, delay_seconds: float) -> None:
-        """等待下一帧或被新的背景 revision 提前唤醒。
+        """等待下一帧或被新的背景、静态键 revision 提前唤醒。
 
         入参：`delay_seconds` 是原本要等待的帧间隔。
         返回：无。
@@ -595,19 +722,30 @@ class StreamDockN4ProPersistentAnimator:
         timing: dict[str, float],
         started_at: float,
     ) -> StreamDockN4ProDeviceLike | StreamDockN4ProAnimationResult:
-        """返回已打开设备；必要时首次枚举、open 并 init。
+        """返回当前枚举路径对应的已打开设备；必要时重连、open 并 init。
 
-        入参：`timing` 是本轮 timing 结果容器；`started_at` 是本轮开始 monotonic 时间。
+        入参：`timing` 是本轮 timing 结果容器；`started_at` 是本轮开始 monotonic 时间。每轮会先
+        只读枚举 N4 Pro，并与当前持有会话的 SDK 路径比较。
         返回：成功时返回 device；失败时返回 `ok=False` 的结果对象。
-        错误处理：open false 和找不到设备转为错误结果；其他异常交给调用方捕获。
-        副作用：可能加载 SDK、枚举设备并 open/init N4 Pro。
+        错误处理：open false、设备消失和找不到设备转为错误结果；枚举/SDK 异常交给调用方捕获。
+        副作用：路径未变时复用当前会话；路径变化时先 `close(notify=False)` 释放失效 HID 句柄，再
+        open/init 新枚举的设备，并在 timing 中记录 `device_reconnected=1`。
         """
 
-        if self._device is not None:
-            timing["open_init"] = 0.0
-            return self._device
         active_manager = self._manager if self._manager is not None else _load_default_manager()
         device = _first_n4pro_device(active_manager.enumerate())
+        if self._device is not None:
+            if device is not None and _safe_path(device) == self._path:
+                timing["open_init"] = 0.0
+                timing["device_reconnected"] = 0.0
+                return self._device
+            self.close()
+            if device is None:
+                return StreamDockN4ProAnimationResult(
+                    ok=False,
+                    error="N4 Pro disappeared while persistent renderer was active",
+                )
+            timing["device_reconnected"] = 1.0
         if device is None:
             return StreamDockN4ProAnimationResult(ok=False, error="no N4 Pro device found")
         self._device_type = type(device).__name__
@@ -624,6 +762,7 @@ class StreamDockN4ProPersistentAnimator:
         self._register_input_callback(device)
         self._device = device
         timing["open_init"] = _elapsed_seconds(started_at, self._monotonic())
+        timing.setdefault("device_reconnected", 0.0)
         return device
 
     def _register_input_callback(self, device: StreamDockN4ProDeviceLike) -> None:

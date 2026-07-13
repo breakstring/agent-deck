@@ -83,6 +83,29 @@ def test_url_icon_cache_reuses_fresh_metadata(tmp_path: Path) -> None:
     assert cache.resolve_file("../bad", "icon-96.png") is None
 
 
+def test_url_icon_cache_reuses_key_image_object_until_refresh(tmp_path: Path) -> None:
+    """同一 URL 图标缓存版本应复用内存 key 图片对象。
+
+    入参：`tmp_path` 提供隔离缓存目录和不访问网络的 fake fetcher。
+    返回：无返回值；断言通过表示 renderer 可按对象身份识别 URL 静态键未变化。
+    错误处理：重复读取重新打开 PNG、或强制解析后仍复用旧图片时由 pytest 报告。
+    副作用：只读写 pytest 临时目录中的 URL 图标缓存，不访问互联网。
+    """
+
+    cache = UrlIconCache(tmp_path / "cache", fetcher=_fake_site_fetcher([]))
+    cache.ensure("https://example.com")
+
+    first = cache.key_image_for_url("https://example.com/path")
+    second = cache.key_image_for_url("https://example.com/other")
+    cache.ensure("https://example.com", force=True)
+    refreshed = cache.key_image_for_url("https://example.com")
+
+    assert first is not None
+    assert second is first
+    assert refreshed is not None
+    assert refreshed is not first
+
+
 def test_url_icon_cache_falls_back_when_favicon_missing(tmp_path: Path) -> None:
     """favicon 下载失败时应生成 token fallback 图标。
 

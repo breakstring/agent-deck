@@ -1534,6 +1534,50 @@ def test_streamdock_n4pro_key_images_include_cached_status_bindings() -> None:
     assert second[2] is first[2]
 
 
+def test_runtime_publishes_only_changed_static_key_images_for_hot_update() -> None:
+    """状态键切换应只向 persistent renderer 发布变更的静态键图片。
+
+    入参：无；测试配置一个 quota status 键、写入缓存 quota 快照，再把该键切到另一窗口。
+    返回：无返回值；断言通过表示输入路径只构建缓存图选择和一键差异，不等待下一次全量 renderer。
+    错误处理：revision 未递增、差异包含无关键或状态键缓存未复用时由 pytest 报告。
+    副作用：只修改测试 app 的进程内 runtime，不访问真实 N4 Pro 或用户配置。
+    """
+
+    key_layout = N4ProKeyLayout(
+        keys=(
+            N4ProKeyBinding(
+                index=0,
+                kind=KeySurfaceKind.QUOTA_STATUS,
+                quota_window="auto",
+            ),
+            *default_n4pro_key_layout().sorted_keys()[1:],
+        )
+    )
+    app = create_app()
+    runtime = app.state.runtime
+    runtime.key_layout = key_layout
+    runtime.update_codex_quota(_quota_snapshot(), updated_at=datetime.now(UTC))
+
+    initial_revision, initial_images = runtime.current_hardware_key_surface_images()
+    assert initial_revision == 1
+    assert sorted(initial_images) == [1]
+
+    assert runtime._replace_key_binding(
+        0,
+        kind="quota_status",
+        update={"quota_window": "secondary"},
+    )
+    layout = runtime.render_current()
+    runtime.prewarm_status_key_images(layout)
+    runtime.publish_hardware_key_surface_images(layout)
+    updated_revision, updated_images = runtime.current_hardware_key_surface_images()
+
+    assert updated_revision == initial_revision + 1
+    assert sorted(updated_images) == [1]
+    assert updated_images[1] is not initial_images[1]
+    assert runtime.status_key_image_cache.diagnostics()["hits"] >= 1
+
+
 def test_hardware_status_key_press_cycles_quota_window_and_usage_period() -> None:
     """按下状态型主键应切换当前展示窗口/周期，而不是执行外部动作。
 
@@ -1584,7 +1628,7 @@ def test_status_key_cycles_all_actual_quota_window_ids() -> None:
 
     入参：无；启动带双窗口 fake quota poller 的 daemon，并连续按下 quota 状态键。
     返回：无返回值；断言通过代表运行时会把 stable window_id 写回暂存布局。
-    错误处理：窗口漏入循环、顺序不稳定或没有回到 auto 时由 pytest 报告。
+    错误处理：窗口漏入循环、顺序不稳定或混入 `auto` 别名时由 pytest 报告。
     副作用：仅测试内存 daemon 和 fake quota reader，不写用户配置或访问硬件。
     """
 
@@ -1611,7 +1655,32 @@ def test_status_key_cycles_all_actual_quota_window_ids() -> None:
             for _ in range(3)
         ]
 
-    assert windows == ["codex:primary", "codex:secondary", "auto"]
+    assert windows == ["codex:secondary", "codex:primary", "codex:secondary"]
+
+
+def test_quota_status_key_cycle_skips_auto_alias_between_visible_windows() -> None:
+    """多窗口 quota 状态键不得在真实周期之间插入无视觉变化的 `auto`。
+
+    入参：双窗口 quota 快照，以及已显式选中的常规与 Spark 周限 window_id。
+    返回：无返回值；断言通过代表每次按下都会切换到另一个实际展示窗口。
+    错误处理：返回 `auto` 或没有切换到另一窗口时由 pytest 报告。
+    副作用：无；只调用纯窗口选择 helper。
+    """
+
+    snapshot = _quota_snapshot()
+
+    assert (
+        server_app._next_quota_status_window("codex:primary", snapshot=snapshot)
+        == "codex:secondary"
+    )
+    assert (
+        server_app._next_quota_status_window("codex:secondary", snapshot=snapshot)
+        == "codex:primary"
+    )
+    assert (
+        server_app._next_quota_status_window("auto", snapshot=snapshot)
+        == "codex:secondary"
+    )
 
 
 def test_quota_presentation_controls_displayed_windows_and_status_key_cycle(
@@ -1698,7 +1767,7 @@ def test_quota_presentation_controls_displayed_windows_and_status_key_cycle(
         item["window_id"] for item in status["codex_quota"]["display_snapshot"]["windows"]
     ] == ["codex_spark:primary", "codex:primary"]
     assert status["codex_quota"]["display_snapshot"]["windows"][0]["presentation_label"] == "Spark"
-    assert windows == ["codex_spark:primary", "codex:primary", "auto"]
+    assert windows == ["codex:primary", "codex_spark:primary", "codex:primary"]
 
 
 def test_single_quota_window_keeps_status_key_in_auto_mode() -> None:

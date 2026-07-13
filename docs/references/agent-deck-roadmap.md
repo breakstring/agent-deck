@@ -159,9 +159,10 @@ flowchart LR
     基础色，避免多次 `init()` 造成清屏或亮度复位。
     Usage touch bar 采用“金额 + 总 Token + 单条周期色历史趋势 + 四项 Token 细则”的紧凑布局；
     曲线与 usage status key 共用 ccusage daily raw 的周期聚合与 Day/Week/Month/All 身份色。
-    quota 两窗口和 Usage 四周期的完整背景图在快照更新时预渲染到进程内缓存，输入只选择缓存图并
-    递增 revision。persistent renderer 是唯一 HID 写入者，输入线程只唤醒其帧间等待；连续 revision
-    以 latest-wins 和短合并窗口下发，避免输入高频时排队旧背景。
+    任意数量的可见 quota 窗口和 Usage 四周期的完整背景图在快照更新时预渲染到进程内缓存；状态型
+    主键也复用同一 quota/usage 数据并预渲染为 112x112 图片。输入只选择缓存图、递增对应 revision。
+    persistent renderer 是唯一 HID 写入者，输入线程只唤醒其帧间等待；背景和静态主键差异都以
+    latest-wins 和短合并窗口下发，避免输入高频时排队旧显示。
     `/status` 的 `streamdock_input.recent_events` 和 `interaction.recent` 保留最近输入与
     业务 intent/action 的小型 ring buffer，用于真实硬件现场调试按键序列。
     实测 N4 Pro 的 10 个主物理按键在 SDK button event 中上报为 `key=11..20`，

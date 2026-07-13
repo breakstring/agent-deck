@@ -384,6 +384,8 @@ class StatusKeyImageCache:
         """
 
         self._images: dict[tuple[object, ...], Any] = {}
+        self._hits = 0
+        self._misses = 0
 
     def clear(self) -> None:
         """清空所有已渲染状态按键图片。
@@ -436,11 +438,14 @@ class StatusKeyImageCache:
         )
         image = self._images.get(key)
         if image is None:
+            self._misses += 1
             image = render_quota_status_key_image(
                 snapshot,
                 window=normalized_window,
             )
             self._store(key, image)
+        else:
+            self._hits += 1
         return image
 
     def usage_image(
@@ -467,12 +472,33 @@ class StatusKeyImageCache:
         )
         image = self._images.get(key)
         if image is None:
+            self._misses += 1
             image = render_usage_summary_key_image(
                 snapshot,
                 period=normalized_period,
             )
             self._store(key, image)
+        else:
+            self._hits += 1
         return image
+
+    def diagnostics(self) -> dict[str, int]:
+        """返回状态型主按键图片缓存的最小诊断快照。
+
+        入参：无。
+        返回：缓存条目总数、quota/usage 分类条目数、命中与未命中次数。
+        错误处理：无。
+        副作用：无；不会触发图片渲染或访问硬件。
+        """
+
+        keys = tuple(self._images)
+        return {
+            "entries": len(keys),
+            "quota_entries": sum(key[0] == "quota_status" for key in keys),
+            "usage_entries": sum(key[0] == "usage_summary" for key in keys),
+            "hits": self._hits,
+            "misses": self._misses,
+        }
 
 
 class LogicalPanelImageCache:
@@ -654,6 +680,9 @@ class _DaemonRuntime:
     logical_panel_background_revision: int
     logical_panel_last_render_duration_ms: float | None
     hardware_background_notifier: Callable[[], None] | None
+    hardware_key_surface_revision: int
+    hardware_key_surface_images: dict[int, Any]
+    hardware_key_surface_pending_images: dict[int, Any]
     streamdock_touch_tap_last_handled_monotonic: float | None
     streamdock_knob4_rotate_accumulator: int
     streamdock_input_event_count: int
@@ -757,6 +786,7 @@ class _DaemonRuntime:
         self.key_layout = layout
         rendered_layout = self.render_current()
         self.prewarm_status_key_images(rendered_layout)
+        self.publish_hardware_key_surface_images(rendered_layout)
         return {
             "key_layout": _dump_model(self.current_key_layout_response()),
             "layout": _dump_model(rendered_layout),
@@ -809,13 +839,13 @@ class _DaemonRuntime:
         self,
         notifier: Callable[[], None] | None,
     ) -> None:
-        """设置由 persistent animator 提供的同会话背景更新唤醒器。
+        """设置由 persistent animator 提供的同会话 surface 更新唤醒器。
 
         入参：`notifier` 只能通知已有 animator 读取最新 revision，不能直接访问 SDK；None 表示
         当前 fake 或外部 renderer 不支持主动唤醒。
         返回：无。
         错误处理：设置阶段不调用 notifier，不传播硬件异常。
-        副作用：覆盖 runtime 内存回调；下一次面板 revision 变化时可能唤醒硬件帧循环。
+        副作用：覆盖 runtime 内存回调；下一次背景或静态键 revision 变化时可能唤醒硬件帧循环。
         """
 
         self.hardware_background_notifier = notifier
@@ -865,6 +895,7 @@ class _DaemonRuntime:
         self.rotary_layout_last_error = None
         rendered_layout = self.render_current()
         self.prewarm_status_key_images(rendered_layout)
+        self.publish_hardware_key_surface_images(rendered_layout)
         self.render_current_logical_panel_image()
         return {
             "key_layout": _dump_model(self.current_key_layout_response()),
@@ -984,6 +1015,7 @@ class _DaemonRuntime:
             self.logical_panel_image_cache.prewarm_quota(displayed_snapshot)
         image = self.render_current_logical_panel_image()
         self.prewarm_status_key_images()
+        self.publish_hardware_key_surface_images()
         return image
 
     def displayed_codex_quota_snapshot(self) -> CodexQuotaSnapshot | None:
@@ -1020,6 +1052,7 @@ class _DaemonRuntime:
         self.codex_token_usage_last_error = None
         self.logical_panel_image_cache.prewarm_tokens(snapshot)
         self.prewarm_status_key_images()
+        self.publish_hardware_key_surface_images()
         return self.render_current_logical_panel_image()
 
     def _available_quota_windows(self) -> tuple[str, ...] | None:
@@ -1611,6 +1644,7 @@ class _DaemonRuntime:
             }
         layout = self.render_current()
         self.prewarm_status_key_images(layout)
+        self.publish_hardware_key_surface_images(layout)
         return {
             "intent": intent.intent,
             "key_index": intent.key_index,
@@ -1645,6 +1679,7 @@ class _DaemonRuntime:
             }
         layout = self.render_current()
         self.prewarm_status_key_images(layout)
+        self.publish_hardware_key_surface_images(layout)
         return {
             "intent": intent.intent,
             "key_index": intent.key_index,
@@ -1706,6 +1741,58 @@ class _DaemonRuntime:
             token_usage_snapshot=self.codex_token_usage_snapshot,
             status_key_cache=self.status_key_image_cache,
         )
+
+    def publish_hardware_key_surface_images(
+        self,
+        layout: LayoutPlan | None = None,
+        *,
+        notify: bool = True,
+    ) -> dict[int, Any]:
+        """生成静态主键差异，并发布给已打开的 persistent renderer。
+
+        入参：`layout` 可复用本次业务路径已生成的 renderer-neutral layout；为空时重建当前
+        layout。`notify` 仅在调用方即将同步执行 renderer 首帧时设为 False，避免无意义唤醒。
+        返回：当前完整静态键图映射，只包含 App、URL、quota status 和 usage summary，不含由
+        agent 动画帧控制的键。
+        错误处理：图标或状态图渲染失败按原语义传播；本方法不访问 SDK。
+        副作用：内容引用发生变化时替换待下发差异、递增 revision，并可唤醒持久硬件帧循环；
+        多次快速调用只保留最新差异图，保证硬件侧 latest-wins。
+        """
+
+        resolved_layout = layout or self.render_current()
+        key_images = _key_images_from_layout(
+            resolved_layout,
+            app_icon_cache=self.app_icon_cache,
+            url_icon_cache=self.url_icon_cache,
+            quota_snapshot=self.displayed_codex_quota_snapshot(),
+            token_usage_snapshot=self.codex_token_usage_snapshot,
+            status_key_cache=self.status_key_image_cache,
+        )
+        changed_images = {
+            key: image
+            for key, image in key_images.items()
+            if self.hardware_key_surface_images.get(key) is not image
+        }
+        self.hardware_key_surface_images = key_images
+        if not changed_images:
+            return key_images
+        self.hardware_key_surface_pending_images = changed_images
+        self.hardware_key_surface_revision += 1
+        if notify:
+            self._notify_hardware_background_update()
+        return key_images
+
+    def current_hardware_key_surface_images(self) -> tuple[int, dict[int, Any]]:
+        """返回真实 renderer 可读取的当前完整静态键图片 revision 与快照。
+
+        入参：无；只读取 daemon 已缓存的完整静态键图与待下发差异。
+        返回：单调递增 revision 和当前完整静态键图副本；空映射代表尚无首次静态键图。renderer
+        在它自己的单一硬件线程中以图片引用与上次已写快照比较，确保只下发发生变化的键。
+        错误处理：无；不创建图片、不访问 SDK。
+        副作用：无；复制映射以避免硬件线程遍历时看到 handler 的后续替换。
+        """
+
+        return self.hardware_key_surface_revision, dict(self.hardware_key_surface_images)
 
     def show_brand_feedback_panel(self, intent: InteractionIntent) -> dict[str, Any]:
         """短暂显示 Agent Deck 默认品牌面板。
@@ -2240,6 +2327,13 @@ class _DaemonRuntime:
                 "applied_console_brightness_percent": self.n4pro_last_applied_brightness_percent,
                 "applied_lighting": self.n4pro_last_applied_lighting,
                 "applied_led_brightness_percent": self.n4pro_last_applied_led_brightness_percent,
+                "static_key_surface": {
+                    "revision": self.hardware_key_surface_revision,
+                    "latest_change_key_count": len(
+                        self.hardware_key_surface_pending_images
+                    ),
+                    "image_cache": self.status_key_image_cache.diagnostics(),
+                },
             },
             "streamdock_input": {
                 "event_count": self.streamdock_input_event_count,
@@ -2422,6 +2516,9 @@ def _build_default_n4pro_renderer_sink(
     background_setter = getattr(animator, "set_background_update_provider", None)
     if callable(background_setter):
         background_setter(runtime.current_hardware_background)
+    key_image_setter = getattr(animator, "set_key_image_update_provider", None)
+    if callable(key_image_setter):
+        key_image_setter(runtime.current_hardware_key_surface_images)
     notifier = getattr(animator, "notify_background_update", None)
     if callable(notifier):
         runtime.set_hardware_background_notifier(notifier)
@@ -2538,6 +2635,9 @@ def create_app(
         logical_panel_background_revision=0,
         logical_panel_last_render_duration_ms=None,
         hardware_background_notifier=None,
+        hardware_key_surface_revision=0,
+        hardware_key_surface_images={},
+        hardware_key_surface_pending_images={},
         streamdock_touch_tap_last_handled_monotonic=None,
         streamdock_knob4_rotate_accumulator=0,
         streamdock_input_event_count=0,
@@ -3282,13 +3382,9 @@ async def _render_streamdock_n4pro_once(
             layout,
             frame_root=frame_root,
         )
-        key_images = _key_images_from_layout(
+        key_images = runtime.publish_hardware_key_surface_images(
             layout,
-            app_icon_cache=runtime.app_icon_cache,
-            url_icon_cache=runtime.url_icon_cache,
-            quota_snapshot=runtime.codex_quota_snapshot,
-            token_usage_snapshot=runtime.codex_token_usage_snapshot,
-            status_key_cache=runtime.status_key_image_cache,
+            notify=False,
         )
         result = await asyncio.to_thread(
             renderer_sink,
@@ -3467,21 +3563,22 @@ def _next_quota_status_window(
     """返回 quota status 按键下一个展示窗口。
 
     入参：`value` 是当前窗口。
-    返回：按 `auto -> 实际 window_id -> auto` 循环后的字符串；没有快照时保持 `auto`。
-    错误处理：未知值视为 `auto`。
+    返回：多窗口时在实际 `window_id` 之间循环；`auto` 和过期值先解析为默认
+    实际窗口，再返回其后一个窗口。单窗口或没有快照时保持 `auto`。
+    错误处理：未知值按 quota 快照的默认窗口解析；解析结果异常时回退第一个实际窗口。
     副作用：无。
     """
 
     if snapshot is None:
         return "auto"
     available = tuple(item.window_id for item in snapshot.available_windows())
-    if len(available) == 1:
+    if len(available) <= 1:
         return "auto"
-    order = ("auto", *available)
     current = _normalize_quota_status_window(value)
-    if current not in order:
-        current = snapshot.resolved_window(current).window_id
-    return order[(order.index(current) + 1) % len(order)]
+    if current not in available:
+        resolved = snapshot.resolved_window(current).window_id
+        current = resolved if resolved in available else available[0]
+    return available[(available.index(current) + 1) % len(available)]
 
 
 def _next_token_usage_period(value: str | None) -> str:

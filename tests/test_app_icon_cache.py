@@ -73,6 +73,45 @@ def test_app_icon_cache_reuses_fresh_metadata(tmp_path: Path) -> None:
     assert cache.resolve_file("../bad", "icon-96.png") is None
 
 
+def test_app_icon_cache_reuses_key_image_object_until_refresh(tmp_path: Path) -> None:
+    """同一 App 图标缓存版本应复用内存 key 图片对象。
+
+    入参：`tmp_path` 提供 fake Finder bundle 和隔离缓存目录。
+    返回：无返回值；断言通过表示 renderer 可用对象身份快速判断 App 静态键没有变化。
+    错误处理：重复读取重新打开 PNG、或强制刷新后仍复用旧图片时由 pytest 报告。
+    副作用：只读写 pytest 临时目录中的 App 图标缓存。
+    """
+
+    app_path = _fake_finder_app(tmp_path)
+    cache = AppIconCache(tmp_path / "cache")
+    app = _app_info(app_path)
+
+    first = cache.key_image_for_binding(
+        app_name=app.name,
+        app_path=app.app_path,
+        bundle_id=app.bundle_id,
+        icon_token=app.icon_token,
+    )
+    second = cache.key_image_for_binding(
+        app_name=app.name,
+        app_path=app.app_path,
+        bundle_id=app.bundle_id,
+        icon_token=app.icon_token,
+    )
+    cache.ensure_for_app(app, force=True)
+    refreshed = cache.key_image_for_binding(
+        app_name=app.name,
+        app_path=app.app_path,
+        bundle_id=app.bundle_id,
+        icon_token=app.icon_token,
+    )
+
+    assert first is not None
+    assert second is first
+    assert refreshed is not None
+    assert refreshed is not first
+
+
 def test_cache_key_for_app_falls_back_to_path_hash() -> None:
     """缺少 bundle id 时 cache key 应使用稳定 path hash。
 

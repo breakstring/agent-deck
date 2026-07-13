@@ -80,6 +80,7 @@ class AppIconCache:
 
         self.root = root.expanduser()
         self.url_prefix = url_prefix.rstrip("/")
+        self._key_images: dict[str, Image.Image] = {}
 
     def ensure_for_app(
         self,
@@ -168,6 +169,7 @@ class AppIconCache:
                 "updated_at": datetime.now(UTC).isoformat(),
             },
         )
+        self._key_images.pop(cache_key, None)
         return self._entry(cache_key, status="ready", updated=True)
 
     def key_image_for_binding(
@@ -182,9 +184,11 @@ class AppIconCache:
         """读取适合硬件下发的缓存 key 图。
 
         入参：App binding identity 来自 `KeyPlan.payload`。
-        返回：RGB `Image`；缓存或读取失败时返回 None，让调用方 fallback。
+        返回：RGB `Image`；同一缓存版本会复用同一个进程内图片对象，缓存或读取失败时返回 None，
+        让调用方 fallback。
         错误处理：坏缓存图片返回 None；写缓存失败向上传播。
-        副作用：缓存缺失或过期时可能重建。
+        副作用：缓存缺失或过期时可能重建；首次读取一个缓存版本时把 Pillow 图保存在进程内，图标
+        重建后会自动失效该引用。
         """
 
         entry = self.ensure(
@@ -196,10 +200,15 @@ class AppIconCache:
         )
         if entry.key_icon_path is None:
             return None
+        cached = self._key_images.get(entry.cache_key)
+        if cached is not None:
+            return cached
         try:
             with Image.open(entry.key_icon_path) as image:
                 image.load()
-                return image.convert("RGB")
+                key_image = image.convert("RGB")
+                self._key_images[entry.cache_key] = key_image
+                return key_image
         except Exception:
             return None
 

@@ -98,6 +98,7 @@ class UrlIconCache:
         self.root = root.expanduser()
         self.url_prefix = url_prefix.rstrip("/")
         self.fetcher = fetcher or fetch_favicon_bytes
+        self._key_images: dict[str, Image.Image] = {}
 
     def ensure(self, url: str, *, force: bool = False) -> CachedUrlIcon:
         """显式解析网页并确保 URL origin 已有 favicon 或 fallback 图标缓存。
@@ -157,6 +158,7 @@ class UrlIconCache:
                 "updated_at": datetime.now(UTC).isoformat(),
             },
         )
+        self._key_images.pop(cache_key, None)
         return self._entry(
             cache_key,
             origin=origin,
@@ -245,6 +247,7 @@ class UrlIconCache:
                 "updated_at": datetime.now(UTC).isoformat(),
             },
         )
+        self._key_images.pop(cache_key, None)
         return self._entry(
             cache_key,
             origin=origin,
@@ -259,9 +262,11 @@ class UrlIconCache:
         """只读读取适合硬件下发的缓存 URL key 图。
 
         入参：`url` 来自 `KeyPlan.payload`。
-        返回：RGB `Image`；URL 非法、缓存或读取失败时返回 None，让调用方 fallback。
+        返回：RGB `Image`；同一缓存版本会复用同一个进程内图片对象，URL 非法、缓存或读取失败时
+        返回 None，让调用方 fallback。
         错误处理：坏缓存图片返回 None。
-        副作用：只读缓存目录，不访问网络、不写文件。
+        副作用：首次读取一个缓存版本时把 Pillow 图保存在进程内；图标重新解析或用户上传后会失效
+        该引用，不访问网络、不写文件。
         """
 
         try:
@@ -272,10 +277,15 @@ class UrlIconCache:
             return None
         if entry.key_icon_path is None:
             return None
+        cached = self._key_images.get(entry.cache_key)
+        if cached is not None:
+            return cached
         try:
             with Image.open(entry.key_icon_path) as image:
                 image.load()
-                return image.convert("RGB")
+                key_image = image.convert("RGB")
+                self._key_images[entry.cache_key] = key_image
+                return key_image
         except Exception:
             return None
 
