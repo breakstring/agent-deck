@@ -14,6 +14,9 @@ from PIL import Image
 from agent_deck.adapters.codex_quota import CodexQuotaSnapshot
 from agent_deck.rendering.quota_touchscreen import render_quota_panel, render_quota_touchscreen
 
+_DEFAULT_SECONDARY = object()
+"""测试 helper 用于区分默认双窗口与显式缺失 secondary 的哨兵值。"""
+
 
 def test_render_quota_touchscreen_returns_n4pro_image() -> None:
     """quota 渲染应输出 N4 Pro SDK 背景图尺寸。
@@ -123,6 +126,25 @@ def test_render_quota_panel_draws_reset_credit_marker() -> None:
     assert abs(_bounds_center_y(icon_bounds) - _bounds_center_y(digit_bounds)) <= 1
 
 
+def test_render_quota_panel_supports_a_single_monthly_window() -> None:
+    """只有月限的订阅应只绘制实际存在的一行 quota，不访问 secondary。
+
+    入参：无；测试构造 30 天 primary 窗口和 null secondary。
+    返回：无返回值；断言通过代表 touch bar 不会因缺少旧 weekly 槽位而报错。
+    错误处理：渲染器仍访问 secondary 或没有绘制主窗口进度条时由 pytest 报告。
+    副作用：无；只创建内存图片。
+    """
+
+    panel = render_quota_panel(_snapshot(secondary=None, primary_duration_mins=43200))
+
+    assert panel.size == (800, 136)
+    assert any(
+        panel.getpixel((x, y)) == (76, 205, 255)
+        for y in range(45, 78)
+        for x in range(350, 640)
+    )
+
+
 def _color_bounds(
     image: Image.Image,
     color: tuple[int, int, int],
@@ -166,30 +188,41 @@ def _bounds_center_y(bounds: tuple[int, int, int, int]) -> float:
     return (bounds[1] + bounds[3]) / 2
 
 
-def _snapshot(*, reset_credits_available: int | None = None) -> CodexQuotaSnapshot:
+def _snapshot(
+    *,
+    reset_credits_available: int | None = None,
+    secondary: object = _DEFAULT_SECONDARY,
+    primary_duration_mins: int = 300,
+) -> CodexQuotaSnapshot:
     """构造固定 quota snapshot。
 
-    入参：`reset_credits_available` 是可选 reset credit 数量，用于验证左侧附加标识。
+    入参：`reset_credits_available` 是可选 reset credit 数量；`secondary` 可显式设为 None
+    模拟单窗口账户；`primary_duration_mins` 控制 primary 周期。
     返回：用于触屏渲染测试的 `CodexQuotaSnapshot`。
     错误处理：模型字段错误由 Pydantic 报告。
     副作用：无。
     """
 
     tz = ZoneInfo("Asia/Shanghai")
+    secondary_payload = (
+        {
+            "used_percent": 8,
+            "window_duration_mins": 10080,
+            "resets_at": datetime(2026, 6, 24, 13, 47, 28, tzinfo=tz),
+        }
+        if secondary is _DEFAULT_SECONDARY
+        else secondary
+    )
     return CodexQuotaSnapshot(
         plan_type="prolite",
         plan_short_label="ProLite",
         plan_display_name="ProLite",
         primary={
             "used_percent": 28,
-            "window_duration_mins": 300,
+            "window_duration_mins": primary_duration_mins,
             "resets_at": datetime(2026, 6, 17, 19, 51, 2, tzinfo=tz),
         },
-        secondary={
-            "used_percent": 8,
-            "window_duration_mins": 10080,
-            "resets_at": datetime(2026, 6, 24, 13, 47, 28, tzinfo=tz),
-        },
+        secondary=secondary_payload,
         credits_balance="0",
         reset_credits_available=reset_credits_available,
         raw={},

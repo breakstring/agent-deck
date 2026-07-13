@@ -10,6 +10,8 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from agent_deck.adapters.codex_quota import (
     CodexQuotaSnapshot,
     display_plan_name,
@@ -64,14 +66,17 @@ def test_parse_rate_limits_response_maps_prolite_to_prolite() -> None:
     assert snapshot.plan_type == "prolite"
     assert snapshot.plan_short_label == "ProLite"
     assert snapshot.plan_display_name == "ProLite"
-    assert snapshot.primary.used_percent == 28
-    assert snapshot.primary.window_duration_mins == 300
-    assert snapshot.primary.resets_at == datetime.fromtimestamp(
+    primary, secondary = snapshot.windows
+    assert primary.window_id == "codex:primary"
+    assert primary.used_percent == 28
+    assert primary.window_duration_mins == 300
+    assert primary.resets_at == datetime.fromtimestamp(
         1781697062,
         ZoneInfo("Asia/Shanghai"),
     )
-    assert snapshot.secondary.used_percent == 8
-    assert snapshot.secondary.window_duration_mins == 10080
+    assert secondary.window_id == "codex:secondary"
+    assert secondary.used_percent == 8
+    assert secondary.window_duration_mins == 10080
     assert snapshot.credits_balance == "0"
     assert snapshot.reset_credits_available == 2
 
@@ -118,5 +123,121 @@ def test_quota_snapshot_exposes_short_reset_labels() -> None:
         raw={},
     )
 
-    assert snapshot.primary_reset_label() == "19:51"
-    assert snapshot.secondary_reset_label() == "06-24 13:47"
+    primary, secondary = snapshot.windows
+
+    assert primary.reset_label(include_date=False) == "19:51"
+    assert secondary.reset_label(include_date=True) == "06-24 13:47"
+
+
+def test_parse_rate_limits_response_accepts_a_single_monthly_window() -> None:
+    """单窗口订阅不应因 secondary 为 null 被判定为 quota 读取失败。
+
+    入参：无；测试构造只有 30 天 primary 窗口的 app-server 响应。
+    返回：无返回值；断言通过代表免费或策略调整后的单月限额可安全进入渲染路径。
+    错误处理：缺失窗口、周期推导或回退选择错误时由 pytest 报告。
+    副作用：无；不启动 Codex、不访问用户账号。
+    """
+
+    snapshot = parse_rate_limits_response(
+        {
+            "id": 2,
+            "result": {
+                "rateLimits": {
+                    "primary": {
+                        "usedPercent": 42,
+                        "windowDurationMins": 43200,
+                        "resetsAt": 1784513812,
+                    },
+                    "secondary": None,
+                    "planType": "free",
+                }
+            },
+        },
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )
+
+    assert tuple(item.window_id for item in snapshot.available_windows()) == ("codex:primary",)
+    assert snapshot.windows[0].display_period_label() == "MONTH"
+    assert snapshot.resolved_window("secondary").window_id == "codex:primary"
+
+
+def test_parse_rate_limits_response_collects_additional_limit_windows() -> None:
+    """额外模型或产品限额应进入同一个窗口集合，而不是被 primary/secondary 丢弃。
+
+    入参：无；测试构造主 Codex 限额及一个具名模型专属限额。
+    返回：无返回值；断言通过代表未来多重订阅限制可由同一按键和面板交互消费。
+    错误处理：重复主 limit、额外 limit 漏解析或 window_id 不稳定时由 pytest 报告。
+    副作用：无；不启动 Codex、不访问用户账号。
+    """
+
+    snapshot = parse_rate_limits_response(
+        {
+            "id": 2,
+            "result": {
+                "rateLimits": {
+                    "limitId": "codex",
+                    "primary": {
+                        "usedPercent": 42,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1784513812,
+                    },
+                },
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "limitId": "codex",
+                        "primary": {
+                            "usedPercent": 42,
+                            "windowDurationMins": 10080,
+                            "resetsAt": 1784513812,
+                        },
+                    },
+                    "codex_spark": {
+                        "limitId": "codex_spark",
+                        "limitName": "GPT-5 Spark",
+                        "primary": {
+                            "usedPercent": 73,
+                            "windowDurationMins": 43200,
+                            "resetsAt": 1787000000,
+                        },
+                        "tertiary": {
+                            "usedPercent": 16,
+                            "windowDurationMins": 300,
+                            "resetsAt": 1785000000,
+                        },
+                    },
+                },
+            },
+        },
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )
+
+    assert [item.window_id for item in snapshot.windows] == [
+        "codex:primary",
+        "codex_spark:primary",
+        "codex_spark:tertiary",
+    ]
+    assert snapshot.resolved_window("auto").window_id == "codex_spark:primary"
+    assert snapshot.resolved_window("codex_spark:tertiary").display_period_label() == "5H"
+
+
+def test_parse_rate_limits_response_rejects_when_no_window_exists() -> None:
+    """服务端同时缺失 primary 和 secondary 时应给出明确结构错误。
+
+    入参：无；测试构造两个窗口都为 null 的响应。
+    返回：无返回值；断言通过代表 daemon 会保留上次成功缓存并记录可诊断错误。
+    错误处理：没有可用窗口时由 Pydantic ValueError 报告。
+    副作用：无。
+    """
+
+    with pytest.raises(ValueError, match="usable quota window"):
+        parse_rate_limits_response(
+            {
+                "id": 2,
+                "result": {
+                    "rateLimits": {
+                        "primary": None,
+                        "secondary": None,
+                    }
+                },
+            }
+        )

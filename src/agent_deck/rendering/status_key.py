@@ -14,7 +14,11 @@ from typing import Any, Final, Literal
 
 from PIL import Image, ImageDraw, ImageFont
 
-from agent_deck.adapters.codex_quota import CodexQuotaSnapshot, CodexQuotaWindow
+from agent_deck.adapters.codex_quota import (
+    CodexQuotaSnapshot,
+    CodexQuotaWindow,
+    quota_window_period_label,
+)
 from agent_deck.adapters.codex_tokens import (
     CodexTokenPeriod,
     CodexTokenUsageSnapshot,
@@ -25,8 +29,8 @@ from agent_deck.rendering.reset_credit import draw_reset_credit_key_icon
 N4PRO_STATUS_KEY_SIZE: Final[tuple[int, int]] = (112, 112)
 """N4 Pro 主按键状态图标默认尺寸。"""
 
-QuotaStatusWindow = Literal["auto", "primary", "secondary"]
-"""quota_status 按键可展示的 quota 窗口。"""
+QuotaStatusWindow = str
+"""quota_status 按键可展示的 `auto` 或稳定 quota window_id。"""
 
 UsageSparklineMetric = Literal["total_tokens", "cost_usd"]
 """usage_summary sparkline 可使用的趋势指标。"""
@@ -40,6 +44,14 @@ _MUTED: Final[tuple[int, int, int]] = (142, 157, 181)
 _TRACK: Final[tuple[int, int, int]] = (43, 54, 75)
 _PRIMARY: Final[tuple[int, int, int]] = (76, 205, 255)
 _SECONDARY: Final[tuple[int, int, int]] = (126, 236, 165)
+_TERTIARY: Final[tuple[int, int, int]] = (171, 143, 255)
+_QUATERNARY: Final[tuple[int, int, int]] = (255, 143, 112)
+_QUOTA_ACCENTS: Final[tuple[tuple[int, int, int], ...]] = (
+    _PRIMARY,
+    _SECONDARY,
+    _TERTIARY,
+    _QUATERNARY,
+)
 _RESET_CREDIT: Final[tuple[int, int, int]] = (248, 213, 113)
 _USAGE_LINE: Final[tuple[int, int, int]] = (91, 210, 246)
 _USAGE_PERIOD_COLORS: Final[Mapping[CodexTokenPeriod, tuple[int, int, int]]] = {
@@ -60,7 +72,7 @@ def render_quota_status_key_image(
 ) -> Image.Image:
     """把 Codex quota 快照渲染成单个订阅/限额状态按键。
 
-    入参：`snapshot` 是 quota adapter 输出；`window` 控制展示最紧张窗口、5 小时窗口或周窗口；
+    入参：`snapshot` 是 quota adapter 输出；`window` 控制展示最紧张窗口或指定 API 窗口；
     `size` 是输出尺寸；`now` 用于测试或预览中稳定“今天/其他日期”判断。
     返回：RGB `Image`，默认 112x112。
     错误处理：尺寸过小时抛 `ValueError`；未知窗口由类型约束或显式分支抛出。
@@ -77,7 +89,7 @@ def render_quota_status_key_image(
     _draw_key_surface(draw, size)
     _draw_badge(draw, (size[0] / 2, 8), label, accent)
 
-    plan_label = snapshot.plan_short_label or snapshot.plan_display_name
+    plan_label = _quota_identity_label(selected_window, snapshot=snapshot)
     _draw_text(
         draw,
         (size[0] / 2, 31),
@@ -217,17 +229,54 @@ def _select_quota_window(
     副作用：无。
     """
 
-    if window == "primary":
-        return snapshot.primary, "5H", _PRIMARY
-    if window == "secondary":
-        return snapshot.secondary, "WEEK", _SECONDARY
-    if window == "auto":
-        primary_remaining = _remaining_percent(snapshot.primary.used_percent)
-        secondary_remaining = _remaining_percent(snapshot.secondary.used_percent)
-        if primary_remaining <= secondary_remaining:
-            return snapshot.primary, "5H", _PRIMARY
-        return snapshot.secondary, "WEEK", _SECONDARY
-    raise ValueError(f"unknown quota status window: {window}")
+    selected = snapshot.resolved_window(window)
+    selected_index = snapshot.available_windows().index(selected)
+    return (
+        selected,
+        quota_window_period_label(selected.window_duration_mins),
+        _accent_for_window(selected_index),
+    )
+
+
+def _quota_identity_label(
+    window: CodexQuotaWindow,
+    *,
+    snapshot: CodexQuotaSnapshot,
+) -> str:
+    """返回状态键中用于区分同周期不同限额的短身份标签。
+
+    入参：`window` 是当前状态键选中的 quota 窗口；`snapshot` 提供订阅名作为单窗口回退。
+    返回：优先使用展示策略短标签，其次从 limit 名称提取末段；只有单一无名 limit 时使用订阅名。
+    错误处理：名称格式异常时回退为 `LIMIT`，避免小屏渲染为空。
+    副作用：无；只读取内存模型。
+    """
+
+    if window.presentation_label:
+        return window.presentation_label.upper()
+    if window.limit_id == "codex":
+        return "CODEX"
+    if window.limit_name:
+        parts = tuple(
+            item.strip()
+            for item in window.limit_name.replace("_", "-").split("-")
+            if item.strip()
+        )
+        return (parts[-1] if parts else "LIMIT").upper()
+    if len(snapshot.available_windows()) > 1:
+        return window.limit_id[:12].upper()
+    return (snapshot.plan_short_label or snapshot.plan_display_name).upper()
+
+
+def _accent_for_window(index: int) -> tuple[int, int, int]:
+    """返回 quota 窗口在当前快照顺序中的循环强调色。
+
+    入参：`index` 是窗口在 `snapshot.windows` 中的稳定位置。
+    返回：按预设调色板循环的强调色，支持超过两个窗口。
+    错误处理：负索引按 Python 取模规则仍可安全映射。
+    副作用：无。
+    """
+
+    return _QUOTA_ACCENTS[index % len(_QUOTA_ACCENTS)]
 
 
 def _remaining_percent(used_percent: int) -> int:

@@ -88,8 +88,10 @@ def test_panel_content_cycle_changes_quota_and_tokens_but_brand_is_silent_noop()
 
     assert cycle_panel_content(brand, direction=PanelContentDirection.NEXT) == brand
     assert cycle_panel_content(
-        quota, direction=PanelContentDirection.NEXT
-    ).quota_window == "secondary"
+        quota,
+        direction=PanelContentDirection.NEXT,
+        available_quota_windows=("codex:primary", "codex:secondary"),
+    ).quota_window == "codex:primary"
     assert cycle_panel_content(
         tokens, direction=PanelContentDirection.NEXT
     ).token_period == CodexTokenPeriod.WEEK
@@ -110,7 +112,7 @@ def test_quota_panel_plan_preserves_quota_semantics_and_rotary_controls() -> Non
     assert plan.title == "Quota"
     assert "ProLite" in plan.lines[0]
     assert any("5h 72%" in line for line in plan.lines)
-    assert any("weekly 92%" in line for line in plan.lines)
+    assert any("week 92%" in line for line in plan.lines)
     assert plan.primary_input_role == PanelInputRole.ROTARY_NAVIGATION
     assert _control(plan, PanelInputEvent.KNOB_1_PRESS).intent == (
         PanelInputIntent.CONFIRM
@@ -229,9 +231,10 @@ def test_knob4_cycles_quota_window_or_token_period_without_changing_panel() -> N
     quota_selection = apply_panel_input(
         quota_selection,
         PanelInputEvent.KNOB_4_ROTATE_RIGHT,
+        available_quota_windows=("codex:primary", "codex:secondary"),
     )
     assert quota_selection.active_kind == PanelKind.QUOTA
-    assert quota_selection.quota_window == "secondary"
+    assert quota_selection.quota_window == "codex:primary"
 
     token_selection = PanelSelection(
         active_kind=PanelKind.TOKENS,
@@ -252,6 +255,26 @@ def test_knob4_cycles_quota_window_or_token_period_without_changing_panel() -> N
         PanelInputEvent.KNOB_4_ROTATE_LEFT,
     )
     assert token_selection.token_period == CodexTokenPeriod.WEEK
+
+
+def test_quota_panel_content_cycle_skips_missing_secondary_window() -> None:
+    """实时 quota 只有一个窗口时，虚拟面板旋转不应切到不可渲染的旧 secondary。
+
+    入参：无；测试在 quota 面板传入只有 primary 的可用窗口集合。
+    返回：无返回值；断言通过代表运行时可把单周期账户保持在有效选择上。
+    错误处理：仍切到 secondary 时由 pytest 报告。
+    副作用：无；纯 selection reducer 测试。
+    """
+
+    selection = PanelSelection(active_kind=PanelKind.QUOTA, quota_window="codex:primary")
+
+    updated = cycle_panel_content(
+        selection,
+        direction=PanelContentDirection.NEXT,
+        available_quota_windows=("codex:primary",),
+    )
+
+    assert updated == selection
 
 
 def _control(plan: LogicalPanelPlan, event: PanelInputEvent):

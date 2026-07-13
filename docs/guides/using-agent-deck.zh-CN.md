@@ -158,13 +158,35 @@ uv run agent-deckctl hardware n4pro splash
 
 - 按键布局：`~/Library/Application Support/AgentDeck/n4pro-key-layout.json`
 - 旋钮与灯光布局：`~/Library/Application Support/AgentDeck/n4pro-rotary-layout.json`
+- Codex quota 展示策略：`~/Library/Application Support/AgentDeck/quota-presentation.json`
 
 测试或多配置场景可用下列环境变量隔离路径：
 
 ```bash
 export AGENT_DECK_N4PRO_KEY_LAYOUT="/path/to/key-layout.json"
 export AGENT_DECK_N4PRO_ROTARY_LAYOUT="/path/to/rotary-layout.json"
+export AGENT_DECK_QUOTA_PRESENTATION="/path/to/quota-presentation.json"
 ```
+
+`quota-presentation.json` 不通过当前 Web 配置页编辑，适合对不同 Codex limit 设置短标签、展示
+顺序和可见性。它按 app-server 的 `limit_id` 匹配，不依赖 `primary` / `secondary` 槽位；未匹配到
+的未来 limit 默认仍会显示。文件不存在时使用该默认行为。
+
+```json
+{
+  "version": 1,
+  "presentation": {
+    "unmatched_visible": true,
+    "rules": [
+      { "limit_id": "codex", "label": "Codex", "visible": true, "order": 0 },
+      { "limit_id": "codex_bengalfox", "label": "Spark", "visible": true, "order": 10 }
+    ]
+  }
+}
+```
+
+可通过 `GET /status` 中 `codex_quota.snapshot.windows` 查看当前实际 `limit_id`；
+`display_snapshot` 则显示策略筛选后的硬件展示集合。修改文件后重启 daemon 生效。
 
 ## 6. Codex 集成
 

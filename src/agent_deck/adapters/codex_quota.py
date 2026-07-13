@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Final
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agent_deck.adapters.codex_plan import (
     PLAN_TYPE_SOURCE_URL,
@@ -38,8 +38,8 @@ DEFAULT_CODEX_APP_SERVER_COMMAND: Final[tuple[str, ...]] = (
 class CodexQuotaWindow(BaseModel):
     """Codex quota 的单个时间窗口。
 
-    入参：`used_percent` 是窗口内已使用百分比；`window_duration_mins` 是窗口长度；
-    `resets_at` 是本地时区下的重置时间。
+    入参：`window_id` 是 Agent Deck 生成的稳定窗口标识；`limit_id`/`limit_name` 描述所属
+    服务端限额；`source_slot` 是该限额内部的原始字段名；其余字段来自 app-server。
     返回：Pydantic model，可供触屏渲染或 API 输出。
     错误处理：字段类型非法时由 Pydantic 报告。
     副作用：无；仅保存解析结果。
@@ -47,6 +47,11 @@ class CodexQuotaWindow(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    window_id: str = "legacy:primary"
+    limit_id: str = "legacy"
+    limit_name: str | None = None
+    presentation_label: str | None = None
+    source_slot: str = "primary"
     used_percent: int = Field(ge=0)
     window_duration_mins: int = Field(gt=0)
     resets_at: datetime
@@ -63,13 +68,51 @@ class CodexQuotaWindow(BaseModel):
 
         return self.resets_at.strftime("%m-%d %H:%M" if include_date else "%H:%M")
 
+    def display_period_label(self) -> str:
+        """根据 app-server 返回的窗口时长生成稳定的短周期标签。
+
+        入参：无；使用当前窗口的 `window_duration_mins`。
+        返回：适合 N4 Pro 按键和 touch bar 的 `5H`、`WEEK`、`MONTH` 等短标签。
+        错误处理：时长由模型约束为正整数；未知粒度降级为分钟标签。
+        副作用：无；只读取内存字段。
+        """
+
+        return quota_window_period_label(self.window_duration_mins)
+
+    def display_reset_label(self, *, now: datetime | None = None) -> str:
+        """按“当天显示时间，其他日期显示日期和时间”的规则格式化重置时间。
+
+        入参：`now` 可用于测试或预览中固定当前时间；未传时使用窗口时区下的当前时间。
+        返回：`HH:MM` 或 `MM-DD HH:MM` 格式的短文本。
+        错误处理：窗口时间由 adapter 保证带时区；底层时间格式化异常按标准语义传播。
+        副作用：无；不读取 quota 之外的外部状态。
+        """
+
+        reference = now or datetime.now(self.resets_at.tzinfo)
+        include_date = reference.astimezone(self.resets_at.tzinfo).date() != self.resets_at.date()
+        return self.reset_label(include_date=include_date)
+
+    def display_label(self) -> str:
+        """返回包含可选限额名称和周期的触屏短标签。
+
+        入参：无。
+        返回：主限额仅返回周期，例如 `WEEK`；具名额外限额返回 `名称 · WEEK`。
+        错误处理：无；无名称时安全回退为周期标签。
+        副作用：无；只读取内存字段。
+        """
+
+        period = self.display_period_label()
+        label = self.presentation_label or self.limit_name
+        return f"{label} · {period}" if label else period
+
 
 class CodexQuotaSnapshot(BaseModel):
     """Codex 当前 quota 快照。
 
     入参：`plan_type` 是 Codex app-server 返回的标准 plan type；`plan_short_label`
-    是 N4 Pro 小屏主标签；`plan_display_name` 是 Agent Deck 完整展示名；`primary`
-    是 5 小时窗口；`secondary` 是 weekly 窗口；`credits_balance` 是可选 credits 文本；
+    是 N4 Pro 小屏主标签；`plan_display_name` 是 Agent Deck 完整展示名；`windows` 是任意
+    数量的实际限额窗口集合，不把 app-server 当前的 primary/secondary 传输字段当成领域模型；
+    `credits_balance` 是可选 credits 文本；
     `reset_credits_available` 是账号当前可用的 earned reset 数量；`raw` 保留原始 result
     子集用于调试。
     返回：Pydantic model，可被 renderer 和 CLI 复用。
@@ -82,33 +125,100 @@ class CodexQuotaSnapshot(BaseModel):
     plan_type: str | None
     plan_short_label: str | None = None
     plan_display_name: str
-    primary: CodexQuotaWindow
-    secondary: CodexQuotaWindow
+    windows: tuple[CodexQuotaWindow, ...] = ()
     credits_balance: str | None = None
     reset_credits_available: int | None = Field(default=None, ge=0)
     raw: dict[str, Any] = Field(default_factory=dict)
 
-    def primary_reset_label(self) -> str:
-        """返回 5 小时窗口重置时间标签。
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_window_fields(cls, value: object) -> object:
+        """把旧测试、缓存或调用方的 primary/secondary 字段迁移为窗口集合。
+
+        入参：`value` 是 Pydantic 即将验证的原始 object。
+        返回：已有 `windows` 时原样返回；否则从旧槽位构造泛化窗口列表。
+        错误处理：非 mapping 值交由 Pydantic 后续标准错误处理。
+        副作用：只复制输入 mapping，不修改调用方对象。
+        """
+
+        if not isinstance(value, dict) or "windows" in value:
+            return value
+        migrated = dict(value)
+        limit_id = str(migrated.get("limit_id") or "codex")
+        windows: list[dict[str, object]] = []
+        for slot in ("primary", "secondary"):
+            payload = migrated.pop(slot, None)
+            if isinstance(payload, dict):
+                windows.append(
+                    {
+                        **payload,
+                        "window_id": f"{limit_id}:{slot}",
+                        "limit_id": limit_id,
+                        "source_slot": slot,
+                    }
+                )
+        migrated["windows"] = windows
+        return migrated
+
+    def available_windows(self) -> tuple[CodexQuotaWindow, ...]:
+        """返回当前快照实际可展示的 quota 窗口，保持服务端稳定排序。
 
         入参：无。
-        返回：`HH:MM` 格式的本地时间。
-        错误处理：时间格式化异常按 Python 标准异常传播。
+        返回：由窗口模型组成的非空元组，按主 limit 后额外 limit、原始槽位顺序排列。
+        错误处理：模型构造阶段已保证至少一个窗口存在，因此不会返回空元组。
+        副作用：无；只读取内存字段。
+        """
+
+        return self.windows
+
+    def window_for_id(self, window_id: str) -> CodexQuotaWindow | None:
+        """按稳定 window_id 查找一个实际 quota 窗口。
+
+        入参：`window_id` 是配置与渲染路径保存的窗口标识。
+        返回：匹配窗口或 None。
+        错误处理：无；未知 id 作为正常兼容场景处理。
+        副作用：无；只读取内存集合。
+        """
+
+        return next((item for item in self.windows if item.window_id == window_id), None)
+
+    def resolved_window(self, selection: str | None) -> CodexQuotaWindow:
+        """按配置选择实际窗口，并兼容旧 primary/secondary 配置值。
+
+        入参：`selection` 是 `auto`、稳定 window_id 或旧槽位名。
+        返回：命中的窗口；未知或缺失选择回退到当前最紧张窗口。
+        错误处理：模型构造阶段保证至少存在一个窗口。
+        副作用：无；不覆盖用户保存的原始配置。
+        """
+
+        if selection and selection != "auto":
+            matched = self.window_for_id(selection)
+            if matched is not None:
+                return matched
+            legacy = next(
+                (item for item in self.windows if item.source_slot == selection),
+                None,
+            )
+            if legacy is not None:
+                return legacy
+        return max(self.windows, key=lambda item: item.used_percent)
+
+    @model_validator(mode="after")
+    def _validate_at_least_one_window(self) -> CodexQuotaSnapshot:
+        """拒绝没有任何可展示 quota 窗口的 app-server 响应。
+
+        入参：当前已解析的快照模型。
+        返回：当前模型实例。
+        错误处理：primary 与 secondary 同时缺失时抛 ValueError。
         副作用：无。
         """
 
-        return self.primary.reset_label(include_date=False)
-
-    def secondary_reset_label(self) -> str:
-        """返回 weekly 窗口重置时间标签。
-
-        入参：无。
-        返回：`MM-DD HH:MM` 格式的本地时间。
-        错误处理：时间格式化异常按 Python 标准异常传播。
-        副作用：无。
-        """
-
-        return self.secondary.reset_label(include_date=True)
+        if not self.windows:
+            raise ValueError("Codex rate limits did not include a usable quota window")
+        window_ids = [item.window_id for item in self.windows]
+        if len(window_ids) != len(set(window_ids)):
+            raise ValueError("Codex rate limit window ids must be unique")
+        return self
 
 def parse_rate_limits_response(
     response: dict[str, Any],
@@ -129,8 +239,16 @@ def parse_rate_limits_response(
         raise ValueError(f"Codex app-server returned error: {response['error']}")
     result = _require_mapping(response.get("result"), "result")
     rate_limits = _require_mapping(result.get("rateLimits"), "result.rateLimits")
-    primary = _parse_window(rate_limits.get("primary"), "primary", timezone=timezone)
-    secondary = _parse_window(rate_limits.get("secondary"), "secondary", timezone=timezone)
+    windows = list(_parse_limit_windows(rate_limits, timezone=timezone))
+    limits_by_id = result.get("rateLimitsByLimitId")
+    if isinstance(limits_by_id, dict):
+        for limit_key, payload in limits_by_id.items():
+            if not isinstance(payload, dict):
+                continue
+            limit_id = str(payload.get("limitId") or limit_key)
+            if any(item.limit_id == limit_id for item in windows):
+                continue
+            windows.extend(_parse_limit_windows(payload, timezone=timezone))
     plan_type = _optional_str(rate_limits.get("planType"))
     plan_display = describe_codex_plan(plan_type)
     credits = rate_limits.get("credits")
@@ -145,8 +263,7 @@ def parse_rate_limits_response(
         plan_type=plan_type,
         plan_short_label=plan_display.short_label,
         plan_display_name=plan_display.display_name,
-        primary=primary,
-        secondary=secondary,
+        windows=tuple(windows),
         credits_balance=credits_balance,
         reset_credits_available=reset_credits_available,
         raw=result,
@@ -211,27 +328,82 @@ def read_codex_quota(
         _terminate_process(process)
 
 
-def _parse_window(
-    payload: object,
-    name: str,
+def _parse_limit_windows(
+    payload: dict[str, Any],
     *,
     timezone: ZoneInfo | None,
-) -> CodexQuotaWindow:
-    """解析单个 quota window。
+) -> tuple[CodexQuotaWindow, ...]:
+    """从一个 app-server rate limit object 提取任意数量的窗口字段。
 
-    入参：`payload` 是 window object；`name` 用于错误消息；`timezone` 是时间转换时区。
-    返回：`CodexQuotaWindow`。
-    错误处理：字段缺失或类型不符合预期时抛 KeyError/ValueError。
+    入参：`payload` 是 `rateLimits` 或 `rateLimitsByLimitId` 中的一项；`timezone` 是展示时区。
+    返回：按原始字段顺序排列的 quota 窗口元组；可为空。
+    错误处理：候选字段看似窗口但缺少必要字段时抛 ValueError，避免静默展示错误配额。
+    副作用：无；只读取 JSON object。
+    """
+
+    limit_id = str(payload.get("limitId") or "codex")
+    limit_name = _optional_str(payload.get("limitName"))
+    windows: list[CodexQuotaWindow] = []
+    for source_slot, candidate in payload.items():
+        if not _looks_like_quota_window(candidate):
+            continue
+        data = _require_mapping(candidate, f"rate limit {limit_id}.{source_slot}")
+        tz = timezone or ZoneInfo("Asia/Shanghai")
+        windows.append(
+            CodexQuotaWindow(
+                window_id=f"{limit_id}:{source_slot}",
+                limit_id=limit_id,
+                limit_name=limit_name,
+                source_slot=source_slot,
+                used_percent=int(data["usedPercent"]),
+                window_duration_mins=int(data["windowDurationMins"]),
+                resets_at=datetime.fromtimestamp(int(data["resetsAt"]), tz),
+            )
+        )
+    return tuple(windows)
+
+
+def _looks_like_quota_window(value: object) -> bool:
+    """判断一个 JSON 字段是否具备 quota window 所需的最小结构。
+
+    入参：`value` 是 rate-limit object 内某个字段的值。
+    返回：同时包含已用比例、窗口长度和重置时间字段时返回 True。
+    错误处理：无；非 mapping 安全返回 False。
     副作用：无。
     """
 
-    data = _require_mapping(payload, name)
-    tz = timezone or ZoneInfo("Asia/Shanghai")
-    return CodexQuotaWindow(
-        used_percent=int(data["usedPercent"]),
-        window_duration_mins=int(data["windowDurationMins"]),
-        resets_at=datetime.fromtimestamp(int(data["resetsAt"]), tz),
-    )
+    return isinstance(value, dict) and {
+        "usedPercent",
+        "windowDurationMins",
+        "resetsAt",
+    }.issubset(value)
+
+
+def quota_window_period_label(window_duration_mins: int) -> str:
+    """把服务端窗口长度转换成设备上可读的周期标签。
+
+    入参：`window_duration_mins` 是 app-server 返回的正整数分钟数。
+    返回：优先使用 `H`、`DAY`、`WEEK`、`MONTH`；非规则时长降级为 `N M`。
+    错误处理：非正整数抛 ValueError，保护直接调用方不产生无意义标签。
+    副作用：无；纯格式化函数。
+    """
+
+    if window_duration_mins <= 0:
+        raise ValueError("quota window duration must be positive")
+    minutes_per_hour = 60
+    minutes_per_day = 24 * minutes_per_hour
+    minutes_per_week = 7 * minutes_per_day
+    if 28 * minutes_per_day <= window_duration_mins <= 31 * minutes_per_day:
+        return "MONTH"
+    if window_duration_mins % minutes_per_week == 0:
+        weeks = window_duration_mins // minutes_per_week
+        return "WEEK" if weeks == 1 else f"{weeks}W"
+    if window_duration_mins % minutes_per_day == 0:
+        days = window_duration_mins // minutes_per_day
+        return "DAY" if days == 1 else f"{days}D"
+    if window_duration_mins % minutes_per_hour == 0:
+        return f"{window_duration_mins // minutes_per_hour}H"
+    return f"{window_duration_mins}M"
 
 
 def _require_mapping(value: object, name: str) -> dict[str, Any]:

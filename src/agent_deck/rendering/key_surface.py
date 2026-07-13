@@ -124,13 +124,12 @@ class N4ProKeyBinding(BaseModel):
             raise ValueError("url key requires url")
         if self.kind == KeySurfaceKind.FOLDER and not self.path:
             raise ValueError("folder key requires path")
-        if self.kind == KeySurfaceKind.QUOTA_STATUS and self.quota_window not in {
-            None,
-            "auto",
-            "primary",
-            "secondary",
-        }:
-            raise ValueError("quota_status key requires quota_window auto/primary/secondary")
+        if (
+            self.kind == KeySurfaceKind.QUOTA_STATUS
+            and self.quota_window is not None
+            and not self.quota_window.strip()
+        ):
+            raise ValueError("quota_status key requires a non-empty quota_window")
         if self.kind == KeySurfaceKind.USAGE_SUMMARY and self.usage_period not in {
             None,
             "today",

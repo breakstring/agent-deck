@@ -150,6 +150,11 @@ from agent_deck.server.rotary_layout_store import (
     load_n4pro_rotary_layout,
     save_n4pro_rotary_layout,
 )
+from agent_deck.server.quota_presentation_store import (
+    QuotaPresentation,
+    QuotaPresentationStoreError,
+    load_quota_presentation,
+)
 
 CodexAppStateEventReader = Callable[[], tuple[NormalizedEvent, ...]]
 CodexAppActiveSessionsReader = Callable[..., tuple[CodexAppActiveSession, ...]]
@@ -425,12 +430,7 @@ class StatusKeyImageCache:
             snapshot.plan_type,
             snapshot.plan_short_label,
             snapshot.plan_display_name,
-            snapshot.primary.used_percent,
-            snapshot.primary.window_duration_mins,
-            snapshot.primary.resets_at.isoformat(),
-            snapshot.secondary.used_percent,
-            snapshot.secondary.window_duration_mins,
-            snapshot.secondary.resets_at.isoformat(),
+            _quota_windows_fingerprint(snapshot),
             snapshot.credits_balance,
             snapshot.reset_credits_available,
         )
@@ -515,7 +515,7 @@ class LogicalPanelImageCache:
     def quota_image(self, snapshot: CodexQuotaSnapshot, *, window: str) -> Any:
         """返回指定 quota 窗口的基础面板，优先命中内容指纹缓存。
 
-        入参：`snapshot` 是 daemon 已确认的 quota 快照；`window` 是 primary 或 secondary。
+        入参：`snapshot` 是 daemon 已确认的 quota 快照；`window` 是 `auto` 或稳定 window_id。
         返回：800x480 quota 背景图。
         错误处理：未知窗口或渲染异常按原语义传播。
         副作用：缓存未命中时生成并保存一张新图。
@@ -553,16 +553,16 @@ class LogicalPanelImageCache:
         )
 
     def prewarm_quota(self, snapshot: CodexQuotaSnapshot) -> None:
-        """预渲染两个 quota 窗口，消除后续内容切换的首次绘制。
+        """预渲染当前实际可用 quota 窗口，消除后续内容切换的首次绘制。
 
         入参：`snapshot` 是刚刷新成功的 quota 快照。
         返回：无。
-        错误处理：任一窗口渲染失败时按原样传播给 poller。
-        副作用：可能新增两张进程内背景图并递增预热计数。
+        错误处理：任一实际窗口渲染失败时按原样传播给 poller。
+        副作用：可能为任意数量的实际窗口新增进程内背景图并递增预热计数。
         """
 
-        for window in ("primary", "secondary"):
-            self.quota_image(snapshot, window=window)
+        for quota_window in snapshot.available_windows():
+            self.quota_image(snapshot, window=quota_window.window_id)
             self._prewarm_count += 1
 
     def prewarm_tokens(self, snapshot: CodexTokenUsageSnapshot) -> None:
@@ -643,6 +643,10 @@ class _DaemonRuntime:
     codex_quota_snapshot: CodexQuotaSnapshot | None
     codex_quota_updated_at: datetime | None
     codex_quota_last_error: str | None
+    quota_presentation: QuotaPresentation
+    quota_presentation_source: str
+    quota_presentation_path: Path | None
+    quota_presentation_last_error: str | None
     codex_token_usage_snapshot: CodexTokenUsageSnapshot | None
     codex_token_usage_updated_at: datetime | None
     codex_token_usage_last_error: str | None
@@ -967,10 +971,35 @@ class _DaemonRuntime:
         self.codex_quota_snapshot = snapshot
         self.codex_quota_updated_at = updated_at
         self.codex_quota_last_error = None
-        self.logical_panel_image_cache.prewarm_quota(snapshot)
+        displayed_snapshot = self.displayed_codex_quota_snapshot()
+        if displayed_snapshot is None:
+            self.logical_panel_selection = self.logical_panel_selection.model_copy(
+                update={"quota_window": "auto"}
+            )
+        else:
+            self.logical_panel_selection = _normalize_logical_panel_quota_window(
+                self.logical_panel_selection,
+                displayed_snapshot,
+            )
+            self.logical_panel_image_cache.prewarm_quota(displayed_snapshot)
         image = self.render_current_logical_panel_image()
         self.prewarm_status_key_images()
         return image
+
+    def displayed_codex_quota_snapshot(self) -> CodexQuotaSnapshot | None:
+        """返回当前展示策略过滤、排序并标注后的 quota 快照。
+
+        入参：无；读取 runtime 中最新原始 quota 快照和不可变展示策略。
+        返回：无原始快照或全部被隐藏时返回 None；否则返回只含可见窗口的复制快照。
+        错误处理：策略和原始快照均在写入 runtime 前完成校验，不会执行外部 I/O。
+        副作用：无；不修改原始快照，也不更新缓存。
+        """
+
+        if self.codex_quota_snapshot is None:
+            return None
+        return self.quota_presentation.present(
+            self.codex_quota_snapshot
+        ).display_snapshot()
 
     def update_codex_token_usage(
         self,
@@ -992,6 +1021,20 @@ class _DaemonRuntime:
         self.logical_panel_image_cache.prewarm_tokens(snapshot)
         self.prewarm_status_key_images()
         return self.render_current_logical_panel_image()
+
+    def _available_quota_windows(self) -> tuple[str, ...] | None:
+        """返回当前 quota 快照中可供 logical panel 切换的稳定窗口标识。
+
+        入参：无。
+        返回：已有 quota 快照时返回任意数量的 `window_id`；尚未成功刷新时返回 None。
+        错误处理：快照仅来自 adapter；空窗口由 adapter 模型拒绝，不会进入此方法。
+        副作用：无；只读取 runtime 内存快照。
+        """
+
+        snapshot = self.displayed_codex_quota_snapshot()
+        if snapshot is None:
+            return None
+        return tuple(window.window_id for window in snapshot.available_windows())
 
     def mark_codex_token_usage_poll_error(
         self,
@@ -1025,6 +1068,7 @@ class _DaemonRuntime:
         self.logical_panel_selection = apply_panel_input(
             self.logical_panel_selection,
             body.event,
+            available_quota_windows=self._available_quota_windows(),
         )
         self.render_current_logical_panel_image()
         return {
@@ -1095,6 +1139,7 @@ class _DaemonRuntime:
                     if direction > 0
                     else PanelContentDirection.PREVIOUS
                 ),
+                available_quota_windows=self._available_quota_windows(),
             )
             self.render_current_logical_panel_image()
             return {
@@ -1548,7 +1593,8 @@ class _DaemonRuntime:
         """
 
         updated_window = _next_quota_status_window(
-            intent.payload.get("quota_window")
+            intent.payload.get("quota_window"),
+            snapshot=self.displayed_codex_quota_snapshot(),
         )
         updated = self._replace_key_binding(
             intent.key_index,
@@ -1650,12 +1696,13 @@ class _DaemonRuntime:
         不执行 ccusage、不读取 quota。
         """
 
-        if self.codex_quota_snapshot is None and self.codex_token_usage_snapshot is None:
+        quota_snapshot = self.displayed_codex_quota_snapshot()
+        if quota_snapshot is None and self.codex_token_usage_snapshot is None:
             return
         resolved_layout = layout or self.render_current()
         _key_images_from_layout(
             resolved_layout,
-            quota_snapshot=self.codex_quota_snapshot,
+            quota_snapshot=quota_snapshot,
             token_usage_snapshot=self.codex_token_usage_snapshot,
             status_key_cache=self.status_key_image_cache,
         )
@@ -1829,11 +1876,12 @@ class _DaemonRuntime:
             )
         else:
             active_kind = self.logical_panel_selection.active_kind
-            if active_kind == PanelKind.QUOTA and self.codex_quota_snapshot is not None:
+            quota_snapshot = self.displayed_codex_quota_snapshot()
+            if active_kind == PanelKind.QUOTA and quota_snapshot is not None:
                 base_image, base_source = (
                     self.logical_panel_image_cache.quota_image(
-                        self.codex_quota_snapshot,
-                        window=self.logical_panel_selection.quota_window.value,
+                        quota_snapshot,
+                        window=self.logical_panel_selection.quota_window,
                     ),
                     "codex_quota",
                 )
@@ -2139,6 +2187,20 @@ class _DaemonRuntime:
             },
             "codex_quota": {
                 "snapshot": _dump_optional_model(self.codex_quota_snapshot),
+                "display_snapshot": _dump_optional_model(
+                    self.displayed_codex_quota_snapshot()
+                ),
+                "presentation": {
+                    "source": self.quota_presentation_source,
+                    "path": (
+                        str(self.quota_presentation_path)
+                        if self.quota_presentation_path
+                        else None
+                    ),
+                    "last_error": self.quota_presentation_last_error,
+                    "rules": _dump_model(self.quota_presentation)["rules"],
+                    "unmatched_visible": self.quota_presentation.unmatched_visible,
+                },
                 "updated_at": _dump_datetime(self.codex_quota_updated_at),
                 "last_error": self.codex_quota_last_error,
                 "touchscreen_render_count": self.surface.touchscreen_render_count,
@@ -2386,6 +2448,7 @@ def create_app(
     url_icon_fetcher: UrlIconFetcher | None = None,
     key_layout_path: Path | None = None,
     rotary_layout_path: Path | None = None,
+    quota_presentation_path: Path | None = None,
 ) -> FastAPI:
     """Create the local daemon FastAPI app without binding sockets.
 
@@ -2406,8 +2469,9 @@ def create_app(
     `app_icon_cache_path` 是 App 图标缓存根目录；`url_icon_cache_path` 是 URL favicon
     缓存根目录；两者默认使用用户级 Application Support；`url_icon_fetcher` 供测试替换网络请求；
     `key_layout_path` 与 `rotary_layout_path` 为 None 时相应 GUI 布局只保存在进程内，传入路径时
-    启动会读各自 JSON，保存会写回；`system_control_executor` 可注入 fake，默认按平台构造保守
-    executor。
+    启动会读各自 JSON，保存会写回；`quota_presentation_path` 可选加载独立 quota 展示策略，
+    只影响硬件显示而不改原始采集数据；`system_control_executor` 可注入 fake，默认按平台构造
+    保守 executor。
     返回：配置好路由且持有 in-memory runtime 的 `FastAPI` ASGI app。
     错误处理：对象构造失败会直接抛出；poller 单次失败会记录到 status，不让 app 启动失败。
     副作用：总是分配内存对象并注册路由；只有显式启用 poller 时，lifespan startup 才会只读访问
@@ -2440,6 +2504,17 @@ def create_app(
                 initial_rotary_layout_source = "persisted"
         except RotaryLayoutStoreError as exc:
             rotary_layout_last_error = str(exc)
+    initial_quota_presentation = QuotaPresentation()
+    initial_quota_presentation_source = "default"
+    quota_presentation_last_error: str | None = None
+    if quota_presentation_path is not None:
+        try:
+            persisted_presentation = load_quota_presentation(quota_presentation_path)
+            if persisted_presentation is not None:
+                initial_quota_presentation = persisted_presentation
+                initial_quota_presentation_source = "persisted"
+        except QuotaPresentationStoreError as exc:
+            quota_presentation_last_error = str(exc)
     runtime = _DaemonRuntime(
         store=AgentStateStore(),
         broker=DecisionBroker(),
@@ -2452,6 +2527,10 @@ def create_app(
         codex_quota_snapshot=None,
         codex_quota_updated_at=None,
         codex_quota_last_error=None,
+        quota_presentation=initial_quota_presentation,
+        quota_presentation_source=initial_quota_presentation_source,
+        quota_presentation_path=quota_presentation_path,
+        quota_presentation_last_error=quota_presentation_last_error,
         codex_token_usage_snapshot=None,
         codex_token_usage_updated_at=None,
         codex_token_usage_last_error=None,
@@ -3357,14 +3436,12 @@ def _normalize_quota_status_window(value: str | None) -> QuotaStatusWindow:
     """把配置或 intent 中的 quota window 归一成渲染器可接受的值。
 
     入参：`value` 是用户配置、layout payload 或硬件 intent 中的窗口字符串。
-    返回：`auto`、`primary` 或 `secondary`；未知值降级到 `auto`。
+    返回：非空的 `auto`、稳定 window_id 或遗留槽位名；空值降级到 `auto`。
     错误处理：不抛业务异常，避免坏配置打断硬件渲染循环。
     副作用：无。
     """
 
-    if value in {"auto", "primary", "secondary"}:
-        return value
-    return "auto"
+    return value.strip() if value and value.strip() else "auto"
 
 
 def _normalize_token_usage_period(value: str | None) -> CodexTokenPeriod:
@@ -3382,17 +3459,28 @@ def _normalize_token_usage_period(value: str | None) -> CodexTokenPeriod:
         return CodexTokenPeriod.TODAY
 
 
-def _next_quota_status_window(value: str | None) -> str:
+def _next_quota_status_window(
+    value: str | None,
+    *,
+    snapshot: CodexQuotaSnapshot | None = None,
+) -> str:
     """返回 quota status 按键下一个展示窗口。
 
     入参：`value` 是当前窗口。
-    返回：按 `auto -> primary -> secondary -> auto` 循环后的字符串。
+    返回：按 `auto -> 实际 window_id -> auto` 循环后的字符串；没有快照时保持 `auto`。
     错误处理：未知值视为 `auto`。
     副作用：无。
     """
 
-    order = ("auto", "primary", "secondary")
+    if snapshot is None:
+        return "auto"
+    available = tuple(item.window_id for item in snapshot.available_windows())
+    if len(available) == 1:
+        return "auto"
+    order = ("auto", *available)
     current = _normalize_quota_status_window(value)
+    if current not in order:
+        current = snapshot.resolved_window(current).window_id
     return order[(order.index(current) + 1) % len(order)]
 
 
@@ -3445,7 +3533,7 @@ def _quota_panel_fingerprint(
     """生成 quota touch bar 基础图的内容缓存指纹。
 
     入参：`snapshot` 是当前 Codex quota 快照。
-    返回：覆盖计划名、两个窗口、重置时间和可用重置次数的不可变元组。
+    返回：覆盖计划名、实际可用窗口、重置时间和可用重置次数的不可变元组。
     错误处理：无；adapter 已保证快照字段可读。
     副作用：无；只读取内存快照。
     """
@@ -3454,15 +3542,52 @@ def _quota_panel_fingerprint(
         snapshot.plan_type,
         snapshot.plan_short_label,
         snapshot.plan_display_name,
-        snapshot.primary.used_percent,
-        snapshot.primary.window_duration_mins,
-        snapshot.primary.resets_at.isoformat(),
-        snapshot.secondary.used_percent,
-        snapshot.secondary.window_duration_mins,
-        snapshot.secondary.resets_at.isoformat(),
+        _quota_windows_fingerprint(snapshot),
         snapshot.credits_balance,
         snapshot.reset_credits_available,
     )
+
+
+def _quota_windows_fingerprint(
+    snapshot: CodexQuotaSnapshot,
+) -> tuple[tuple[str, str, str | None, int, int, str], ...]:
+    """生成 quota 实际窗口的缓存指纹，正确区分缺失窗口与零用量窗口。
+
+    入参：`snapshot` 是 adapter 已校验的 quota 快照。
+    返回：每个实际窗口的稳定 id、所属 limit、已用比例、时长和重置时间组成的稳定元组。
+    错误处理：无；至少一个窗口由快照模型保证。
+    副作用：无；只读取内存字段。
+    """
+
+    return tuple(
+        (
+            window.window_id,
+            window.limit_id,
+            window.presentation_label,
+            window.used_percent,
+            window.window_duration_mins,
+            window.resets_at.isoformat(),
+        )
+        for window in snapshot.available_windows()
+    )
+
+
+def _normalize_logical_panel_quota_window(
+    selection: PanelSelection,
+    snapshot: CodexQuotaSnapshot,
+) -> PanelSelection:
+    """在 quota 刷新后把已失效的 virtual panel 窗口选择回退到实际可用项。
+
+    入参：`selection` 是当前面板选择；`snapshot` 是新成功的 quota 快照。
+    返回：选择仍有效或为 auto 时返回原对象；否则将 quota 窗口设为第一个实际 window_id。
+    错误处理：snapshot 至少包含一个窗口，故不会出现空回退。
+    副作用：无；不修改用户保存的主键配置，只修正 runtime 面板选择。
+    """
+
+    available = tuple(window.window_id for window in snapshot.available_windows())
+    if selection.quota_window == "auto" or selection.quota_window in available:
+        return selection
+    return selection.model_copy(update={"quota_window": available[0]})
 
 
 def _token_usage_daily_fingerprint(

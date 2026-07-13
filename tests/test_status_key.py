@@ -23,6 +23,10 @@ from agent_deck.rendering.status_key import (
     usage_sparkline_values,
 )
 from agent_deck.rendering.status_key import _quota_reset_label as quota_reset_label
+from agent_deck.rendering.status_key import _select_quota_window as select_quota_window
+
+_DEFAULT_SECONDARY = object()
+"""测试 helper 用于区分默认双窗口与显式缺失 secondary 的哨兵值。"""
 
 
 def test_render_quota_status_key_image_uses_n4pro_key_size_and_gold_reset() -> None:
@@ -173,6 +177,24 @@ def test_quota_reset_label_uses_time_today_and_date_other_day() -> None:
     ) == "07-14"
 
 
+def test_quota_status_key_uses_actual_monthly_label_and_falls_back_from_missing_slot() -> None:
+    """单月限额时状态键应使用 MONTH 角标，旧 secondary 配置也要安全回退。
+
+    入参：无；测试构造只有 monthly primary 的 quota 快照。
+    返回：无返回值；断言通过代表按键渲染不会继续把 primary 误写成 5H。
+    错误处理：缺失 secondary 触发异常、标签仍固定为 WEEK/5H 时由 pytest 报告。
+    副作用：无；不访问 Codex 或硬件。
+    """
+
+    snapshot = _quota_snapshot(secondary=None, primary_duration_mins=43200)
+
+    selected, label, accent = select_quota_window(snapshot, window="secondary")
+
+    assert selected.window_duration_mins == 43200
+    assert label == "MONTH"
+    assert accent == (76, 205, 255)
+
+
 def test_status_key_rejects_tiny_size() -> None:
     """状态型按键尺寸太小时应明确失败。
 
@@ -219,7 +241,11 @@ def _count_near_color(
     return count
 
 
-def _quota_snapshot() -> CodexQuotaSnapshot:
+def _quota_snapshot(
+    *,
+    secondary: object = _DEFAULT_SECONDARY,
+    primary_duration_mins: int = 300,
+) -> CodexQuotaSnapshot:
     """构造固定 quota snapshot。
 
     入参：无。
@@ -229,20 +255,25 @@ def _quota_snapshot() -> CodexQuotaSnapshot:
     """
 
     tz = ZoneInfo("Asia/Shanghai")
+    secondary_payload = (
+        {
+            "used_percent": 58,
+            "window_duration_mins": 10080,
+            "resets_at": datetime(2026, 7, 14, 11, 27, tzinfo=tz),
+        }
+        if secondary is _DEFAULT_SECONDARY
+        else secondary
+    )
     return CodexQuotaSnapshot(
         plan_type="prolite",
         plan_short_label="ProLite",
         plan_display_name="ProLite",
         primary={
             "used_percent": 49,
-            "window_duration_mins": 300,
+            "window_duration_mins": primary_duration_mins,
             "resets_at": datetime(2026, 7, 9, 15, 18, tzinfo=tz),
         },
-        secondary={
-            "used_percent": 58,
-            "window_duration_mins": 10080,
-            "resets_at": datetime(2026, 7, 14, 11, 27, tzinfo=tz),
-        },
+        secondary=secondary_payload,
         reset_credits_available=2,
         raw={},
     )

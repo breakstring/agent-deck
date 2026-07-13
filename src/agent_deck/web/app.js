@@ -140,9 +140,30 @@ function keyLabel(key) {
 }
 
 function quotaWindowLabel(value) {
-  if (value === "primary") return "5H";
-  if (value === "secondary") return "WEEK";
-  return "AUTO";
+  if (!value || value === "auto") return "AUTO";
+  const windows =
+    state.status?.codex_quota?.display_snapshot?.windows ||
+    state.status?.codex_quota?.snapshot?.windows ||
+    [];
+  const selected = windows.find(
+    (item) => item.window_id === value || item.source_slot === value,
+  );
+  if (!selected) return "AUTO";
+  const minutes = Number(selected.window_duration_mins || 0);
+  let period = `${minutes}M`;
+  if (minutes >= 28 * 24 * 60 && minutes <= 31 * 24 * 60) {
+    period = "MONTH";
+  } else if (minutes > 0 && minutes % (7 * 24 * 60) === 0) {
+    const weeks = minutes / (7 * 24 * 60);
+    period = weeks === 1 ? "WEEK" : `${weeks}W`;
+  } else if (minutes > 0 && minutes % (24 * 60) === 0) {
+    const days = minutes / (24 * 60);
+    period = days === 1 ? "DAY" : `${days}D`;
+  }
+  else if (minutes > 0 && minutes % 60 === 0) period = `${minutes / 60}H`;
+  if (minutes <= 0) return "AUTO";
+  const label = selected.presentation_label || selected.limit_name;
+  return label ? `${label} · ${period}` : period;
 }
 
 function usagePeriodLabel(value) {
@@ -483,7 +504,7 @@ function renderKeyInspector() {
   } else if (key.kind === "quota_status") {
     details =
       detailRow("展示", quotaWindowLabel(key.quotaWindow)) +
-      detailRow("按下", "切换 Auto / 5H / Week") +
+      detailRow("按下", "切换 Auto / 当前可用限额") +
       detailRow("数据", "复用 touch bar quota 快照");
   } else if (key.kind === "usage_summary") {
     details =

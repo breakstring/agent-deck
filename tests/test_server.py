@@ -50,6 +50,11 @@ from agent_deck.rendering.layout import build_layout_plan
 from agent_deck.rendering.logical_panel import PanelKind
 from agent_deck.rendering.rotary_surface import default_n4pro_rotary_layout
 from agent_deck.server.app import DaemonPollerConfig, create_app
+from agent_deck.server.quota_presentation_store import (
+    QuotaPresentation,
+    QuotaPresentationRule,
+    save_quota_presentation,
+)
 
 
 def test_web_index_serves_n4pro_layout_editor() -> None:
@@ -776,7 +781,7 @@ def test_codex_quota_poller_updates_status_and_touchscreen_frame() -> None:
 
     assert calls == [{"timeout_seconds": 1.5}]
     assert status["codex_quota"]["snapshot"]["plan_short_label"] == "ProLite"
-    assert status["codex_quota"]["snapshot"]["primary"]["used_percent"] == 28
+    assert status["codex_quota"]["snapshot"]["windows"][0]["used_percent"] == 28
     assert status["codex_quota"]["last_error"] is None
     assert status["codex_quota"]["updated_at"] is not None
     assert status["codex_quota"]["touchscreen_render_count"] == 1
@@ -960,7 +965,7 @@ def test_hardware_input_endpoint_routes_touch_and_knob_to_logical_panel() -> Non
     assert knob_response.json()["panel_event"] is None
     assert knob_response.json()["rotary_intent"]["rotate_action"] == "cycle_panel_content"
     assert status["logical_panel"]["selection"]["active_kind"] == "quota"
-    assert status["logical_panel"]["selection"]["quota_window"] == "secondary"
+    assert status["logical_panel"]["selection"]["quota_window"] == "auto"
 
 
 def test_hardware_key_selects_agent_and_reports_missing_focus_target() -> None:
@@ -1567,11 +1572,157 @@ def test_hardware_status_key_press_cycles_quota_window_and_usage_period() -> Non
 
     assert save_response.status_code == 200
     assert quota_response.json()["action"]["status"] == "cycled"
-    assert quota_response.json()["action"]["quota_window"] == "secondary"
+    assert quota_response.json()["action"]["quota_window"] == "auto"
     assert usage_response.json()["action"]["status"] == "cycled"
     assert usage_response.json()["action"]["usage_period"] == "week"
-    assert status["key_layout"]["layout"]["keys"][0]["quota_window"] == "secondary"
+    assert status["key_layout"]["layout"]["keys"][0]["quota_window"] == "auto"
     assert status["key_layout"]["layout"]["keys"][1]["usage_period"] == "week"
+
+
+def test_status_key_cycles_all_actual_quota_window_ids() -> None:
+    """多窗口 quota 快照应让状态键在真实 window_id 间循环，而非固定两个槽位。
+
+    入参：无；启动带双窗口 fake quota poller 的 daemon，并连续按下 quota 状态键。
+    返回：无返回值；断言通过代表运行时会把 stable window_id 写回暂存布局。
+    错误处理：窗口漏入循环、顺序不稳定或没有回到 auto 时由 pytest 报告。
+    副作用：仅测试内存 daemon 和 fake quota reader，不写用户配置或访问硬件。
+    """
+
+    app = create_app(
+        poller_config=DaemonPollerConfig(codex_quota_enabled=True),
+        codex_quota_reader=lambda **_kwargs: _quota_snapshot(),
+    )
+    with TestClient(app) as client:
+        client.put(
+            "/ui/key-layout",
+            json={
+                "keys": [
+                    {"index": 0, "kind": "quota_status", "quota_window": "auto"},
+                    *({"index": index, "kind": "unassigned"} for index in range(1, 5)),
+                    *({"index": index, "kind": "agent"} for index in range(5, 10)),
+                ]
+            },
+        )
+        windows = [
+            client.post(
+                "/hardware/input",
+                json=_hardware_input(kind="key", index=0, value={"state": 1}),
+            ).json()["action"]["quota_window"]
+            for _ in range(3)
+        ]
+
+    assert windows == ["codex:primary", "codex:secondary", "auto"]
+
+
+def test_quota_presentation_controls_displayed_windows_and_status_key_cycle(
+    tmp_path: Path,
+) -> None:
+    """独立 quota 策略应重排、标记和隐藏硬件展示窗口，而原始状态保持完整。
+
+    入参：`tmp_path` 提供隔离策略路径；测试快照含 Codex、Spark 与隐藏的未来 limit。
+    返回：无返回值；断言通过代表主键轮换只消费展示集合，而 status 仍保留采集集合。
+    错误处理：策略未加载、展示标签不生效或隐藏窗口进入循环时由 pytest 报告。
+    副作用：仅在 pytest 临时目录写策略 JSON，并启动内存 FastAPI app。
+    """
+
+    policy_path = tmp_path / "quota-presentation.json"
+    save_quota_presentation(
+        QuotaPresentation(
+            rules=(
+                QuotaPresentationRule(limit_id="codex_spark", label="Spark", order=0),
+                QuotaPresentationRule(limit_id="codex", label="Codex", order=10),
+                QuotaPresentationRule(limit_id="future", visible=False),
+            )
+        ),
+        policy_path,
+    )
+    snapshot = CodexQuotaSnapshot(
+        plan_type="pro",
+        plan_display_name="Pro",
+        windows=(
+            {
+                "window_id": "codex:primary",
+                "limit_id": "codex",
+                "used_percent": 10,
+                "window_duration_mins": 10080,
+                "resets_at": datetime(2026, 7, 20, 10, tzinfo=UTC),
+            },
+            {
+                "window_id": "codex_spark:primary",
+                "limit_id": "codex_spark",
+                "limit_name": "GPT-5.3-Codex-Spark",
+                "used_percent": 20,
+                "window_duration_mins": 10080,
+                "resets_at": datetime(2026, 7, 20, 10, tzinfo=UTC),
+            },
+            {
+                "window_id": "future:primary",
+                "limit_id": "future",
+                "used_percent": 30,
+                "window_duration_mins": 43200,
+                "resets_at": datetime(2026, 8, 1, 10, tzinfo=UTC),
+            },
+        ),
+    )
+    app = create_app(
+        poller_config=DaemonPollerConfig(codex_quota_enabled=True),
+        codex_quota_reader=lambda **_kwargs: snapshot,
+        quota_presentation_path=policy_path,
+    )
+    with TestClient(app) as client:
+        client.put(
+            "/ui/key-layout",
+            json={
+                "keys": [
+                    {"index": 0, "kind": "quota_status", "quota_window": "auto"},
+                    *({"index": index, "kind": "unassigned"} for index in range(1, 5)),
+                    *({"index": index, "kind": "agent"} for index in range(5, 10)),
+                ]
+            },
+        )
+        status = client.get("/status").json()
+        windows = [
+            client.post(
+                "/hardware/input",
+                json=_hardware_input(kind="key", index=0, value={"state": 1}),
+            ).json()["action"]["quota_window"]
+            for _ in range(3)
+        ]
+
+    assert [item["window_id"] for item in status["codex_quota"]["snapshot"]["windows"]] == [
+        "codex:primary",
+        "codex_spark:primary",
+        "future:primary",
+    ]
+    assert [
+        item["window_id"] for item in status["codex_quota"]["display_snapshot"]["windows"]
+    ] == ["codex_spark:primary", "codex:primary"]
+    assert status["codex_quota"]["display_snapshot"]["windows"][0]["presentation_label"] == "Spark"
+    assert windows == ["codex_spark:primary", "codex:primary", "auto"]
+
+
+def test_single_quota_window_keeps_status_key_in_auto_mode() -> None:
+    """单窗口订阅按下 quota 状态键不应在等价的 auto/primary 间伪切换。
+
+    入参：无；测试构造只有 primary 的 quota 快照。
+    返回：无返回值；断言通过代表服务端策略改变后状态键仍保留直观交互。
+    错误处理：缺失 secondary 被加入循环或 stale 配置未被归位时由 pytest 报告。
+    副作用：无；只调用纯窗口选择 helper。
+    """
+
+    snapshot = CodexQuotaSnapshot(
+        plan_type="free",
+        plan_display_name="Free",
+        primary={
+            "used_percent": 42,
+            "window_duration_mins": 43200,
+            "resets_at": datetime(2026, 8, 1, 8, tzinfo=UTC),
+        },
+        secondary=None,
+    )
+
+    assert server_app._next_quota_status_window("auto", snapshot=snapshot) == "auto"
+    assert server_app._next_quota_status_window("secondary", snapshot=snapshot) == "auto"
 
 
 def test_streamdock_n4pro_renderer_combines_quota_and_agent_keys(
@@ -1899,7 +2050,7 @@ def test_default_n4pro_renderer_input_callback_routes_sdk_events(
     assert first_knob_response["handled"] is True
     assert second_knob_response["handled"] is True
     assert status["logical_panel"]["selection"]["active_kind"] == "quota"
-    assert status["logical_panel"]["selection"]["quota_window"] == "primary"
+    assert status["logical_panel"]["selection"]["quota_window"] == "auto"
     assert status["streamdock_input"]["event_count"] == 4
     assert status["streamdock_input"]["last_event"] == {
         "count": 4,

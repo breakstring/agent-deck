@@ -8,11 +8,11 @@ composer 合成到 SDK 可下发的 800x480 背景图。它不读取 Codex、不
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Final, Literal
+from typing import Final
 
 from PIL import Image, ImageDraw, ImageFont
 
-from agent_deck.adapters.codex_quota import CodexQuotaSnapshot
+from agent_deck.adapters.codex_quota import CodexQuotaSnapshot, CodexQuotaWindow
 from agent_deck.rendering.n4pro_panel import (
     N4PRO_BACKGROUND_COLOR,
     N4PRO_BACKGROUND_SIZE,
@@ -38,20 +38,28 @@ _MUTED: Final[tuple[int, int, int]] = (145, 160, 182)
 _TRACK: Final[tuple[int, int, int]] = (44, 54, 76)
 _PRIMARY: Final[tuple[int, int, int]] = (76, 205, 255)
 _SECONDARY: Final[tuple[int, int, int]] = (126, 236, 165)
+_TERTIARY: Final[tuple[int, int, int]] = (171, 143, 255)
+_QUATERNARY: Final[tuple[int, int, int]] = (255, 143, 112)
+_QUOTA_ACCENTS: Final[tuple[tuple[int, int, int], ...]] = (
+    _PRIMARY,
+    _SECONDARY,
+    _TERTIARY,
+    _QUATERNARY,
+)
 _RESET_CREDIT: Final[tuple[int, int, int]] = (248, 213, 113)
 
 
 def render_quota_touchscreen(
     snapshot: CodexQuotaSnapshot,
     *,
-    window: Literal["primary", "secondary", "both"] = "both",
+    window: str = "all",
     size: tuple[int, int] = N4PRO_BACKGROUND_SIZE,
     touch_bar_rect: tuple[int, int, int, int] = N4PRO_TOUCH_BAR_RECT,
 ) -> Image.Image:
     """把 Codex quota 快照渲染为 N4 Pro 背景图。
 
-    入参：`snapshot` 是 Codex quota adapter 解析出的快照；`window` 控制展示 5 小时、周或
-    兼容旧界面的双行内容；`size` 是 SDK 背景图尺寸，
+    入参：`snapshot` 是 Codex quota adapter 解析出的快照；`window` 控制展示指定 API 窗口或
+    全部实际可用窗口；`size` 是 SDK 背景图尺寸，
     默认 N4 Pro 的 800x480；`touch_bar_rect` 是背景图中真实底部触摸条的安全绘制区域，
     格式为 `(left, top, right, bottom)`。
     返回：RGB `Image`，可保存为 JPEG 后通过 SDK `set_touchscreen_image` 下发；信息只绘制
@@ -68,7 +76,7 @@ def render_quota_touchscreen(
 def render_quota_panel(
     snapshot: CodexQuotaSnapshot,
     *,
-    window: Literal["primary", "secondary", "both"] = "both",
+    window: str = "all",
     size: tuple[int, int] = N4PRO_LOGICAL_PANEL_VIEWPORT.size,
 ) -> Image.Image:
     """把 Codex quota 快照渲染为底部虚拟 panel 图像。
@@ -116,27 +124,7 @@ def render_quota_panel(
     )
 
     right_x = left + plan_width + 46
-    if window not in {"primary", "secondary", "both"}:
-        raise ValueError("quota window must be primary, secondary, or both")
-    rows = []
-    if window in {"primary", "both"}:
-        rows.append(
-            (
-                "5hours:",
-                _remaining_percent(snapshot.primary.used_percent),
-                snapshot.primary_reset_label(),
-                _PRIMARY,
-            )
-        )
-    if window in {"secondary", "both"}:
-        rows.append(
-            (
-                "weekly:",
-                _remaining_percent(snapshot.secondary.used_percent),
-                snapshot.secondary_reset_label(),
-                _SECONDARY,
-            )
-        )
+    rows = _quota_rows(snapshot, window=window)
     row_gap = max(48, (content_bottom - content_top - 38) // max(1, len(rows)))
     first_row_y = content_top + 5
     if len(rows) == 1:
@@ -155,6 +143,53 @@ def render_quota_panel(
             percent_font=percent_font,
         )
     return image
+
+
+def _quota_rows(
+    snapshot: CodexQuotaSnapshot,
+    *,
+    window: str,
+) -> list[tuple[str, int, str, tuple[int, int, int]]]:
+    """把当前可用 quota 槽位转换成 touch bar 的行模型。
+
+    入参：`snapshot` 是已解析 quota；`window` 指定稳定 window_id、`auto` 或兼容用的 `all`。
+    返回：指定窗口的一行，或总览模式中当前前两项窗口的行模型。
+    错误处理：未知或旧 primary/secondary 配置由 snapshot 自动回退到实际窗口。
+    副作用：无；不创建图像、不访问时钟之外的外部状态。
+    """
+
+    selected_windows = (
+        snapshot.available_windows()[:2]
+        if window == "all"
+        else (snapshot.resolved_window(window),)
+    )
+    return [
+        (
+            _compact_window_label(selected),
+            _remaining_percent(selected.used_percent),
+            selected.display_reset_label(),
+            _QUOTA_ACCENTS[index % len(_QUOTA_ACCENTS)],
+        )
+        for index, selected in enumerate(selected_windows)
+    ]
+
+
+def _compact_window_label(window: CodexQuotaWindow) -> str:
+    """把 quota 窗口名称压缩为 touch bar 左侧进度条可容纳的标签。
+
+    入参：`window` 是 adapter 的 quota window 模型；函数只依赖其 limit 名称和周期显示方法。
+    返回：主 limit 为 `week:` 等周期标签；具名额外 limit 优先取名称最后一段并附带周期。
+    错误处理：缺少名称或异常格式安全回退到周期标签。
+    副作用：无；不访问图片或硬件。
+    """
+
+    period = window.display_period_label().upper()
+    label = window.presentation_label
+    if not label and window.limit_name:
+        label = window.limit_name.rsplit("-", maxsplit=1)[-1].strip()
+    if not label and window.limit_id == "codex":
+        label = "Codex"
+    return f"{label.upper()} · {period}" if label else period
 
 
 def _remaining_percent(used_percent: int) -> int:
@@ -220,7 +255,15 @@ def _draw_quota_row(
     """
 
     x, y = origin
-    bar_x = x + 116
+    label = _fit_row_label(
+        draw,
+        label,
+        font=label_font,
+        max_right=max_right - 128,
+        origin_x=x,
+    )
+    label_right = _text_right(draw, label, font=label_font, origin=(x, y + 17))
+    bar_x = max(x + 116, label_right + 18)
     bar_y = y + 9
     reset_w = 92
     reset_gap = 16
@@ -250,6 +293,54 @@ def _draw_quota_row(
     _draw_reset_icon(draw, icon_center, icon_size)
     draw.text((bar_x, y + 29), f"{percent}%", fill=bar_color, font=percent_font)
     draw.text((reset_x, bar_center_y), reset_label, fill=_MUTED, font=value_font, anchor="lm")
+
+
+def _text_right(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    *,
+    font: ImageFont.ImageFont,
+    origin: tuple[int, int],
+) -> int:
+    """计算左中对齐文本的右边界，用于给触屏进度条预留动态空间。
+
+    入参：`draw` 是 Pillow 绘图对象；`text` 和 `font` 是待绘制文本与字体；`origin` 是 `lm`
+    锚点坐标。
+    返回：文本像素右边界。
+    错误处理：字体或文本测量异常按 Pillow 原语义传播。
+    副作用：无；只测量，不修改图像。
+    """
+
+    left, _top, right, _bottom = draw.textbbox(origin, text, font=font, anchor="lm")
+    del left
+    return right
+
+
+def _fit_row_label(
+    draw: ImageDraw.ImageDraw,
+    label: str,
+    *,
+    font: ImageFont.ImageFont,
+    max_right: int,
+    origin_x: int,
+) -> str:
+    """裁剪 quota 行标签，保证触屏进度条保留可读的最小宽度。
+
+    入参：`draw` 用于文本测量；`label` 是原始标签；`font` 是标签字体；`max_right` 是标签可达
+    的右边界；`origin_x` 是左起点。
+    返回：原标签或带省略号的短标签。
+    错误处理：Pillow 测量失败按原语义传播。
+    副作用：无；不修改图像。
+    """
+
+    if _text_right(draw, label, font=font, origin=(origin_x, 0)) <= max_right:
+        return label
+    suffix = "..."
+    for length in range(len(label) - 1, 0, -1):
+        candidate = f"{label[:length]}{suffix}"
+        if _text_right(draw, candidate, font=font, origin=(origin_x, 0)) <= max_right:
+            return candidate
+    return suffix
 
 
 def _draw_reset_icon(

@@ -158,13 +158,37 @@ Hardware layouts saved from the web UI live at:
 
 - Key layout: `~/Library/Application Support/AgentDeck/n4pro-key-layout.json`
 - Knob and lighting layout: `~/Library/Application Support/AgentDeck/n4pro-rotary-layout.json`
+- Codex quota presentation policy: `~/Library/Application Support/AgentDeck/quota-presentation.json`
 
 Use these variables to isolate paths for tests or multiple configurations:
 
 ```bash
 export AGENT_DECK_N4PRO_KEY_LAYOUT="/path/to/key-layout.json"
 export AGENT_DECK_N4PRO_ROTARY_LAYOUT="/path/to/rotary-layout.json"
+export AGENT_DECK_QUOTA_PRESENTATION="/path/to/quota-presentation.json"
 ```
+
+`quota-presentation.json` is not edited by the current Web configuration page. It sets a short label,
+display order, and visibility for each Codex limit. Rules match the app-server `limit_id`, never a
+`primary` / `secondary` slot. An unknown future limit remains visible by default, and no file means the
+same default behavior.
+
+```json
+{
+  "version": 1,
+  "presentation": {
+    "unmatched_visible": true,
+    "rules": [
+      { "limit_id": "codex", "label": "Codex", "visible": true, "order": 0 },
+      { "limit_id": "codex_bengalfox", "label": "Spark", "visible": true, "order": 10 }
+    ]
+  }
+}
+```
+
+Read `codex_quota.snapshot.windows` from `GET /status` to find the current `limit_id` values.
+`display_snapshot` is the filtered collection used by the hardware. Restart the daemon after changing
+the file.
 
 ## 6. Codex Integration
 

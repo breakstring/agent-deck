@@ -66,26 +66,6 @@ class PanelContentDirection(StrEnum):
     NEXT = "next"
 
 
-class QuotaWindow(StrEnum):
-    """描述 Quota virtual panel 当前展示的订阅窗口。
-
-    入参：枚举值来自 `PanelSelection` 的内容轮换状态。
-    返回：作为 quota renderer 的稳定窗口标识。
-    错误处理：未知字符串由 Pydantic/Enum 拒绝。
-    副作用：无。
-    """
-
-    PRIMARY = "primary"
-    SECONDARY = "secondary"
-
-
-QUOTA_WINDOW_ORDER: tuple[QuotaWindow, ...] = (
-    QuotaWindow.PRIMARY,
-    QuotaWindow.SECONDARY,
-)
-"""Quota panel 内容切换时采用的 5 小时、周窗口固定顺序。"""
-
-
 class PanelInputRole(StrEnum):
     """描述 panel 推荐使用的主要输入方式。
 
@@ -157,7 +137,7 @@ class PanelSelection(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     active_kind: PanelKind = PanelKind.BRAND
-    quota_window: QuotaWindow = QuotaWindow.PRIMARY
+    quota_window: str = "auto"
     token_period: CodexTokenPeriod = CodexTokenPeriod.TODAY
 
 
@@ -302,22 +282,21 @@ def quota_panel_plan(snapshot: CodexQuotaSnapshot) -> LogicalPanelPlan:
     """把 Codex quota 快照转换成 logical panel 计划。
 
     入参：`snapshot` 是 Codex quota adapter 解析出的快照。
-    返回：`kind=PanelKind.QUOTA` 的 `LogicalPanelPlan`，保留计划名、5 小时和周配额剩余百分比。
+    返回：`kind=PanelKind.QUOTA` 的 `LogicalPanelPlan`，保留计划名与当前实际可用窗口的配额。
     错误处理：snapshot 字段非法应在 adapter 层由 Pydantic 报告；本函数只读取字段。
     副作用：无；不渲染图像、不访问 Codex。
     """
 
     plan_label = snapshot.plan_short_label or snapshot.plan_display_name
-    primary_remaining = _remaining_percent(snapshot.primary.used_percent)
-    secondary_remaining = _remaining_percent(snapshot.secondary.used_percent)
+    quota_lines = tuple(
+        f"{window.display_period_label().lower()} "
+        f"{_remaining_percent(window.used_percent)}% resets {window.display_reset_label()}"
+        for window in snapshot.available_windows()
+    )
     return LogicalPanelPlan(
         kind=PanelKind.QUOTA,
         title="Quota",
-        lines=(
-            plan_label,
-            f"5h {primary_remaining}% resets {snapshot.primary_reset_label()}",
-            f"weekly {secondary_remaining}% resets {snapshot.secondary_reset_label()}",
-        ),
+        lines=(plan_label, *quota_lines),
         controls=_default_rotary_controls(),
     )
 
@@ -399,10 +378,13 @@ def message_panel_plan(
 def apply_panel_input(
     selection: PanelSelection,
     event: PanelInputEvent,
+    *,
+    available_quota_windows: tuple[str, ...] | None = None,
 ) -> PanelSelection:
     """把 logical panel 输入事件归约成新的选择状态。
 
-    入参：`selection` 是当前选择状态；`event` 是已经由硬件层归一化的 panel 输入事件。
+    入参：`selection` 是当前选择状态；`event` 是已经由硬件层归一化的 panel 输入事件；
+    `available_quota_windows` 可由实时 quota 快照传入，以跳过当前订阅不存在的窗口。
     返回：新的 `PanelSelection`；无状态变化时返回原状态值。
     错误处理：非法事件由枚举/Pydantic 调用方约束处理；未知业务事件按无状态变化处理。
     副作用：无；不会执行 action、不会触发硬件输出。
@@ -412,9 +394,17 @@ def apply_panel_input(
         return cycle_virtual_panel(selection, direction=PanelContentDirection.NEXT)
 
     if event == PanelInputEvent.KNOB_4_ROTATE_RIGHT:
-        return cycle_panel_content(selection, direction=PanelContentDirection.NEXT)
+        return cycle_panel_content(
+            selection,
+            direction=PanelContentDirection.NEXT,
+            available_quota_windows=available_quota_windows,
+        )
     if event == PanelInputEvent.KNOB_4_ROTATE_LEFT:
-        return cycle_panel_content(selection, direction=PanelContentDirection.PREVIOUS)
+        return cycle_panel_content(
+            selection,
+            direction=PanelContentDirection.PREVIOUS,
+            available_quota_windows=available_quota_windows,
+        )
 
     return selection
 
@@ -445,22 +435,29 @@ def cycle_panel_content(
     selection: PanelSelection,
     *,
     direction: PanelContentDirection,
+    available_quota_windows: tuple[str, ...] | None = None,
 ) -> PanelSelection:
     """切换当前面板内部的内容维度，不跨越到其他 virtual panel。
 
     入参：`selection` 是当前选择状态；`direction` 指定向前或向后环形移动。
-    返回：Quota 更新 5h/Week 窗口、Usage 更新统计周期；Brand 和其他 panel 原样返回。
+    返回：Quota 在实际可用窗口之间切换、Usage 更新统计周期；Brand 和其他 panel 原样返回。
     错误处理：无；内容缺省值已由 Pydantic 枚举保证。
     副作用：无；不执行系统或硬件动作。
     """
 
     step = 1 if direction == PanelContentDirection.NEXT else -1
     if selection.active_kind == PanelKind.QUOTA:
+        order = available_quota_windows or ()
+        if not order:
+            return selection
+        current = selection.quota_window
+        if current not in order:
+            return selection.model_copy(update={"quota_window": order[0]})
         return selection.model_copy(
             update={
                 "quota_window": _next_cyclic_value(
-                    QUOTA_WINDOW_ORDER,
-                    selection.quota_window,
+                    order,
+                    current,
                     step=step,
                 )
             }

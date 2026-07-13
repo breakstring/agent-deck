@@ -63,6 +63,7 @@ from agent_deck.rendering.visuals import resolve_visual_icon_spec
 from agent_deck.server.app import DaemonPollerConfig, create_app
 from agent_deck.server.key_layout_store import resolve_n4pro_key_layout_path
 from agent_deck.server.rotary_layout_store import resolve_n4pro_rotary_layout_path
+from agent_deck.server.quota_presentation_store import resolve_quota_presentation_path
 
 DEFAULT_DAEMON_URL = "http://127.0.0.1:8765"
 _DEFAULT_HTTP_TIMEOUT_SECONDS = 5.0
@@ -333,6 +334,7 @@ def daemon_callback(
             poller_config=poller_config,
             key_layout_path=resolve_n4pro_key_layout_path(),
             rotary_layout_path=resolve_n4pro_rotary_layout_path(),
+            quota_presentation_path=resolve_quota_presentation_path(),
         ),
         host=host,
         port=port,
