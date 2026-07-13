@@ -2,42 +2,66 @@
 
 **[English](README.en.md)**
 
-Agent Deck 是一个本机运行的 AI Agent 硬件控制台桥接项目。它把 Agent 的状态、用量与可配置操作映射到妙联宝设备，同时保留可在浏览器中使用的本地配置界面。
+> 把本机 AI Agent 的运行状态、订阅额度与可控操作，带到妙联宝 N4 Pro 的硬件表面。
 
-当前公开版本聚焦于 **macOS + MiraBox N4 Pro + Codex**。项目已经具备可实际使用的主路径，但仍处于 `0.x` 快速迭代阶段；其他操作系统、硬件型号和 Agent 平台尚未作出兼容性承诺。
+Agent Deck 是一个运行在本机的 AI Agent 硬件控制台桥接项目。它将 Agent 的状态、用量和经过明确配置的操作映射到妙联宝设备，同时提供浏览器中的本地配置界面。当前版本为 **`0.1.0`**，已聚焦完成 **macOS + MiraBox N4 Pro + Codex** 的首个可用闭环；项目仍处于 `0.x` 阶段，其他操作系统、硬件型号与 Agent 平台暂不作兼容性承诺。
 
-## 你可以用它做什么
+## 产品演示
 
-- 在 N4 Pro 的 10 个 LCD 按键上配置本地应用、网址、Agent 状态和订阅/用量视图。
-- 在底部虚拟面板中轮换品牌图、订阅额度与 Token/金额统计；使用趋势由本地缓存预渲染，减少切换等待。
-- 配置 4 个旋钮的旋转动作，例如切换面板或周期、调节系统输入/输出音量、显示器亮度和控制台屏幕亮度。
-- 配置旋钮灯光颜色和可选呼吸效果，并在 Web 配置页实时预览。
-- 读取 Codex 本地状态、quota 和 `ccusage` 数据；可选择安装 Codex hook 集成。默认审批模式保持 Codex 原生审批界面，不会把审批控制权交给硬件。
-- 没有连接真实硬件时，以 fake hardware 模式运行配置 UI 和核心服务。
+[![播放 Agent Deck 产品介绍视频](assets/agent-deck/brand-intro-v02.png)](https://breakstring.github.io/agent-deck/)
+
+点击上图可在浏览器中打开 Agent Deck 的产品介绍播放页。该页面与项目源码分离部署在 GitHub Pages；正式视频会随首个 [`v0.1.0` Release](https://github.com/breakstring/agent-deck/releases/tag/v0.1.0) 作为 1080p MP4 素材提供。
+
+## 它解决什么问题
+
+当多个 AI Agent 同时运行时，状态、等待输入和用量信息容易散落在终端、桌面 App 和不同窗口中。Agent Deck 将这些本机信号归约为统一状态，并投影到有按键、触屏和旋钮的硬件表面：你可以一眼查看状态，按需切换面板或聚焦上下文，同时保持高风险动作默认关闭。
+
+项目的核心边界始终保持为：
+
+```text
+Agent ingress -> NormalizedEvent -> AgentStateStore -> DeckMode/LayoutPlan
+             -> HardwareSurface -> InteractionIntent/ActionExecutor
+```
+
+这让 Codex 与 N4 Pro 是当前已验证的组合，而不是不可替换的实现前提。
+
+## Web 配置界面
+
+![Agent Deck 本地 Web 配置界面：N4 Pro 预览、按键用途与保存应用操作](assets/agent-deck/config.png)
+
+本地配置页以 N4 Pro 预览为操作入口：选择一个按键或旋钮后，修改会先即时反映在 GUI 预览中，只有点击“保存并应用”才会下发到已连接的真实设备。当前可以配置的内容包括：
+
+- 10 个 LCD 主按键的本地 App、网址、订阅/额度、Token/金额用量与 Agent 状态入口。
+- 底部逻辑面板的品牌图、Codex quota 和用量趋势；其中用量趋势来自本地缓存，切换时不阻塞硬件交互。
+- 4 个旋钮的轮转动作，例如切换面板或周期、调整系统输入/输出音量、显示器亮度与控制台屏幕亮度。
+- 旋钮灯圈组的颜色与可选呼吸效果，并在保存前预览。
+
+未连接真实设备时，配置页和核心服务仍可通过 fake hardware 运行，适合先体验、开发和排障。
 
 ## 当前支持范围
 
 | 维度 | 当前状态 |
 | --- | --- |
-| 操作系统 | macOS 为已验证目标。Windows/Linux 目前不属于正式支持范围。 |
-| 真实硬件 | MiraBox N4 Pro。其他 StreamDock/MiraBox 型号保留架构扩展空间，但尚未作为可用目标发布。 |
-| Agent | Codex 的本地 App/CLI 状态与 hook 集成。 |
+| 项目版本 | `0.1.0`；首个正式 GitHub Release 将使用 tag `v0.1.0`。 |
+| 操作系统 | macOS 为已验证目标。Windows 和 Linux 暂未正式支持。 |
+| 真实硬件 | MiraBox N4 Pro。架构为其他 StreamDock/MiraBox 型号留有扩展空间，但尚未作为可用目标发布。 |
+| Agent | Codex 本地 App/CLI 的状态、quota 与 hook 集成。 |
 | Python | Python 3.11 或更高版本。 |
-| 用量趋势 | 可选依赖 Bun 的 `bunx` 与 `ccusage`；缺失时，其他功能仍可运行，但 Token/金额趋势不可用。 |
+| 用量趋势 | 可选依赖 Bun 的 `bunx` 与 `ccusage`；缺失时，其他功能可继续运行，但 Token/金额趋势不可用。 |
 
 ## 快速开始
 
-完整步骤、硬件接管和排障请阅读 [使用指南](docs/guides/using-agent-deck.zh-CN.md)。下面是使用 fake hardware 启动本地配置页的最短路径：
+完整安装、硬件接管与排障说明请阅读[使用指南](docs/guides/using-agent-deck.zh-CN.md)。下面是以 fake hardware 启动本地配置页的最短路径：
 
 ```bash
 git clone https://github.com/breakstring/agent-deck.git
 cd agent-deck
 uv sync --all-groups
 
-# 检查本机环境与设备线索
+# 读取本机环境与设备线索；该命令不会写屏或接管设备。
 uv run agent-deckctl doctor
 
-# 以不接管真实设备的方式启动
+# 不接管真实硬件地启动本地服务。
 scripts/agent-deckd-tmux.sh start --disable-hardware-renderer
 ```
 
@@ -47,7 +71,40 @@ scripts/agent-deckd-tmux.sh start --disable-hardware-renderer
 scripts/agent-deckd-tmux.sh stop
 ```
 
-如果希望接管 N4 Pro，请先退出官方 MiraBox/StreamDock 应用，并在启动前通过 `doctor` 确认设备线索。macOS 上 SDK 动态库不兼容时，需要将 `AGENT_DECK_STREAMDOCK_SDK_PATH` 指向官方 Python SDK；具体做法见[真实硬件运行](docs/guides/using-agent-deck.zh-CN.md#真实硬件运行)。
+若要接管 N4 Pro，请先退出官方 MiraBox/StreamDock 应用，并在启动前通过 `doctor` 检查设备线索。macOS 上 SDK 动态库不兼容时，需要将 `AGENT_DECK_STREAMDOCK_SDK_PATH` 指向官方 Python SDK；具体做法见[真实硬件运行](docs/guides/using-agent-deck.zh-CN.md#真实硬件运行)。
+
+## Codex 集成与安全边界
+
+Agent Deck 可读取 Codex 的本地状态、quota 和 `ccusage` 数据，并可选安装 Codex hook 集成。安装器始终先输出 dry-run，只有显式传入 `--apply` 才会写入本机 Codex 配置：
+
+```bash
+# 检查当前 Codex 环境，并生成接入建议。
+uv run agent-deckctl codex-detect --enable-integration
+
+# 预览将要写入的 notify 与 hook 配置。
+uv run agent-deckctl codex-install
+
+# 确认预览无误后才实际写入。
+uv run agent-deckctl codex-install --apply
+```
+
+默认审批模式保留 Codex 原生审批界面，不会自动把审批控制权交给硬件。涉及文本输入、批准或拒绝等高风险操作时，必须由用户显式配置；daemon 不可用、响应非法或等待超时时，审批链路按 fail-closed 策略处理。
+
+## 常用命令与运行管理
+
+| 命令 | 用途 |
+| --- | --- |
+| `uv run agent-deckd` | 启动核心 daemon，接收 Agent 事件并驱动硬件渲染。 |
+| `uv run agent-deckctl` | 执行环境诊断、运行状态查看、硬件检查与事件模拟。 |
+| `uv run agent-deck-codex-hook` | 供 Codex notify/command hook 调用的桥接工具。 |
+| `scripts/agent-deckd-tmux.sh [start\|stop\|status\|logs\|attach\|restart]` | 以 tmux 管理常驻服务；推荐用于日常运行。 |
+| `./run.sh [start\|stop\|status\|logs\|restart]` | 没有 tmux 时使用的普通后台管理脚本。 |
+
+前台调试时可以直接运行：
+
+```bash
+uv run agent-deckd --host 127.0.0.1 --port 8765
+```
 
 ## 文档
 
@@ -55,57 +112,7 @@ scripts/agent-deckd-tmux.sh stop
 - [Usage guide (English)](docs/guides/using-agent-deck.en.md)
 - [贡献指南（中文）](CONTRIBUTING.zh-CN.md)
 - [Contributing guide (English)](CONTRIBUTING.md)
-- [项目路线图](docs/references/agent-deck-roadmap.md)：后续方向和边界。
-
-## CLI 主要命令
-
-项目提供了三个主要的 CLI 入口（通过 `uv run` 执行）：
-- **`agent-deckd`**：核心后台 Daemon 服务，负责驱动硬件显示并接收外部 Agent 遥测。
-- **`agent-deckctl`**：运维管理工具，支持环境诊断 (`doctor`)、运行状态查看和事件模拟。
-- **`agent-deck-codex-hook`**：Codex 专属集成钩子，负责同步 turn 状态并安全反馈硬件端做出的审批决策。
-
-## 运行管理
-
-你可以使用项目内置的脚本来管理常驻后台进程：
-
-- **Tmux 托管模式**（推荐，便于查看日志和进程 attach）：
-  ```bash
-  # 启动/停止/查看状态/查看日志/附加到会话
-  scripts/agent-deckd-tmux.sh [start|stop|status|logs|attach|restart]
-  ```
-
-- **普通后台模式**（在没有安装 tmux 的环境）：
-  ```bash
-  # 使用内置的运行脚本
-  ./run.sh [start|stop|status|logs|restart]
-  ```
-
-- **前台直接运行**（常用于调试）：
-  ```bash
-  uv run agent-deckd --host 127.0.0.1 --port 8765
-  ```
-
-## 智能体集成 (Hooks 配置)
-
-项目通过命令行工具支持对 Codex 的一键集成配置：
-1. **环境检测**：运行 `uv run agent-deckctl codex-detect --enable-integration` 获取配置建议。
-2. **预览配置 (Dry-run)**：运行 `uv run agent-deckctl codex-install` 预览待写入的 hooks 设置。
-3. **应用集成**：运行 `uv run agent-deckctl codex-install --apply` 自动完成本地 Codex 系统的 hooks 配置。
-
-更多高级配置及硬件排障，请参考 [使用指南](docs/guides/using-agent-deck.zh-CN.md)。
-
-
-## 授权协议
-
-本项目的核心代码采用 **[MIT 许可证](LICENSE)** 进行授权。你可以自由地使用、修改和分发该软件。
-
-### 第三方组件及授权
-
-本项目的 `vendor/` 目录下包含以下第三方组件：
-- **streamdock-python-sdk**：用于与妙联宝/StreamDock 控制台设备进行通信的 Python SDK。
-  - **原始仓库**: [MiraboxSpace/StreamDock-Plugin-SDK](https://github.com/MiraboxSpace/StreamDock-Plugin-SDK)
-  - **授权协议**: [MIT 许可证](vendor/streamdock-python-sdk/LICENSE)
-
+- [项目路线图](docs/references/agent-deck-roadmap.md)：长期方向、阶段边界与待验证事项。
 
 ## 开发与验证
 
@@ -115,4 +122,8 @@ uv run agent-deckctl version
 git diff --check
 ```
 
-真实设备验证属于显式手动 smoke，不会纳入自动化测试。详见[贡献指南](CONTRIBUTING.zh-CN.md)。
+真实设备验证属于显式手动 smoke，不纳入自动化测试。提交 issue 时，请避免粘贴 API key、token、完整 prompt 或私有应用路径；详见[贡献指南](CONTRIBUTING.zh-CN.md)。
+
+## 授权协议
+
+核心代码采用 **[MIT 许可证](LICENSE)**。`vendor/streamdock-python-sdk` 是用于与妙联宝/StreamDock 控制台设备通信的第三方 Python SDK，来源于 [MiraboxSpace/StreamDock-Plugin-SDK](https://github.com/MiraboxSpace/StreamDock-Plugin-SDK)，同样采用 [MIT 许可证](vendor/streamdock-python-sdk/LICENSE)。

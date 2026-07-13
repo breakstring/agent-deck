@@ -25,3 +25,6 @@ vendor/**/*.egg-info/
 
 # Local worktrees
 .worktrees/
+
+# Local HyperFrames video workspaces and their large source media/renders.
+marketing/hyperframes/

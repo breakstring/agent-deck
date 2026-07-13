@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Agent Deck 产品介绍视频：将本机 AI Agent 的状态、订阅额度和用量趋势带到 MiraBox N4 Pro。"
+    />
+    <meta name="theme-color" content="#071013" />
+    <title>Agent Deck · Product Introduction</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main>
+      <section class="hero" aria-labelledby="page-title">
+        <nav class="topbar" aria-label="Product links">
+          <a class="brand" href="https://github.com/breakstring/agent-deck">
+            <span class="brand-mark" aria-hidden="true">◆</span>
+            <span>AGENT DECK</span>
+          </a>
+          <a class="repo-link" href="https://github.com/breakstring/agent-deck">View on GitHub <span aria-hidden="true">↗</span></a>
+        </nav>
+
+        <div class="hero-copy">
+          <p class="eyebrow"><span class="signal" aria-hidden="true"></span> COMMAND CORE / LOCAL</p>
+          <h1 id="page-title">状态，触手可及。</h1>
+          <p class="lead">把本机 AI Agent 的状态、订阅额度和用量趋势，带到妙联宝 N4 Pro 的硬件表面。</p>
+          <p class="lead-en">Bring local AI-agent status, subscription quota, and usage trends to the physical surface of a MiraBox N4 Pro.</p>
+        </div>
+
+        <div class="player-shell" data-player-shell>
+          <div class="player-topline">
+            <span>PRODUCT INTRODUCTION</span>
+            <span>01:15 · 1080P</span>
+          </div>
+          <video
+            id="product-video"
+            class="product-video"
+            controls
+            playsinline
+            preload="metadata"
+            poster="assets/brand-intro-v02.png"
+            aria-describedby="video-status"
+          >
+            <p>你的浏览器不支持 HTML5 视频播放。请使用下方下载链接。</p>
+          </video>
+          <div class="video-status" id="video-status" role="status" aria-live="polite">
+            正在准备视频播放…
+          </div>
+        </div>
+
+        <div class="hero-actions">
+          <a class="button button-primary" id="download-link" href="https://github.com/breakstring/agent-deck/releases/download/v0.1.0/agent-deck-intro.mp4">
+            下载 1080p MP4 <span aria-hidden="true">↓</span>
+          </a>
+          <a class="button button-secondary" href="https://github.com/breakstring/agent-deck">
+            查看项目源码 <span aria-hidden="true">↗</span>
+          </a>
+        </div>
+      </section>
+
+      <section class="capabilities" aria-label="Agent Deck capabilities">
+        <article class="capability-card">
+          <span class="card-index">01</span>
+          <h2>Agent 状态</h2>
+          <p>将运行、等待输入与工具调用等本机状态投影到可见、可触的硬件界面。</p>
+          <p class="card-en">Live agent signals, made visible on a physical surface.</p>
+        </article>
+        <article class="capability-card">
+          <span class="card-index">02</span>
+          <h2>用量一览</h2>
+          <p>在底部逻辑面板查看 Codex quota、Token 和金额趋势，不必来回切换窗口。</p>
+          <p class="card-en">Quota, tokens, and cost trends at a glance.</p>
+        </article>
+        <article class="capability-card">
+          <span class="card-index">03</span>
+          <h2>本地可控</h2>
+          <p>用 Web 配置页定义按键、旋钮与光效；高风险动作依旧需要显式开启。</p>
+          <p class="card-en">Configurable locally, with safe defaults intact.</p>
+        </article>
+      </section>
+
+      <section class="config-section" aria-labelledby="config-title">
+        <div class="config-copy">
+          <p class="eyebrow"><span class="signal" aria-hidden="true"></span> CONFIGURE LOCALLY</p>
+          <h2 id="config-title">为你的工作流而设。</h2>
+          <p>本地 Web 配置页让 N4 Pro 的按键、底部面板和旋钮控制集中在一个可预览的空间中。修改先出现在 GUI 预览，确认“保存并应用”后才会下发至设备。</p>
+          <a class="inline-link" href="https://github.com/breakstring/agent-deck">打开 Agent Deck 仓库 <span aria-hidden="true">→</span></a>
+        </div>
+        <figure class="config-figure">
+          <img src="assets/config.png" alt="Agent Deck 的本地 Web 配置界面与 N4 Pro 预览" />
+        </figure>
+      </section>
+    </main>
+
+    <footer>
+      <span>AGENT DECK · LOCAL COMMAND CORE</span>
+      <span>OPEN SOURCE · MIT</span>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>
