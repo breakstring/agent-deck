@@ -4,17 +4,17 @@
 
 > Bring local AI-agent status, subscription quota, and controlled actions to the physical surface of a MiraBox N4 Pro.
 
-Agent Deck is a local hardware-console bridge for AI agents. It maps agent state, usage, and explicitly configured actions to MiraBox hardware while providing a browser-based local configuration UI. The current version is **`0.1.0`** and completes the first usable path for **macOS + MiraBox N4 Pro + Codex**. The project remains in the `0.x` stage; other operating systems, hardware models, and agent platforms do not yet carry compatibility guarantees.
+Agent Deck is a local hardware-console bridge for AI agents. It maps agent state, usage, and explicitly configured actions to MiraBox hardware, with a browser-based local configuration UI. Version **`0.1.0`** supports **macOS + MiraBox N4 Pro + Codex**; other operating systems, hardware models, and agent platforms do not yet carry compatibility guarantees.
 
 ## Product Video
 
 [![Play the Agent Deck product introduction](assets/agent-deck/brand-intro-v02.png)](https://breakstring.github.io/agent-deck/)
 
-Select the image to open the browser-based product-video page. The page is deployed separately through GitHub Pages; the final 1080p MP4 will be attached to the first [`v0.1.0` Release](https://github.com/breakstring/agent-deck/releases/tag/v0.1.0).
+Select the image to watch the Agent Deck product introduction in your browser.
 
 ## Why Agent Deck
 
-When several AI agents are running at once, their states, pending input, and usage information are scattered across terminals, desktop apps, and windows. Agent Deck reduces those local signals into a unified state, then projects it onto a hardware surface with keys, a touch display, and knobs. You can see state at a glance, switch panels or focus context when needed, and keep high-risk actions disabled by default.
+When several AI agents are running at once, their states, pending input, and usage information are scattered across terminals, desktop apps, and windows. Agent Deck reduces those local signals into a unified state, then projects it onto a hardware surface with keys, a touch display, and knobs. You can see state at a glance, switch panels or focus context, and keep high-risk actions disabled by default.
 
 The core boundary remains:
 
@@ -23,13 +23,13 @@ Agent ingress -> NormalizedEvent -> AgentStateStore -> DeckMode/LayoutPlan
              -> HardwareSurface -> InteractionIntent/ActionExecutor
 ```
 
-Codex and the N4 Pro are the currently verified combination, not irreplaceable implementation assumptions.
+Codex and the N4 Pro are the currently verified combination; the core architecture leaves room for other agents and hardware.
 
 ## Web Configuration
 
 ![Agent Deck local web configuration: N4 Pro preview, key purpose, and save-and-apply control](assets/agent-deck/config.png)
 
-The local configuration page uses the N4 Pro preview as its workspace. Select a key or knob to edit it; changes appear in the GUI preview first and reach a connected physical device only after you choose **Save and Apply**. The current configuration surface includes:
+The local configuration page uses the N4 Pro preview as its workspace. Select a key or knob to edit it; changes appear in the GUI preview first and reach a connected device only after you choose **Save and Apply**. You can configure:
 
 - Ten LCD main keys for local apps, URLs, subscription/quota, token/cost usage, and agent-status entry points.
 - A bottom logical panel for the brand card, Codex quota, and usage trends. Usage trends come from local caches so a panel switch does not block hardware interaction.
@@ -42,7 +42,7 @@ Without a connected device, the configuration page and core service still run wi
 
 | Area | Status |
 | --- | --- |
-| Project version | `0.1.0`; the first formal GitHub Release will use the `v0.1.0` tag. |
+| Project version | `0.1.0` |
 | Operating system | macOS is the verified target. Windows and Linux are not formally supported yet. |
 | Physical hardware | MiraBox N4 Pro. The architecture leaves room for other StreamDock/MiraBox models, but they are not released as supported targets. |
 | Agent | Local Codex App/CLI state, quota, and hook integration. |

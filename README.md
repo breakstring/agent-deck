@@ -4,17 +4,17 @@
 
 > 把本机 AI Agent 的运行状态、订阅额度与可控操作，带到妙联宝 N4 Pro 的硬件表面。
 
-Agent Deck 是一个运行在本机的 AI Agent 硬件控制台桥接项目。它将 Agent 的状态、用量和经过明确配置的操作映射到妙联宝设备，同时提供浏览器中的本地配置界面。当前版本为 **`0.1.0`**，已聚焦完成 **macOS + MiraBox N4 Pro + Codex** 的首个可用闭环；项目仍处于 `0.x` 阶段，其他操作系统、硬件型号与 Agent 平台暂不作兼容性承诺。
+Agent Deck 是一个运行在本机的 AI Agent 硬件控制台桥接项目。它将 Agent 的状态、用量和经过明确配置的操作映射到妙联宝设备，并提供浏览器中的本地配置界面。当前版本 **`0.1.0`** 支持 **macOS + MiraBox N4 Pro + Codex**；其他操作系统、硬件型号与 Agent 平台暂不作兼容性承诺。
 
 ## 产品演示
 
 [![播放 Agent Deck 产品介绍视频](assets/agent-deck/brand-intro-v02.png)](https://breakstring.github.io/agent-deck/)
 
-点击上图可在浏览器中打开 Agent Deck 的产品介绍播放页。该页面与项目源码分离部署在 GitHub Pages；正式视频会随首个 [`v0.1.0` Release](https://github.com/breakstring/agent-deck/releases/tag/v0.1.0) 作为 1080p MP4 素材提供。
+点击上图，在浏览器中观看 Agent Deck 的产品介绍视频。
 
 ## 它解决什么问题
 
-当多个 AI Agent 同时运行时，状态、等待输入和用量信息容易散落在终端、桌面 App 和不同窗口中。Agent Deck 将这些本机信号归约为统一状态，并投影到有按键、触屏和旋钮的硬件表面：你可以一眼查看状态，按需切换面板或聚焦上下文，同时保持高风险动作默认关闭。
+当多个 AI Agent 同时运行时，状态、等待输入和用量信息容易散落在终端、桌面 App 和不同窗口中。Agent Deck 将这些本机信号归约为统一状态，并投影到有按键、触屏和旋钮的硬件表面：你可以一眼查看状态，切换面板或聚焦上下文，同时保持高风险动作默认关闭。
 
 项目的核心边界始终保持为：
 
@@ -23,26 +23,26 @@ Agent ingress -> NormalizedEvent -> AgentStateStore -> DeckMode/LayoutPlan
              -> HardwareSurface -> InteractionIntent/ActionExecutor
 ```
 
-这让 Codex 与 N4 Pro 是当前已验证的组合，而不是不可替换的实现前提。
+当前已验证的组合是 Codex 与 N4 Pro；核心架构仍为其他 Agent 与硬件保留扩展空间。
 
 ## Web 配置界面
 
 ![Agent Deck 本地 Web 配置界面：N4 Pro 预览、按键用途与保存应用操作](assets/agent-deck/config.png)
 
-本地配置页以 N4 Pro 预览为操作入口：选择一个按键或旋钮后，修改会先即时反映在 GUI 预览中，只有点击“保存并应用”才会下发到已连接的真实设备。当前可以配置的内容包括：
+本地配置页以 N4 Pro 预览为操作入口。选择按键或旋钮后，修改会先反映在 GUI 预览中；只有点击“保存并应用”才会下发到已连接的设备。可以配置：
 
 - 10 个 LCD 主按键的本地 App、网址、订阅/额度、Token/金额用量与 Agent 状态入口。
 - 底部逻辑面板的品牌图、Codex quota 和用量趋势；其中用量趋势来自本地缓存，切换时不阻塞硬件交互。
 - 4 个旋钮的轮转动作，例如切换面板或周期、调整系统输入/输出音量、显示器亮度与控制台屏幕亮度。
 - 旋钮灯圈组的颜色与可选呼吸效果，并在保存前预览。
 
-未连接真实设备时，配置页和核心服务仍可通过 fake hardware 运行，适合先体验、开发和排障。
+未连接真实设备时，配置页和核心服务仍可通过 fake hardware 运行，便于体验、开发和排障。
 
 ## 当前支持范围
 
 | 维度 | 当前状态 |
 | --- | --- |
-| 项目版本 | `0.1.0`；首个正式 GitHub Release 将使用 tag `v0.1.0`。 |
+| 项目版本 | `0.1.0` |
 | 操作系统 | macOS 为已验证目标。Windows 和 Linux 暂未正式支持。 |
 | 真实硬件 | MiraBox N4 Pro。架构为其他 StreamDock/MiraBox 型号留有扩展空间，但尚未作为可用目标发布。 |
 | Agent | Codex 本地 App/CLI 的状态、quota 与 hook 集成。 |
