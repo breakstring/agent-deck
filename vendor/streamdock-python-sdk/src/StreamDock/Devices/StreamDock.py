@@ -1,3 +1,9 @@
+"""StreamDock 设备基类与后台读/心跳线程生命周期。
+
+本模块封装 open/init/close、输入回调和通用显示输出；具体型号负责图像格式与按键映射。
+Agent Deck 依赖通用输出方法透传 transport 返回码，以便硬件断线后让上层关闭失效会话。
+"""
+
 import platform
 import threading
 import time
@@ -278,7 +284,15 @@ class StreamDock(ABC):
 
     # Disconnect and clear all displays
     def disconnected(self):
-        self.transport.disconnected()
+        """通知设备结束当前控制会话并显示设备侧断开画面。
+
+        入参：无。
+        返回：底层 TransportResult；成功通常为 0，旧 SDK 可能返回 None。
+        错误处理：transport 异常原样传播。
+        副作用：向真实设备发送断开命令，可能清除 Agent Deck 图层并显示品牌图。
+        """
+
+        return self.transport.disconnected()
 
     # Clear a specific key icon
     def clearIcon(self, index):
@@ -292,15 +306,15 @@ class StreamDock(ABC):
 
     # Clear all key icons
     def clearAllIcon(self):
-        self.transport.keyAllClear()
+        return self.transport.keyAllClear()
 
     # Wake the screen
     def wakeScreen(self):
-        self.transport.wakeScreen()
+        return self.transport.wakeScreen()
 
     # Refresh the device display
     def refresh(self):
-        self.transport.refresh()
+        return self.transport.refresh()
 
     def image_keys(self):
         """Return logical key numbers that support key images."""

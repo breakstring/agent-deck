@@ -746,6 +746,71 @@ def test_n4pro_session_output_restores_applied_brightness_and_writes_one_group_c
     ]
 
 
+def test_n4pro_session_output_reports_unsigned_native_failures() -> None:
+    """附加亮度和灯光写入应识别 ctypes 暴露的无符号 native 失败码。
+
+    入参：无；测试 fake device 的三个输出方法均返回 `0xFFFFFFFF`。
+    返回：无返回值；断言通过表示 status 能显示连接失效而非缓存错误 applied 值。
+    错误处理：任一失败被误判为成功时由 pytest 报告。
+    副作用：只修改测试 runtime 内存，不访问真实 N4 Pro。
+    """
+
+    class FailingDevice:
+        """对所有 session output 返回无符号 native 失败码的 fake。
+
+        入参：无。
+        返回：提供 runtime 需要的三个 SDK-like 方法。
+        错误处理：无。
+        副作用：无。
+        """
+
+        def set_brightness(self, _percent: int) -> int:
+            """返回整体亮度写失败码。
+
+            入参：`_percent` 是被忽略的目标亮度。
+            返回：固定 `0xFFFFFFFF`。
+            错误处理：不抛异常。
+            副作用：无。
+            """
+
+            return 0xFFFFFFFF
+
+        def set_led_color(self, _red: int, _green: int, _blue: int) -> int:
+            """返回灯圈颜色写失败码。
+
+            入参：三个下划线参数是被忽略的 RGB 值。
+            返回：固定 `0xFFFFFFFF`。
+            错误处理：不抛异常。
+            副作用：无。
+            """
+
+            return 0xFFFFFFFF
+
+        def set_led_brightness(self, _percent: int) -> int:
+            """返回灯圈亮度写失败码。
+
+            入参：`_percent` 是被忽略的目标亮度。
+            返回：固定 `0xFFFFFFFF`。
+            错误处理：不抛异常。
+            副作用：无。
+            """
+
+            return 0xFFFFFFFF
+
+    runtime = create_app().state.runtime
+
+    error = runtime.apply_n4pro_session_outputs(FailingDevice(), initialized=True)
+
+    assert error == (
+        "set_brightness failed: SDK returned 4294967295; "
+        "set_led_color failed: SDK returned 4294967295; "
+        "set_led_brightness failed: SDK returned 4294967295"
+    )
+    assert runtime.n4pro_last_applied_brightness_percent is None
+    assert runtime.n4pro_last_applied_lighting is None
+    assert runtime.n4pro_last_applied_led_brightness_percent is None
+
+
 def test_codex_quota_poller_updates_status_and_touchscreen_frame() -> None:
     """Verify daemon quota poller refreshes snapshot and virtual touch panel.
 

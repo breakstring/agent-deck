@@ -32,10 +32,13 @@ class FakeN4ProUnifiedDevice:
         path: str = "n4pro-path",
         background_result: object = None,
         key_result: object = 0,
+        refresh_result: object = None,
+        writable: bool = True,
     ) -> None:
         """初始化 fake 设备。
 
-        入参：`path` 是测试设备路径；`background_result` 和 `key_result` 是模拟 SDK 返回值。
+        入参：`path` 是测试设备路径；`background_result`、`key_result` 和 `refresh_result`
+        是模拟 SDK 返回值；`writable` 表示当前句柄是否仍可写。
         返回：无返回值。
         错误处理：无。
         副作用：初始化内存调用记录。
@@ -44,6 +47,8 @@ class FakeN4ProUnifiedDevice:
         self.path = path
         self.background_result = background_result
         self.key_result = key_result
+        self.refresh_result = refresh_result
+        self.writable = writable
         self.calls: list[tuple[str, object | None]] = []
         self.paths_seen: list[Path] = []
         self.key_callback: object | None = None
@@ -102,16 +107,28 @@ class FakeN4ProUnifiedDevice:
         assert path_obj.is_file()
         return self.key_result
 
-    def refresh(self) -> None:
-        """记录 refresh 调用。
+    def refresh(self) -> object:
+        """记录 refresh 调用并返回可配置的 SDK 结果。
 
         入参：无。
-        返回：无返回值。
+        返回：构造时传入的 `refresh_result`。
         错误处理：无。
         副作用：追加调用记录。
         """
 
         self.calls.append(("refresh", None))
+        return self.refresh_result
+
+    def can_write(self) -> bool:
+        """返回 fake HID 句柄当前是否可写。
+
+        入参：无。
+        返回：构造或测试过程设置的 `writable`。
+        错误处理：无。
+        副作用：无；不追加调用记录，避免改变现有顺序断言。
+        """
+
+        return self.writable
 
     def close(self, notify: bool = True) -> None:
         """记录 close 调用。
@@ -204,6 +221,50 @@ class FakeOtherUnifiedDevice(FakeN4ProUnifiedDevice):
     错误处理：无。
     副作用：仅记录调用。
     """
+
+
+class FakeHandshakeN4ProUnifiedDevice(FakeN4ProUnifiedDevice):
+    """提供可配置握手结果的 N4 Pro fake。
+
+    入参：继承 unified fake 参数，并接受 `handshake_result` 或 `handshake_error`。
+    返回：可验证握手、open、init 调用顺序的 fake device。
+    错误处理：配置异常时 `send_handshake()` 原样抛出。
+    副作用：只追加内存调用记录，不访问真实 HID。
+    """
+
+    def __init__(
+        self,
+        *,
+        handshake_result: object = 0,
+        handshake_error: Exception | None = None,
+        **kwargs: object,
+    ) -> None:
+        """初始化带握手能力的 fake。
+
+        入参：`handshake_result` 是模拟 native 返回值；`handshake_error` 是可选异常；
+        `kwargs` 传给基础 fake。
+        返回：无返回值。
+        错误处理：构造阶段不抛配置异常。
+        副作用：初始化内存调用记录。
+        """
+
+        super().__init__(**kwargs)
+        self.handshake_result = handshake_result
+        self.handshake_error = handshake_error
+
+    def send_handshake(self) -> object:
+        """记录握手并返回配置结果或抛出配置异常。
+
+        入参：无。
+        返回：构造时配置的 `handshake_result`。
+        错误处理：配置了 `handshake_error` 时原样抛出。
+        副作用：追加握手调用记录。
+        """
+
+        self.calls.append(("send_handshake", None))
+        if self.handshake_error is not None:
+            raise self.handshake_error
+        return self.handshake_result
 
 
 class FakeUnifiedManager:
@@ -315,12 +376,112 @@ def test_persistent_animator_runs_session_output_once_per_render_without_reopeni
         duration_seconds=0.01,
         fps=1,
     )
-
     assert first.ok is True
     assert second.ok is True
     assert callbacks == [True, False]
     assert [name for name, _ in device.calls].count("open") == 1
     assert [name for name, _ in device.calls].count("init") == 1
+
+
+def test_persistent_animator_handshakes_before_first_open_and_each_reconnect(
+    tmp_path: Path,
+) -> None:
+    """首次接管和 USB path 变化后的重连都必须在 open/init 前发送握手。
+
+    入参：`tmp_path` 提供临时背景目录；manager 第二轮切换到新 path 的握手 fake。
+    返回：无返回值；断言通过表示品牌图恢复协议覆盖首次连接和重连，但稳定会话不重复握手。
+    错误处理：握手缺失、顺序错误或稳定会话重复打开时由 pytest 报告。
+    副作用：只写 pytest 临时图片并操作 fake device，不访问真实 N4 Pro。
+    """
+
+    original = FakeHandshakeN4ProUnifiedDevice(path="n4pro-path-a")
+    replacement = FakeHandshakeN4ProUnifiedDevice(path="n4pro-path-b")
+    manager = FakeUnifiedManager([original])
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=manager,
+        temp_dir=tmp_path,
+        sleep=lambda _seconds: None,
+    )
+    background = Image.new("RGB", (800, 480), (1, 2, 3))
+
+    first = animator(
+        background_image=background,
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+    steady = animator(
+        background_image=background,
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+    manager.devices = [replacement]
+    reconnected = animator(
+        background_image=background,
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+
+    assert first.ok is True
+    assert steady.ok is True
+    assert reconnected.ok is True
+    assert [name for name, _ in original.calls[:3]] == [
+        "send_handshake",
+        "open",
+        "init",
+    ]
+    assert [name for name, _ in original.calls].count("send_handshake") == 1
+    assert [name for name, _ in replacement.calls[:3]] == [
+        "send_handshake",
+        "open",
+        "init",
+    ]
+    assert reconnected.timing_seconds["device_reconnected"] == 1.0
+    assert "handshake" in first.timing_seconds
+    assert "handshake" in reconnected.timing_seconds
+    assert first.timing_seconds["device_handshaken"] == 1.0
+    assert first.timing_seconds["device_handshake_count"] == 1.0
+    assert steady.timing_seconds["device_handshaken"] == 0.0
+    assert steady.timing_seconds["device_handshake_count"] == 1.0
+    assert reconnected.timing_seconds["device_handshaken"] == 1.0
+    assert reconnected.timing_seconds["device_handshake_count"] == 2.0
+
+
+def test_persistent_animator_reports_handshake_permission_error_without_opening(
+    tmp_path: Path,
+) -> None:
+    """raw HID 握手无权限时必须停止接管并保留底层错误文本。
+
+    入参：`tmp_path` 提供临时目录；fake 握手抛出 macOS `not permitted` 错误。
+    返回：无返回值；断言通过表示 SDK 的 open 假成功路径不会再被执行。
+    错误处理：renderer 误报成功、吞掉权限错误或继续 open 时由 pytest 报告。
+    副作用：只操作 fake device，不访问真实 N4 Pro。
+    """
+
+    device = FakeHandshakeN4ProUnifiedDevice(
+        handshake_error=OSError("cannot open HID path: not permitted")
+    )
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=FakeUnifiedManager([device]),
+        temp_dir=tmp_path,
+        sleep=lambda _seconds: None,
+    )
+
+    result = animator(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+
+    assert result.ok is False
+    assert result.path == "n4pro-path"
+    assert result.error is not None
+    assert "handshake failed: OSError" in result.error
+    assert "not permitted" in result.error
+    assert device.calls == [("send_handshake", None)]
 
 
 def test_persistent_animator_reopens_when_n4pro_reenumerates(
@@ -357,14 +518,192 @@ def test_persistent_animator_reopens_when_n4pro_reenumerates(
         duration_seconds=0.01,
         fps=1,
     )
+    steady = animator(
+        background_image=background,
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
 
     assert first.ok is True
     assert second.ok is True
     assert second.path == "n4pro-path-b"
     assert second.timing_seconds["device_reconnected"] == 1.0
+    assert second.timing_seconds["device_reconnect_count"] == 1.0
+    assert steady.timing_seconds["device_reconnected"] == 0.0
+    assert steady.timing_seconds["device_reconnect_count"] == 1.0
     assert ("close", False) in original.calls
     assert [name for name, _ in replacement.calls].count("open") == 1
     assert [name for name, _ in replacement.calls].count("init") == 1
+
+
+def test_persistent_animator_reopens_unwritable_n4pro_at_same_path(
+    tmp_path: Path,
+) -> None:
+    """同一 HID path 的旧句柄失效后应改用本轮重新枚举的新设备对象。
+
+    入参：`tmp_path` 提供临时背景目录；fake manager 在第二轮返回 path 相同的新设备对象，
+    同时把第一轮持有句柄标为不可写。
+    返回：无返回值；断言通过表示设备原地重启后不会继续复用 stale handle。
+    错误处理：旧句柄未关闭、新对象未 open/init 或缺少重连诊断时由 pytest 报告。
+    副作用：仅写 pytest 临时图片并操作 fake device，不访问真实 N4 Pro。
+    """
+
+    original = FakeN4ProUnifiedDevice(path="stable-n4pro-path")
+    replacement = FakeN4ProUnifiedDevice(path="stable-n4pro-path")
+    manager = FakeUnifiedManager([original])
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=manager,
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+    background = Image.new("RGB", (800, 480), (1, 2, 3))
+
+    first = animator(
+        background_image=background,
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+    original.writable = False
+    manager.devices = [replacement]
+    second = animator(
+        background_image=background,
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+    steady = animator(
+        background_image=background,
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+
+    assert first.ok is True
+    assert second.ok is True
+    assert second.path == "stable-n4pro-path"
+    assert second.timing_seconds["device_reconnected"] == 1.0
+    assert second.timing_seconds["device_reconnect_count"] == 1.0
+    assert steady.timing_seconds["device_reconnected"] == 0.0
+    assert steady.timing_seconds["device_reconnect_count"] == 1.0
+    assert ("close", False) in original.calls
+    assert [name for name, _ in replacement.calls].count("open") == 1
+    assert [name for name, _ in replacement.calls].count("init") == 1
+
+
+def test_persistent_animator_recovers_after_device_disappears_and_returns(
+    tmp_path: Path,
+) -> None:
+    """设备完整消失后以同一 path 返回时，下一轮应重新 open/init 并恢复渲染。
+
+    入参：`tmp_path` 提供临时背景目录；fake manager 依次模拟在线、无设备、同 path 新设备。
+    返回：无返回值；断言通过表示真实拔插窗口不会终止 animator 后续探测。
+    错误处理：离线轮未关闭旧句柄或恢复轮未打开新设备时由 pytest 报告。
+    副作用：仅写 pytest 临时图片并操作 fake device，不访问真实 N4 Pro。
+    """
+
+    original = FakeN4ProUnifiedDevice(path="stable-n4pro-path")
+    replacement = FakeN4ProUnifiedDevice(path="stable-n4pro-path")
+    manager = FakeUnifiedManager([original])
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=manager,
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+    background = Image.new("RGB", (800, 480), (1, 2, 3))
+
+    online = animator(
+        background_image=background,
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+    manager.devices = []
+    offline = animator(
+        background_image=background,
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+    manager.devices = [replacement]
+    recovered = animator(
+        background_image=background,
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+
+    assert online.ok is True
+    assert offline.ok is False
+    assert offline.error == "N4 Pro disappeared while persistent renderer was active"
+    assert recovered.ok is True
+    assert recovered.timing_seconds["device_reconnected"] == 1.0
+    assert recovered.timing_seconds["device_reconnect_count"] == 1.0
+    assert ("close", False) in original.calls
+    assert [name for name, _ in replacement.calls].count("open") == 1
+    assert [name for name, _ in replacement.calls].count("init") == 1
+
+
+def test_persistent_animator_closes_session_on_unsigned_sdk_write_failure(
+    tmp_path: Path,
+) -> None:
+    """ctypes 无符号返回的 native -1 必须被识别为硬件写失败。
+
+    入参：`tmp_path` 提供临时图片目录；fake key writer 返回 `0xFFFFFFFF`。
+    返回：无返回值；断言通过表示失败不会被记录成 ok，也不会保留失效设备会话。
+    错误处理：漏判无符号失败值或未关闭句柄时由 pytest 报告。
+    副作用：仅写 pytest 临时图片并操作 fake device，不访问真实 N4 Pro。
+    """
+
+    device = FakeN4ProUnifiedDevice(key_result=0xFFFFFFFF)
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=FakeUnifiedManager([device]),
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+
+    result = animator(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={},
+        key_images={1: Image.new("RGB", (112, 112), (4, 5, 6))},
+        duration_seconds=0.01,
+        fps=1,
+    )
+
+    assert result.ok is False
+    assert result.error == "set_key_image failed for key 1: SDK returned 4294967295"
+    assert device.calls[-1] == ("close", False)
+
+
+def test_persistent_animator_closes_session_when_refresh_fails(
+    tmp_path: Path,
+) -> None:
+    """最终 refresh 失败时必须关闭当前设备会话并进入下一轮重连。
+
+    入参：`tmp_path` 提供临时背景目录；fake refresh 返回 `0xFFFFFFFF`。
+    返回：无返回值；断言通过表示 refresh 错误不会被误报为成功。
+    错误处理：漏判 refresh 失败或保留旧句柄时由 pytest 报告。
+    副作用：仅写 pytest 临时图片并操作 fake device，不访问真实 N4 Pro。
+    """
+
+    device = FakeN4ProUnifiedDevice(refresh_result=0xFFFFFFFF)
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=FakeUnifiedManager([device]),
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+
+    result = animator(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+
+    assert result.ok is False
+    assert result.error == "refresh failed: SDK returned 4294967295"
+    assert device.calls[-1] == ("close", False)
 
 
 def test_persistent_animator_refreshes_session_output_for_each_animation_frame(

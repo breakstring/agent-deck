@@ -377,6 +377,23 @@ except AttributeError:
     _HID_API_AVAILABLE = False
     print("Warning: hidapi functions not available in transport library")
 
+try:
+    _transport_lib.hid_open_path.restype = c_void_p
+    _transport_lib.hid_open_path.argtypes = [c_char_p]
+
+    _transport_lib.hid_write.restype = c_int
+    _transport_lib.hid_write.argtypes = [c_void_p, POINTER(c_ubyte), c_size_t]
+
+    _transport_lib.hid_error.restype = c_wchar_p
+    _transport_lib.hid_error.argtypes = [c_void_p]
+
+    _transport_lib.hid_close.restype = None
+    _transport_lib.hid_close.argtypes = [c_void_p]
+
+    _RAW_HID_WRITE_AVAILABLE = True
+except AttributeError:
+    _RAW_HID_WRITE_AVAILABLE = False
+
 
 class LibUSBHIDAPI:
     """
@@ -538,11 +555,11 @@ class LibUSBHIDAPI:
 
     # ========== Screen Control ==========
 
-    def wakeup_screen(self) -> None:
-        """Wake up the device screen."""
+    def wakeup_screen(self) -> int | None:
+        """Wake up the device screen and return the native TransportResult."""
         if not self._handle:
             return
-        _transport_lib.transport_wakeup_screen(self._handle)
+        return _transport_lib.transport_wakeup_screen(self._handle)
 
     def magnetic_calibration(self) -> None:
         """Perform magnetic calibration."""
@@ -550,11 +567,11 @@ class LibUSBHIDAPI:
             return
         _transport_lib.transport_magnetic_calibration(self._handle)
 
-    def refresh_screen(self) -> None:
-        """Refresh the screen display."""
+    def refresh_screen(self) -> int | None:
+        """Refresh the screen display and return the native TransportResult."""
         if not self._handle:
             return
-        _transport_lib.transport_refresh(self._handle)
+        return _transport_lib.transport_refresh(self._handle)
 
     def sleep(self) -> None:
         """Put the device into sleep mode."""
@@ -564,7 +581,7 @@ class LibUSBHIDAPI:
 
     # ========== Key Control ==========
 
-    def set_key_brightness(self, brightness: int) -> None:
+    def set_key_brightness(self, brightness: int) -> int | None:
         """
         Set the brightness of keys.
 
@@ -573,13 +590,13 @@ class LibUSBHIDAPI:
         """
         if not self._handle:
             return
-        _transport_lib.transport_set_key_brightness(self._handle, brightness)
+        return _transport_lib.transport_set_key_brightness(self._handle, brightness)
 
-    def clear_all_keys(self) -> None:
-        """Clear all keys on the device."""
+    def clear_all_keys(self) -> int | None:
+        """Clear all keys and return the native TransportResult."""
         if not self._handle:
             return
-        _transport_lib.transport_clear_all_keys(self._handle)
+        return _transport_lib.transport_clear_all_keys(self._handle)
 
     def clear_key(self, key_index: int) -> None:
         """
@@ -625,7 +642,7 @@ class LibUSBHIDAPI:
 
     def set_background_image_stream(
         self, jpeg_data: bytes, timeout_ms: int = 3000
-    ) -> None:
+    ) -> int | None:
         """
         Set a JPEG image as full-screen background.
 
@@ -635,7 +652,7 @@ class LibUSBHIDAPI:
         """
         if not self._handle:
             return
-        _transport_lib.transport_set_background_image_stream(
+        return _transport_lib.transport_set_background_image_stream(
             self._handle, jpeg_data, len(jpeg_data), timeout_ms
         )
 
@@ -647,7 +664,7 @@ class LibUSBHIDAPI:
         x: int = 0,
         y: int = 0,
         fb_layer: int = 0x00,
-    ) -> None:
+    ) -> int | None:
         """
         Draw a JPEG frame at a specific position (used for animated backgrounds).
 
@@ -661,7 +678,7 @@ class LibUSBHIDAPI:
         """
         if not self._handle:
             return
-        _transport_lib.transport_set_background_frame_stream(
+        return _transport_lib.transport_set_background_frame_stream(
             self._handle, jpeg_data, len(jpeg_data), width, height, x, y, fb_layer
         )
 
@@ -678,7 +695,7 @@ class LibUSBHIDAPI:
 
     # ========== LED Control ==========
 
-    def set_led_brightness(self, brightness: int) -> None:
+    def set_led_brightness(self, brightness: int) -> int | None:
         """
         Set LED brightness.
 
@@ -687,9 +704,9 @@ class LibUSBHIDAPI:
         """
         if not self._handle:
             return
-        _transport_lib.transport_set_led_brightness(self._handle, brightness)
+        return _transport_lib.transport_set_led_brightness(self._handle, brightness)
 
-    def set_led_color(self, count: int, r: int, g: int, b: int) -> None:
+    def set_led_color(self, count: int, r: int, g: int, b: int) -> int | None:
         """
         Set color for the first N LEDs.
 
@@ -702,6 +719,7 @@ class LibUSBHIDAPI:
         if not self._handle:
             return
         res = _transport_lib.transport_set_led_color(self._handle, count, r, g, b)
+        return res
 
     def reset_led_color(self) -> None | int:
         """Reset LED colors to default."""
@@ -844,17 +862,17 @@ class LibUSBHIDAPI:
             timeout_ms,
         )
 
-    def notify_disconnected(self) -> None:
-        """Notify the device of disconnection."""
+    def notify_disconnected(self) -> int | None:
+        """Notify the device of disconnection and return the native result."""
         if not self._handle:
             return
-        _transport_lib.transport_disconnected(self._handle)
+        return _transport_lib.transport_disconnected(self._handle)
 
-    def heartbeat(self) -> None:
-        """Send a heartbeat packet to the device."""
+    def heartbeat(self) -> int | None:
+        """Send a heartbeat packet and return the native TransportResult."""
         if not self._handle:
             return
-        _transport_lib.transport_heartbeat(self._handle)
+        return _transport_lib.transport_heartbeat(self._handle)
 
     # ========== Report Configuration ==========
 
@@ -964,6 +982,58 @@ class LibUSBHIDAPI:
                 "line_number": error_info.line_number,
             }
         return {}
+
+    @staticmethod
+    def send_handshake(
+        device_path: bytes | str,
+        *,
+        report_id: int = 0,
+        output_report_size: int = 1025,
+    ) -> int:
+        """在常规 transport 会话建立前发送 StreamDock 设备握手包。
+
+        入参：`device_path` 是枚举得到的 HID path；`report_id` 是输出 report 首字节；
+        `output_report_size` 是设备要求的完整输出报告长度，N4 Pro 为 1025。
+        返回：完整写入后返回 0，与其他 TransportResult 成功语义一致。
+        错误处理：底层未导出 raw HID API、路径无效、权限不足、打开失败或短写时抛出异常；
+        异常文本保留 hidapi 的原始错误，便于 daemon 识别 macOS 权限问题。
+        副作用：短暂独占打开 HID path，写入 `report_id + HAN + zero padding` 后立即关闭；
+        不创建常驻 transport，也不发送断开通知。
+        """
+
+        if not _RAW_HID_WRITE_AVAILABLE:
+            raise RuntimeError(
+                "StreamDock transport library does not expose raw HID writes"
+            )
+        if isinstance(device_path, str):
+            encoded_path = device_path.encode("utf-8")
+        else:
+            encoded_path = bytes(device_path)
+        if not encoded_path:
+            raise ValueError("device_path must not be empty")
+        if not 0 <= report_id <= 0xFF:
+            raise ValueError("report_id must be between 0 and 255")
+        if output_report_size < 4:
+            raise ValueError("output_report_size must be at least 4 bytes")
+
+        handle = _transport_lib.hid_open_path(encoded_path)
+        if not handle:
+            error = _transport_lib.hid_error(None) or "unknown HID error"
+            raise OSError(f"cannot open HID path for handshake: {error}")
+        try:
+            packet = (c_ubyte * output_report_size)()
+            packet[0] = report_id
+            packet[1:4] = b"HAN"
+            written = _transport_lib.hid_write(handle, packet, output_report_size)
+            if written != output_report_size:
+                error = _transport_lib.hid_error(handle) or "unknown HID error"
+                raise OSError(
+                    "handshake HID write was incomplete: "
+                    f"wrote {written} of {output_report_size} bytes: {error}"
+                )
+        finally:
+            _transport_lib.hid_close(handle)
+        return 0
 
     # ========== Static Methods ==========
 
@@ -1085,17 +1155,17 @@ class LibUSBHIDAPI:
         """Legacy alias for clear_task_queue()."""
         self.clear_task_queue()
 
-    def wakeScreen(self) -> None:
+    def wakeScreen(self) -> int | None:
         """Legacy alias for wakeup_screen()."""
-        self.wakeup_screen()
+        return self.wakeup_screen()
 
     def keyClear(self, index: int) -> None:
         """Legacy alias for clear_key()."""
         self.clear_key(index)
 
-    def keyAllClear(self) -> None:
+    def keyAllClear(self) -> int | None:
         """Legacy alias for clear_all_keys()."""
-        self.clear_all_keys()
+        return self.clear_all_keys()
 
     def changePage(self, page: int) -> None:
         """Legacy alias for change_page()."""
@@ -1276,7 +1346,7 @@ class LibUSBHIDAPI:
         """
         self.set_background_bitmap(buffer[:size])
 
-    def setBackgroundImgDualDevice(self, path) -> None:
+    def setBackgroundImgDualDevice(self, path) -> int | None:
         """
         Legacy method: Set background image from file path (for dual device).
 
@@ -1299,11 +1369,11 @@ class LibUSBHIDAPI:
 
             with open(path, "rb") as f:
                 jpeg_data = f.read()
-            self.set_background_image_stream(jpeg_data)
+            return self.set_background_image_stream(jpeg_data)
         except Exception as e:
             raise RuntimeError(f"Failed to load image from {path}: {e}")
 
-    def setBackgroundImgFrame(self, path, img_width, img_height) -> None:
+    def setBackgroundImgFrame(self, path, img_width, img_height) -> int | None:
         """
         Legacy method: Set Temporary background image from file path (for dual device).
 
@@ -1328,7 +1398,7 @@ class LibUSBHIDAPI:
 
             with open(path, "rb") as f:
                 jpeg_data = f.read()
-            self.set_background_frame_stream(jpeg_data, img_width, img_height)
+            return self.set_background_frame_stream(jpeg_data, img_width, img_height)
         except Exception as e:
             raise RuntimeError(f"Failed to load image from {path}: {e}")
 
@@ -1381,19 +1451,19 @@ class LibUSBHIDAPI:
         """
         self.set_key_image_stream(data, key)
 
-    def setBrightness(self, percent: int) -> None:
+    def setBrightness(self, percent: int) -> int | None:
         """
         Legacy method: Set brightness.
 
         Args:
             percent: Brightness percentage (0-100)
         """
-        self.set_key_brightness(percent)
+        return self.set_key_brightness(percent)
 
-    def disconnected(self) -> None:
+    def disconnected(self) -> int | None:
         """Legacy method: Notify device of disconnection."""
-        self.notify_disconnected()
+        return self.notify_disconnected()
 
-    def refresh(self) -> None:
+    def refresh(self) -> int | None:
         """Legacy method: Refresh the display."""
-        self.refresh_screen()
+        return self.refresh_screen()

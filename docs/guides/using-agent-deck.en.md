@@ -2,7 +2,7 @@
 
 **[简体中文](using-agent-deck.zh-CN.md)**
 
-This guide is for people running Agent Deck on their own Mac. It documents the currently verified path: **macOS + MiraBox N4 Pro + Codex**. You can still use the local configuration UI and daemon with fake hardware when no N4 Pro is connected.
+This guide is for people running Agent Deck on their own Mac. It documents the currently verified path: **macOS + MiraBox N4 Pro + Codex**. It calls `agent-deckd` the “background service” and intentionally avoids internal protocol and status details. Developers should use the [Developer Q&A](../references/developer-q-and-a.md) for those details.
 
 ## 1. Prerequisites
 
@@ -25,7 +25,7 @@ This guide is for people running Agent Deck on their own Mac. It documents the c
 | Official StreamDock Python SDK | Compatibility fallback when the bundled SDK cannot load on macOS | See [Run with Physical Hardware](#run-with-physical-hardware) |
 | Codex | Show Codex state and quota, or install optional hook integration | `uv run agent-deckctl codex-detect --enable-integration` |
 
-`ccusage` only affects token/cost statistics. Without Bun, the configuration UI, application/URL keys, quota, and the main hardware path still work; the daemon status will record the token-polling failure reason.
+`ccusage` only affects token/cost statistics. Without Bun, the configuration UI, application/URL keys, quota, and hardware display still work.
 
 ## 2. Get the Source and Install Dependencies
 
@@ -44,7 +44,7 @@ uv run agent-deckctl doctor
 
 `doctor` only reads local environment and hardware ownership hints. It does not initialize, clear, or refresh a physical device, so use it first when diagnosing setup issues.
 
-## 3. First Run: Fake Hardware Mode
+## 3. First Run: Preview Without Taking Over Hardware
 
 For the first run, avoid taking ownership of physical hardware and verify the local service and configuration UI first:
 
@@ -62,9 +62,9 @@ scripts/agent-deckd-tmux.sh logs
 scripts/agent-deckd-tmux.sh stop
 ```
 
-### tmux Launcher
+### Background Launcher
 
-Use `scripts/agent-deckd-tmux.sh` to manage a persistent daemon:
+Use `scripts/agent-deckd-tmux.sh` to manage the background service:
 
 ```bash
 scripts/agent-deckd-tmux.sh start
@@ -75,13 +75,15 @@ scripts/agent-deckd-tmux.sh attach
 scripts/agent-deckd-tmux.sh stop
 ```
 
-The default tmux session is `agent-deckd` and the default listener is `127.0.0.1:8765`. Set these before launching when needed:
+The default service name is `agent-deckd`, and the configuration page uses `127.0.0.1:8765`. Set a different name or port only when running multiple services:
 
 ```bash
 export AGENT_DECK_TMUX_SESSION=agent-deckd-dev
 export AGENT_DECK_HOST=127.0.0.1
 export AGENT_DECK_PORT=8765
 ```
+
+This script keeps the service running after the terminal window closes. If the background service itself exits, use `restart`. A normal N4 Pro disconnect or restart should recover automatically without restarting the service.
 
 Without tmux, use the root `./run.sh start` process manager or run in the foreground:
 
@@ -104,7 +106,7 @@ MiraBox N4 Pro is the currently supported physical device. Before starting:
    uv run agent-deckctl hardware n4pro status
    ```
 
-The `doctor` probe briefly opens, reads, and closes the device, but intentionally does not call SDK `init()`. Do not add `init()` to diagnostic scripts: a real SDK initialization can wake displays, change brightness, clear key images, or refresh the device.
+These diagnostic commands do not change the N4 Pro display, so use them first.
 
 ### 4.2 macOS SDK Compatibility Fallback
 
@@ -115,7 +117,7 @@ export AGENT_DECK_STREAMDOCK_SDK_PATH="/absolute/path/to/StreamDock-Device-SDK/P
 uv run agent-deckctl doctor
 ```
 
-The variable only tells Agent Deck where to import the official Python SDK. It does not install or initialize the device. After diagnostics succeed, start the real renderer:
+The variable only tells Agent Deck where to load the official Python SDK. After diagnostics succeed, start the background service:
 
 ```bash
 scripts/agent-deckd-tmux.sh start
@@ -134,6 +136,7 @@ scripts/agent-deckd-tmux.sh restart
 - Each of the four knobs can have its own rotation action. For volume actions, pressing the knob implicitly toggles output mute or microphone mute; pressing is not separately configured.
 - Knob lighting is configured independently: off, or a base color with an optional breathing effect. When the device supports it, volume/brightness actions reflect state from the base color; muted states use red or turn off.
 - The bottom virtual panel rotates through the brand image, quota, and usage. Usage can switch among Day, Week, Month, and All.
+- If the N4 Pro is unplugged, loses power, or restarts, the background service waits for it to return and restores the display, lighting, and input. This normally takes a few seconds and does not require the official StreamDock application.
 
 If you intentionally need to replace a residual device image after the daemon has exited, use this write operation to show the branded splash image:
 
@@ -141,54 +144,17 @@ If you intentionally need to replace a residual device image after the daemon ha
 uv run agent-deckctl hardware n4pro splash
 ```
 
-This is not a read-only diagnostic. Make sure it will not overwrite another daemon that is currently controlling the device.
+This command changes the device display. Quit the official StreamDock application and any other Agent Deck service before running it.
 
-## 5. Configuration Locations and Persistence
+## 5. Configuration and Backups
 
-The default configuration lookup order is:
-
-1. An explicit `agent-deckd --config /path/to/config.toml` path.
-2. The `AGENT_DECK_CONFIG` environment variable.
-3. `agent-deck.toml` in the current working directory.
-4. `~/Library/Application Support/AgentDeck/config.toml`.
-
-The repository's [`agent-deck.toml`](../../agent-deck.toml) is a readable default example. Its current default is `codex.permission_request.mode = "passthrough"`, which keeps approval handling in Codex's native UI.
-
-Hardware layouts saved from the web UI live at:
+For everyday use, open [http://127.0.0.1:8765/](http://127.0.0.1:8765/), edit the layout, and choose **Save and Apply**. To back up or move settings to another Mac, the main files saved by the Web configuration page are:
 
 - Key layout: `~/Library/Application Support/AgentDeck/n4pro-key-layout.json`
 - Knob and lighting layout: `~/Library/Application Support/AgentDeck/n4pro-rotary-layout.json`
 - Codex quota presentation policy: `~/Library/Application Support/AgentDeck/quota-presentation.json`
 
-Use these variables to isolate paths for tests or multiple configurations:
-
-```bash
-export AGENT_DECK_N4PRO_KEY_LAYOUT="/path/to/key-layout.json"
-export AGENT_DECK_N4PRO_ROTARY_LAYOUT="/path/to/rotary-layout.json"
-export AGENT_DECK_QUOTA_PRESENTATION="/path/to/quota-presentation.json"
-```
-
-`quota-presentation.json` is not edited by the current Web configuration page. It sets a short label,
-display order, and visibility for each Codex limit. Rules match the app-server `limit_id`, never a
-`primary` / `secondary` slot. An unknown future limit remains visible by default, and no file means the
-same default behavior.
-
-```json
-{
-  "version": 1,
-  "presentation": {
-    "unmatched_visible": true,
-    "rules": [
-      { "limit_id": "codex", "label": "Codex", "visible": true, "order": 0 },
-      { "limit_id": "codex_bengalfox", "label": "Spark", "visible": true, "order": 10 }
-    ]
-  }
-}
-```
-
-Read `codex_quota.snapshot.windows` from `GET /status` to find the current `limit_id` values.
-`display_snapshot` is the filtered collection used by the hardware. Restart the daemon after changing
-the file.
+The repository's [`agent-deck.toml`](../../agent-deck.toml) is the default-settings example. Explicit configuration paths, isolated test directories, and custom quota presentation rules are advanced topics covered by the [Developer Q&A](../references/developer-q-and-a.md) and [Codex quota reference](../references/codex-app-server-quota.md).
 
 ## 6. Codex Integration
 
@@ -210,31 +176,52 @@ Only apply changes after reviewing the output:
 uv run agent-deckctl codex-install --apply
 ```
 
-The installer creates backups before edits. Read the target files and hook content it prints. Agent Deck's `notify` hook is best-effort and must not interfere with normal Codex work; `permission-request` fails closed when the daemon is unavailable, times out, or responds incorrectly. Keep the `passthrough` default unless you understand the security impact of changing the approval flow.
+The installer creates backups before edits. Keep the default approval setting unless you understand the effect of changing it; by default, approvals stay in Codex's native interface.
 
-## 7. Token, Cost, and Quota Data
+## 7. Token, Cost, and Quota
 
-- The daemon proactively refreshes quota and token/cost caches at startup, then follows its local refresh policy.
-- Token/cost trends use `bunx ccusage`. Check `bunx --version`; without Bun or enough `ccusage` history, a trend can be empty or show only the newest point.
-- Quota comes from Codex app-server-related paths. Network state, sign-in state, or Codex changes can make it temporarily unavailable. Inspect daemon data through `uv run agent-deckctl status`.
-- Panel and key images use the same cache. Knob/key interaction prefers already rendered frames while stale snapshots refresh in the background, so user input is not blocked by network or usage calculations.
+- The background service updates quota and token/cost information automatically.
+- Token/cost trends require Bun. Run `bunx --version`; without Bun or enough history, a trend may be empty.
+- Network problems, a signed-out Codex session, or a Codex version change can make quota temporarily unavailable. It normally returns on a later update.
 
 ## 8. Troubleshooting
 
 ### The configuration UI opens, but N4 Pro does not update
 
-Confirm that the daemon was started with the real renderer:
+Confirm that the background service is running:
 
 ```bash
 scripts/agent-deckd-tmux.sh status
 uv run agent-deckctl status
 ```
 
-Then quit the official MiraBox/StreamDock application, confirm no second daemon exists, and run `uv run agent-deckctl doctor` again. `--disable-hardware-renderer` deliberately does not own the device.
+Then quit the official MiraBox/StreamDock application, make sure Agent Deck is not running twice, and run `uv run agent-deckctl doctor` again. If the launch command contains `--disable-hardware-renderer`, remove it and restart.
 
 ### `streamdock` fails to load on macOS
 
-Set `AGENT_DECK_STREAMDOCK_SDK_PATH` to the official SDK's `Python-SDK` or `src`, then verify with `doctor`. Do not add `device.init()` to a probe to work around library loading issues.
+Follow the SDK compatibility steps under [Run with Physical Hardware](#run-with-physical-hardware), then run `uv run agent-deckctl doctor` again.
+
+### Insufficient macOS permission reports successful writes but leaves the brand image
+
+When launching or debugging from Codex Desktop, set its execution policy to **Full Access**, then quit and restart Codex completely. If `not permitted` still appears, open System Settings -> Privacy & Security -> Input Monitoring, allow Codex or the terminal that launches Agent Deck, and restart that application.
+
+### N4 Pro does not recover after a restart or reconnect
+
+Inspect the service and its logs:
+
+```bash
+uv run agent-deckctl status
+scripts/agent-deckd-tmux.sh logs
+```
+
+Normally the device recovers within a few seconds after reconnecting. If it remains on the brand image:
+
+1. Check Codex or terminal permissions as described above.
+2. Run `scripts/agent-deckd-tmux.sh restart`.
+3. If it still does not recover, stop Agent Deck and open the official StreamDock application to confirm that it recognizes the device.
+4. Quit the official application completely before starting Agent Deck again, so both applications never control the device at once.
+
+When reporting the problem, include logs, firmware version, and whether the device connects directly to the Mac or through a USB hub. See the [Developer Q&A](../references/developer-q-and-a.md) for protocol details and internal status fields.
 
 ### The token/cost panel has no trend line
 
@@ -260,6 +247,6 @@ Stop the known Agent Deck session before starting again, or choose another `AGEN
 
 ## 9. Getting Help and Reporting Issues
 
-When reporting an issue, include the macOS version, Python/uv version, device model, whether the official software is running, launch method, redacted `agent-deckctl doctor` output, and relevant daemon logs. Do not paste API keys, tokens, complete prompts, or private application paths into issues or logs.
+When reporting an issue, include the macOS version, device model, whether the official software was opened, launch method, `agent-deckctl doctor` output, and relevant logs. Do not paste API keys, tokens, complete conversations, or other private information.
 
 Read the [contributing guide](../../CONTRIBUTING.md) before changing code or adding a hardware adapter.

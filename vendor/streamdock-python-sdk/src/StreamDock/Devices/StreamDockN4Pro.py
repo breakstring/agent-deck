@@ -1,3 +1,9 @@
+"""StreamDock N4 Pro 设备协议适配。
+
+本模块在官方 SDK 的 N4 Pro 显示、输入和灯光能力之外，显式暴露连接握手；握手只由真实
+renderer 在接管设备前调用，安全只读 probe 仍只执行普通 open/read/close，不会修改显示模式。
+"""
+
 from StreamDock.FeatrueOption import device_type
 from .StreamDock import StreamDock
 from ..DeviceConfig import StreamDockN4ProConfig
@@ -366,6 +372,21 @@ class StreamDockN4Pro(StreamDock):
             "rotation": 180,
             "flip": (False, False),
         }
+
+    def send_handshake(self):
+        """发送 N4 Pro 从品牌图模式进入 SDK 控制模式所需的握手包。
+
+        入参：无；使用当前枚举对象保存的 HID path、report id 0 和 1025 字节输出报告。
+        返回：底层完整写入后返回 0。
+        错误处理：HID 权限不足、打开失败或短写时由 transport 抛出异常。
+        副作用：短暂打开 HID path 并发送 `HAN` 握手，随后立即释放；不建立常驻会话。
+        """
+
+        return self.transport.send_handshake(
+            self.path,
+            report_id=0,
+            output_report_size=1025,
+        )
 
     # Set device parameters
     def set_device(self):

@@ -33,6 +33,9 @@ StreamDockN4ProKeyImageUpdateProvider = Callable[[], tuple[int, Mapping[int, Ima
 _MIN_BACKGROUND_UPDATE_INTERVAL_SECONDS = 0.04
 """连续输入时同会话背景热更新的最短间隔，超过此频率时只保留最新 revision。"""
 
+_HANDSHAKE_SETTLE_SECONDS = 0.05
+"""N4 Pro 接受 `HAN` 握手后、常驻 SDK 会话 open 前的最短稳定等待。"""
+
 
 class StreamDockN4ProDeviceLike(Protocol):
     """统一 N4 Pro writer 所需的官方 SDK device 最小协议。
@@ -66,7 +69,7 @@ class StreamDockN4ProDeviceLike(Protocol):
 
         入参：`path` 是本地 JPEG 图片路径。
         返回：SDK 返回值；常见成功值可能是 None 或 0。
-        错误处理：SDK 转换或传输失败可返回 -1 或抛异常。
+        错误处理：SDK 转换或传输失败可返回非零 TransportResult 或抛异常。
         副作用：真实实现会修改 N4 Pro 背景层；该接口实测可与按键图层同时显示。
         """
 
@@ -75,7 +78,7 @@ class StreamDockN4ProDeviceLike(Protocol):
 
         入参：`key` 是 N4 Pro 逻辑按键编号 1-15；`path` 是本地 PNG 图片路径。
         返回：SDK 返回值；常见成功值可能是 None 或 0。
-        错误处理：SDK 转换或传输失败可返回 -1 或抛异常。
+        错误处理：SDK 转换或传输失败可返回非零 TransportResult 或抛异常。
         副作用：真实实现会修改 N4 Pro 指定按键图标。
         """
 
@@ -104,6 +107,15 @@ class StreamDockN4ProDeviceLike(Protocol):
         返回：设备路径字符串。
         错误处理：读取失败可抛异常，调用方会降级为空字符串。
         副作用：只读取 SDK 元数据。
+        """
+
+    def send_handshake(self) -> object:
+        """请求 N4 Pro 退出品牌图模式并进入 SDK 控制模式。
+
+        入参：无；设备实现使用枚举 path 和 N4 Pro 固定报告参数。
+        返回：SDK 成功值 0；旧版 SDK 可能没有此可选方法，调用方会兼容跳过。
+        错误处理：权限不足、HID 打开失败或短写可抛异常。
+        副作用：在常驻 `open()` 前短暂打开同一 HID path 并发送连接握手。
         """
 
 
@@ -178,7 +190,7 @@ class StreamDockN4ProPersistentAnimator:
 
     入参：`manager` 可注入 fake 或官方 DeviceManager；`temp_dir` 控制临时背景 JPEG 目录；
     `sleep` 和 `monotonic` 仅供测试替换。实例会在第一次调用时 open/init N4 Pro，并在后续
-    调用中复用同一个设备会话，直到显式调用 `close()` 或 SDK 枚举显示 N4 Pro 已更换 USB 路径。
+    调用中复用同一个设备会话，直到显式调用 `close()`、设备 path 变化或当前 transport 不可写。
     返回：实例本身是 callable，签名兼容 `animate_key_images_on_n4pro`。
     错误处理：设备枚举/open/init 或 SDK 下发失败时返回 `ok=False`；显式 close 会吞掉 SDK
     close 异常，避免 daemon shutdown 失败。
@@ -226,6 +238,9 @@ class StreamDockN4ProPersistentAnimator:
         self._device: StreamDockN4ProDeviceLike | None = None
         self._device_type: str | None = None
         self._path: str | None = None
+        self._has_opened_device = False
+        self._device_reconnect_count = 0
+        self._device_handshake_count = 0
 
     def set_session_output_callback(
         self,
@@ -298,7 +313,8 @@ class StreamDockN4ProPersistentAnimator:
         播放窗口；`fps` 是目标帧率。
         返回：`StreamDockN4ProAnimationResult`，成功结果包含 timing 诊断；persistent 模式下
         `close` 阶段耗时固定为 0，真实 close 只在 `close()` 中发生。
-        错误处理：非法参数、设备不可用或 SDK 返回 -1 时返回 `ok=False`；异常会关闭当前会话
+        错误处理：非法参数、设备不可用或 SDK 返回非零 TransportResult 时返回 `ok=False`；
+        异常会关闭当前会话
         并作为错误结果返回。
         副作用：可能首次 open/init 真实设备，每轮写 frame background、set key image 和 refresh。
         """
@@ -359,14 +375,17 @@ class StreamDockN4ProPersistentAnimator:
                     after_open_init,
                     after_background,
                 )
-                if background_result == -1:
+                if streamdock_sdk_result_failed(background_result):
                     self.close()
                     return StreamDockN4ProAnimationResult(
                         ok=False,
                         device_type=self._device_type,
                         path=self._path,
                         background_result=str(background_result),
-                        error="set_frame_background failed: SDK returned -1",
+                        error=_sdk_failure_message(
+                            "set_frame_background failed",
+                            background_result,
+                        ),
                     )
             else:
                 timing["background"] = 0.0
@@ -377,7 +396,7 @@ class StreamDockN4ProPersistentAnimator:
                     key_path = _save_temp_png(image, temp_dir=self._temp_dir)
                     temp_paths.append(key_path)
                     key_result = device.set_key_image(key, str(key_path))
-                    if key_result == -1:
+                    if streamdock_sdk_result_failed(key_result):
                         self.close()
                         return StreamDockN4ProAnimationResult(
                             ok=False,
@@ -385,7 +404,10 @@ class StreamDockN4ProPersistentAnimator:
                             path=self._path,
                             background_result=_stringify_optional(background_result),
                             key_count=key_count,
-                            error=f"set_key_image failed for key {key}: SDK returned -1",
+                            error=_sdk_failure_message(
+                                f"set_key_image failed for key {key}",
+                                key_result,
+                            ),
                         )
                 timing["static_keys"] = _elapsed_seconds(
                     static_started_at,
@@ -469,7 +491,7 @@ class StreamDockN4ProPersistentAnimator:
                     for key, paths in normalized_frames.items():
                         frame_path = paths[frame_index % len(paths)]
                         key_result = device.set_key_image(key, str(frame_path))
-                        if key_result == -1:
+                        if streamdock_sdk_result_failed(key_result):
                             self.close()
                             return StreamDockN4ProAnimationResult(
                                 ok=False,
@@ -478,9 +500,23 @@ class StreamDockN4ProPersistentAnimator:
                                 background_result=_stringify_optional(background_result),
                                 frames_rendered=frames_rendered,
                                 key_count=key_count,
-                                error=f"set_key_image failed for key {key}: SDK returned -1",
+                                error=_sdk_failure_message(
+                                    f"set_key_image failed for key {key}",
+                                    key_result,
+                                ),
                             )
-                    device.refresh()
+                    refresh_result = device.refresh()
+                    if streamdock_sdk_result_failed(refresh_result):
+                        self.close()
+                        return StreamDockN4ProAnimationResult(
+                            ok=False,
+                            device_type=self._device_type,
+                            path=self._path,
+                            background_result=_stringify_optional(background_result),
+                            frames_rendered=frames_rendered,
+                            key_count=key_count,
+                            error=_sdk_failure_message("refresh failed", refresh_result),
+                        )
                     frames_rendered += 1
                     if frames_rendered == 1:
                         timing["first_frame"] = _elapsed_seconds(
@@ -493,7 +529,18 @@ class StreamDockN4ProPersistentAnimator:
                         if delay > 0:
                             self._wait_for_next_frame(delay)
             else:
-                device.refresh()
+                refresh_result = device.refresh()
+                if streamdock_sdk_result_failed(refresh_result):
+                    self.close()
+                    return StreamDockN4ProAnimationResult(
+                        ok=False,
+                        device_type=self._device_type,
+                        path=self._path,
+                        background_result=_stringify_optional(background_result),
+                        frames_rendered=frames_rendered,
+                        key_count=key_count,
+                        error=_sdk_failure_message("refresh failed", refresh_result),
+                    )
                 frames_rendered += 1
                 timing["first_frame"] = _elapsed_seconds(
                     playback_started_at,
@@ -651,8 +698,12 @@ class StreamDockN4ProPersistentAnimator:
             result = device.set_frame_background(str(background_path))
         except Exception as exc:
             return False, None, f"set_frame_background update failed: {type(exc).__name__}: {exc}"
-        if result == -1:
-            return False, result, "set_frame_background update failed: SDK returned -1"
+        if streamdock_sdk_result_failed(result):
+            return (
+                False,
+                result,
+                _sdk_failure_message("set_frame_background update failed", result),
+            )
         self._last_background_revision = revision
         self._last_background_update_monotonic = self._monotonic()
         return True, result, None
@@ -692,8 +743,15 @@ class StreamDockN4ProPersistentAnimator:
                 key_path = _save_temp_png(image, temp_dir=self._temp_dir)
                 temp_paths.append(key_path)
                 result = device.set_key_image(key, str(key_path))
-                if result == -1:
-                    return False, 0, f"set_key_image update failed for key {key}: SDK returned -1"
+                if streamdock_sdk_result_failed(result):
+                    return (
+                        False,
+                        0,
+                        _sdk_failure_message(
+                            f"set_key_image update failed for key {key}",
+                            result,
+                        ),
+                    )
         except Exception as exc:
             return False, 0, f"set_key_image update failed: {type(exc).__name__}: {exc}"
         self._last_key_image_revision = revision
@@ -733,11 +791,19 @@ class StreamDockN4ProPersistentAnimator:
         """
 
         active_manager = self._manager if self._manager is not None else _load_default_manager()
+        had_opened_device = self._has_opened_device
         device = _first_n4pro_device(active_manager.enumerate())
         if self._device is not None:
-            if device is not None and _safe_path(device) == self._path:
+            same_path = device is not None and _safe_path(device) == self._path
+            if same_path and _device_is_writable(self._device) is not False:
                 timing["open_init"] = 0.0
+                timing["handshake"] = 0.0
+                timing["device_handshaken"] = 0.0
+                timing["device_handshake_count"] = float(
+                    self._device_handshake_count
+                )
                 timing["device_reconnected"] = 0.0
+                timing["device_reconnect_count"] = float(self._device_reconnect_count)
                 return self._device
             self.close()
             if device is None:
@@ -750,6 +816,35 @@ class StreamDockN4ProPersistentAnimator:
             return StreamDockN4ProAnimationResult(ok=False, error="no N4 Pro device found")
         self._device_type = type(device).__name__
         self._path = _safe_path(device)
+        handshake_started_at = self._monotonic()
+        handshake = getattr(device, "send_handshake", None)
+        device_handshaken = False
+        if callable(handshake):
+            try:
+                handshake_result = handshake()
+            except Exception as exc:
+                return StreamDockN4ProAnimationResult(
+                    ok=False,
+                    device_type=self._device_type,
+                    path=self._path,
+                    error=f"handshake failed: {type(exc).__name__}: {exc}",
+                )
+            if streamdock_sdk_result_failed(handshake_result):
+                return StreamDockN4ProAnimationResult(
+                    ok=False,
+                    device_type=self._device_type,
+                    path=self._path,
+                    error=_sdk_failure_message("handshake failed", handshake_result),
+                )
+            self._device_handshake_count += 1
+            device_handshaken = True
+            self._sleep(_HANDSHAKE_SETTLE_SECONDS)
+        timing["handshake"] = _elapsed_seconds(
+            handshake_started_at,
+            self._monotonic(),
+        )
+        timing["device_handshaken"] = 1.0 if device_handshaken else 0.0
+        timing["device_handshake_count"] = float(self._device_handshake_count)
         open_result = device.open()
         if open_result is False:
             return StreamDockN4ProAnimationResult(
@@ -758,11 +853,25 @@ class StreamDockN4ProPersistentAnimator:
                 path=self._path,
                 error="open failed: SDK returned false",
             )
-        device.init()
-        self._register_input_callback(device)
         self._device = device
+        device.init()
+        if _device_is_writable(device) is False:
+            device_type = self._device_type
+            path = self._path
+            self.close()
+            return StreamDockN4ProAnimationResult(
+                ok=False,
+                device_type=device_type,
+                path=path,
+                error="init failed: N4 Pro session is not writable",
+            )
+        self._register_input_callback(device)
+        if had_opened_device:
+            self._device_reconnect_count += 1
+        self._has_opened_device = True
         timing["open_init"] = _elapsed_seconds(started_at, self._monotonic())
-        timing.setdefault("device_reconnected", 0.0)
+        timing["device_reconnected"] = 1.0 if had_opened_device else 0.0
+        timing["device_reconnect_count"] = float(self._device_reconnect_count)
         return device
 
     def _register_input_callback(self, device: StreamDockN4ProDeviceLike) -> None:
@@ -799,7 +908,7 @@ def render_images_to_n4pro(
     是逻辑 key 到 Pillow 图像的映射，key 必须在 1-15；`manager` 可注入 fake 或官方
     DeviceManager；`temp_dir` 是临时文件目录，测试可传入 pytest tmp_path。
     返回：`StreamDockN4ProRenderResult`，成功时包含背景和各 key 的 SDK 返回值。
-    错误处理：没有任何 surface、非法 key、找不到 N4 Pro、open false、任一 SDK 返回 -1 或
+    错误处理：没有任何 surface、非法 key、找不到 N4 Pro、open false、任一 SDK 返回非零结果或
     抛异常都会返回 `ok=False`；临时文件会尽力清理。
     副作用：无 manager 时懒加载官方 SDK 并枚举真实设备；成功选中 N4 Pro 后会 open/init、
     set frame background、set key images、refresh 并 close(notify=False)。
@@ -847,13 +956,16 @@ def render_images_to_n4pro(
             background_path = _save_temp_jpeg(background_image, temp_dir=temp_dir)
             temp_paths.append(background_path)
             background_result = device.set_frame_background(str(background_path))
-            if background_result == -1:
+            if streamdock_sdk_result_failed(background_result):
                 return StreamDockN4ProRenderResult(
                     ok=False,
                     device_type=device_type,
                     path=path,
                     background_result=str(background_result),
-                    error="set_frame_background failed: SDK returned -1",
+                    error=_sdk_failure_message(
+                        "set_frame_background failed",
+                        background_result,
+                    ),
                 )
 
         key_results: dict[int, str] = {}
@@ -862,17 +974,30 @@ def render_images_to_n4pro(
             temp_paths.append(key_path)
             key_result = device.set_key_image(key, str(key_path))
             key_results[key] = str(key_result)
-            if key_result == -1:
+            if streamdock_sdk_result_failed(key_result):
                 return StreamDockN4ProRenderResult(
                     ok=False,
                     device_type=device_type,
                     path=path,
                     background_result=_stringify_optional(background_result),
                     key_results=key_results,
-                    error=f"set_key_image failed for key {key}: SDK returned -1",
+                    error=_sdk_failure_message(
+                        f"set_key_image failed for key {key}",
+                        key_result,
+                    ),
                 )
 
         refresh_result = device.refresh()
+        if streamdock_sdk_result_failed(refresh_result):
+            return StreamDockN4ProRenderResult(
+                ok=False,
+                device_type=device_type,
+                path=path,
+                background_result=_stringify_optional(background_result),
+                key_results=key_results,
+                refresh_result=str(refresh_result),
+                error=_sdk_failure_message("refresh failed", refresh_result),
+            )
         return StreamDockN4ProRenderResult(
             ok=True,
             device_type=device_type,
@@ -918,7 +1043,7 @@ def animate_key_images_on_n4pro(
     可注入 fake 或官方 DeviceManager；`temp_dir` 是背景临时 JPEG 目录；`sleep`/`monotonic`
     仅供测试替换计时函数。
     返回：`StreamDockN4ProAnimationResult`，成功时包含刷新帧数和参与按键数。
-    错误处理：非法 key、空帧、时长/FPS 非正、找不到 N4 Pro、open false、SDK 返回 -1 或
+    错误处理：非法 key、空帧、时长/FPS 非正、找不到 N4 Pro、open false、SDK 返回非零结果或
     抛异常都会返回 `ok=False`；临时背景文件会尽力清理。
     副作用：无 manager 时懒加载官方 SDK 并枚举真实设备；成功选中 N4 Pro 后会 open/init、
     可选写 frame background，然后按帧循环 set_key_image/refresh，最后 close(notify=False)。
@@ -982,13 +1107,16 @@ def animate_key_images_on_n4pro(
             background_result = device.set_frame_background(str(background_path))
             after_background = monotonic()
             timing["background"] = _elapsed_seconds(after_open_init, after_background)
-            if background_result == -1:
+            if streamdock_sdk_result_failed(background_result):
                 return StreamDockN4ProAnimationResult(
                     ok=False,
                     device_type=device_type,
                     path=path,
                     background_result=str(background_result),
-                    error="set_frame_background failed: SDK returned -1",
+                    error=_sdk_failure_message(
+                        "set_frame_background failed",
+                        background_result,
+                    ),
                 )
         else:
             timing["background"] = 0.0
@@ -999,14 +1127,17 @@ def animate_key_images_on_n4pro(
                 key_path = _save_temp_png(image, temp_dir=temp_dir)
                 temp_paths.append(key_path)
                 key_result = device.set_key_image(key, str(key_path))
-                if key_result == -1:
+                if streamdock_sdk_result_failed(key_result):
                     return StreamDockN4ProAnimationResult(
                         ok=False,
                         device_type=device_type,
                         path=path,
                         background_result=_stringify_optional(background_result),
                         key_count=key_count,
-                        error=f"set_key_image failed for key {key}: SDK returned -1",
+                        error=_sdk_failure_message(
+                            f"set_key_image failed for key {key}",
+                            key_result,
+                        ),
                     )
             timing["static_keys"] = _elapsed_seconds(static_started_at, monotonic())
             after_static = monotonic()
@@ -1022,7 +1153,7 @@ def animate_key_images_on_n4pro(
                 for key, paths in normalized_frames.items():
                     frame_path = paths[frame_index % len(paths)]
                     key_result = device.set_key_image(key, str(frame_path))
-                    if key_result == -1:
+                    if streamdock_sdk_result_failed(key_result):
                         return StreamDockN4ProAnimationResult(
                             ok=False,
                             device_type=device_type,
@@ -1030,9 +1161,22 @@ def animate_key_images_on_n4pro(
                             background_result=_stringify_optional(background_result),
                             frames_rendered=frames_rendered,
                             key_count=key_count,
-                            error=f"set_key_image failed for key {key}: SDK returned -1",
+                            error=_sdk_failure_message(
+                                f"set_key_image failed for key {key}",
+                                key_result,
+                            ),
                         )
-                device.refresh()
+                refresh_result = device.refresh()
+                if streamdock_sdk_result_failed(refresh_result):
+                    return StreamDockN4ProAnimationResult(
+                        ok=False,
+                        device_type=device_type,
+                        path=path,
+                        background_result=_stringify_optional(background_result),
+                        frames_rendered=frames_rendered,
+                        key_count=key_count,
+                        error=_sdk_failure_message("refresh failed", refresh_result),
+                    )
                 frames_rendered += 1
                 if frames_rendered == 1:
                     timing["first_frame"] = _elapsed_seconds(
@@ -1045,7 +1189,17 @@ def animate_key_images_on_n4pro(
                     if delay > 0:
                         sleep(delay)
         else:
-            device.refresh()
+            refresh_result = device.refresh()
+            if streamdock_sdk_result_failed(refresh_result):
+                return StreamDockN4ProAnimationResult(
+                    ok=False,
+                    device_type=device_type,
+                    path=path,
+                    background_result=_stringify_optional(background_result),
+                    frames_rendered=frames_rendered,
+                    key_count=key_count,
+                    error=_sdk_failure_message("refresh failed", refresh_result),
+                )
             frames_rendered += 1
             timing["first_frame"] = _elapsed_seconds(playback_started_at, monotonic())
 
@@ -1240,6 +1394,52 @@ def _safe_path(device: StreamDockN4ProDeviceLike) -> str:
     except Exception:
         value = getattr(device, "path", "")
         return value if isinstance(value, str) else ""
+
+
+def _device_is_writable(device: StreamDockN4ProDeviceLike) -> bool | None:
+    """尽量读取当前 HID 会话是否仍可写，供同 path 原地重启检测。
+
+    入参：`device` 是 persistent animator 当前持有的 SDK device。
+    返回：SDK 明确报告时返回 bool；旧版 SDK 没有健康接口时返回 None 并保留兼容复用行为。
+    错误处理：健康检查抛异常时返回 False，按失效句柄处理。
+    副作用：可能调用 SDK device 或 transport 的只读 `can_write()`，不写屏幕、不重置设备。
+    """
+
+    checker = getattr(device, "can_write", None)
+    if not callable(checker):
+        transport = getattr(device, "transport", None)
+        checker = getattr(transport, "can_write", None)
+    if not callable(checker):
+        return None
+    try:
+        return bool(checker())
+    except Exception:
+        return False
+
+
+def streamdock_sdk_result_failed(result: object | None) -> bool:
+    """判断 StreamDock native 写操作是否返回失败码。
+
+    入参：`result` 是 SDK/ctypes 返回值；旧版成功路径可能返回 None，新版 TransportResult
+    以 0 表示成功，并可能把 native `-1` 暴露成无符号 `0xFFFFFFFF`。
+    返回：非零整数返回 True；None、0 和布尔兼容值返回 False。
+    错误处理：未知对象按旧 SDK 成功兼容处理，由异常路径和下一轮健康检查兜底。
+    副作用：无；只检查内存返回值。
+    """
+
+    return isinstance(result, int) and not isinstance(result, bool) and result != 0
+
+
+def _sdk_failure_message(failure: str, result: object) -> str:
+    """构造保留原始 native 返回值的稳定硬件错误文本。
+
+    入参：`failure` 是已经包含 `failed` 的操作说明；`result` 是 SDK 原始返回值。
+    返回：适合 result/status 和测试断言的单行错误文本。
+    错误处理：`str(result)` 异常按 Python 原语义传播；常见 SDK 标量不会触发。
+    副作用：无。
+    """
+
+    return f"{failure}: SDK returned {result}"
 
 
 def _stringify_optional(value: object | None) -> str | None:

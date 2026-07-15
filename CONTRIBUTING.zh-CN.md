@@ -100,7 +100,8 @@ Agent ingress -> NormalizedEvent -> AgentStateStore -> DeckMode/LayoutPlan
 - macOS 的 SDK 加载问题优先通过 `AGENT_DECK_STREAMDOCK_SDK_PATH` 指向官方 `Python-SDK` 或 `src` 解决，而不是修改诊断流程为初始化设备。
 - 新增硬件型号时，先建模能力，再做特定 layout；不要把 N4 Pro 的按键/旋钮数量或坐标写进通用逻辑。
 
-详细手动接管流程见[使用指南](docs/guides/using-agent-deck.zh-CN.md#真实硬件运行)。
+普通用户的接管步骤见[使用指南](docs/guides/using-agent-deck.zh-CN.md#真实硬件运行)；协议、重连、
+权限假成功、状态字段和真机 smoke 证据见[开发者 Q&A](docs/references/developer-q-and-a.md)。
 
 ## 编码与文档约定
 

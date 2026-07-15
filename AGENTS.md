@@ -79,6 +79,14 @@ Agent ingress -> NormalizedEvent -> AgentStateStore -> DeckMode/LayoutPlan -> Ha
 - 诊断探针只能做只读 open/read/close。不要在诊断流程调用官方 SDK 的 `device.init()`，因为真实 SDK 的 `init()` 会唤醒屏幕、设置亮度、清空图标并刷新设备。
 - `streamdock_probe.py` 当前设计为短暂 open，读取固件和序列号，然后 `close(notify=False)`。保持这个安全边界。
 - macOS 上 PyPI `streamdock` 包可能加载 Linux `.so` 失败。真实探针优先支持通过 `AGENT_DECK_STREAMDOCK_SDK_PATH` 指向官方 `Python-SDK` 或 `Python-SDK/src`。
+- N4 Pro 在断开通知或某些重启路径后可能只显示品牌图。真实 renderer 接管新枚举设备时必须先
+  发送 `report_id=0 + HAN + zero padding` 的 1025 字节握手包，再执行常驻会话的 open/init；
+  安全只读 probe 不得发送该握手。首次连接和每次重连都要执行，不能依赖官方 App 复位。
+- macOS 设备权限不足时，vendored SDK 可能出现假成功：`device.open()` 为 True、`can_write`
+  为 True、写入返回 0，但 `transport.get_last_error()` 实际是 `[HID] Device not open`，真机仍只
+  显示品牌图。真实硬件调试不能只看这些返回值；握手 raw HID open/write 必须成功，并以真机
+  显示变化作为 smoke 证据。从 Codex Desktop App 调试时应启用 Full Access 并完整重启 App；
+  若仍报 `not permitted`，检查 macOS“隐私与安全性 -> 输入监控”并重新启动相关终端/App。
 - 不要在自动化测试中访问真实 HID 设备。真实设备验证只能作为显式 smoke/manual 步骤。
 
 当前真实 N4 Pro 安全探针命令示例：

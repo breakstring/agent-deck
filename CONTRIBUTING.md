@@ -100,7 +100,7 @@ A real N4 Pro is an explicit manual smoke environment and **must never** become 
 - Resolve macOS SDK loading issues by pointing `AGENT_DECK_STREAMDOCK_SDK_PATH` to the official `Python-SDK` or `src`; do not change diagnostics to initialize a device.
 - When adding hardware, model capabilities first and add device-specific layouts second. Do not hard-code N4 Pro key/knob counts or coordinates into generic logic.
 
-See [the usage guide](docs/guides/using-agent-deck.en.md#run-with-physical-hardware) for the detailed manual ownership process.
+See [the usage guide](docs/guides/using-agent-deck.en.md#run-with-physical-hardware) for user-facing ownership steps. Developers should use the [Developer Q&A](docs/references/developer-q-and-a.md) for protocol, reconnection, false-success permissions, status fields, and real-hardware smoke evidence.
 
 ## Code and Documentation Conventions
 

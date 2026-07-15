@@ -108,8 +108,9 @@ uv run agent-deckd --host 127.0.0.1 --port 8765
 
 ## 文档
 
-- [使用指南（中文）](docs/guides/using-agent-deck.zh-CN.md)：安装依赖、启动、配置、硬件、Codex 集成与排障。
+- [使用指南（中文）](docs/guides/using-agent-deck.zh-CN.md)：面向普通用户的安装、启动、配置与排障步骤。
 - [Usage guide (English)](docs/guides/using-agent-deck.en.md)
+- [开发者 Q&A](docs/references/developer-q-and-a.md)：运行结构、N4 Pro 重连/握手、macOS 权限、状态字段与真机验证。
 - [贡献指南（中文）](CONTRIBUTING.zh-CN.md)
 - [Contributing guide (English)](CONTRIBUTING.md)
 - [项目路线图](docs/references/agent-deck-roadmap.md)：长期方向、阶段边界与待验证事项。

@@ -135,6 +135,15 @@ flowchart LR
     working 动画会在终点出现肉眼可见的停顿。daemon 默认使用 persistent N4 Pro renderer
     sink，在服务生命周期内复用同一个 open/init 后的设备会话；CLI 一次性预览命令仍可使用
     open/play/close 的短会话路径。
+    persistent renderer 每轮都会重新枚举设备；只有 USB path 相同且当前 transport `can_write`
+    明确可用时才复用旧会话。设备消失、同 path 原地重启或 SDK 写入/refresh 返回非零
+    TransportResult 时，renderer 会 `close(notify=False)` 使旧句柄失效，并在后续轮次用新枚举对象
+    重新执行 raw HID `HAN` 握手、open/init、注册输入回调和 full redraw。N4 Pro 握手使用
+    `report_id=0` 的 1025 字节输出报告，可让设备从只显示品牌图的断开状态回到 SDK 控制模式；
+    安全只读 probe 不发送握手。vendored SDK 的 legacy 背景、刷新、亮度和灯光 API 必须透传
+    native 返回码，不能只打印 `Device is disconnected` 后仍让 daemon 记录成功。macOS 受限运行
+    策略还可能让 SDK 的 open/can_write/返回码全部假成功，因此真实 smoke 必须验证 raw HID 握手，
+    Codex Desktop 调试需启用 Full Access 并重启，仍报 `not permitted` 时检查输入监控权限。
 
 13. Codex 视觉资产生成器
     将 `assets/codex/codex.gif` 按目标设备 profile 预渲染成状态帧序列、每状态
@@ -241,6 +250,7 @@ P1 验收清单：
 - [x] 启用统一 N4 Pro renderer 后，Codex 会话状态按钮和底部 quota 背景能在同一次硬件写入链路中共存。
 - [x] 超时默认策略按配置执行。
 - [x] 拔插设备服务不崩溃。
+- [x] 设备以相同 USB path 重启或重新插入后，失效句柄会被识别并在后续 renderer 周期重连。
 - [x] `pytest` 通过。
 
 ## P2：Claude Code Adapter

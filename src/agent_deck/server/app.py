@@ -77,6 +77,7 @@ from agent_deck.hardware.capabilities import get_device_profile
 from agent_deck.hardware.streamdock_n4pro import (
     StreamDockN4ProAnimationResult,
     StreamDockN4ProPersistentAnimator,
+    streamdock_sdk_result_failed,
 )
 from agent_deck.hardware.streamdock_touchscreen import (
     StreamDockTouchscreenRenderResult,
@@ -1316,7 +1317,7 @@ class _DaemonRuntime:
         入参：`device` 是已成功 open/init 的官方 SDK device；`initialized` 表示本轮刚 init，
         因为 SDK init 会把亮度重置为 100，需要强制重新写入持久化值。
         返回：所有失败信息拼接后的错误字符串，成功或无变更时返回 None。
-        错误处理：缺少 SDK 方法、返回 -1 或调用异常只记录错误，不影响本轮图像渲染。
+        错误处理：缺少 SDK 方法、返回非零 TransportResult 或调用异常只记录错误，不影响本轮图像渲染。
         副作用：仅在值变化或刚 init 时调用 `set_brightness`/`set_led_color`，不新建 HID 会话。
         """
 
@@ -4035,7 +4036,7 @@ def _set_n4pro_brightness(device: object, percent: int) -> str | None:
     """调用 N4 Pro SDK 的整体亮度 API，并把兼容错误归一为诊断文本。
 
     入参：`device` 是已 open/init 的官方 SDK 对象；`percent` 是 0 到 100 的目标亮度。
-    返回：成功时 None；缺方法、SDK 返回 -1 或异常时返回错误说明。
+    返回：成功时 None；缺方法、SDK 返回非零 TransportResult 或异常时返回错误说明。
     错误处理：不抛 SDK 异常，避免控制台附加输出破坏主图像刷新。
     副作用：成功时调用设备 `set_brightness(percent)`。
     """
@@ -4047,8 +4048,8 @@ def _set_n4pro_brightness(device: object, percent: int) -> str | None:
         result = setter(percent)
     except Exception as exc:
         return f"set_brightness failed: {type(exc).__name__}: {exc}"
-    if result == -1:
-        return "set_brightness failed: SDK returned -1"
+    if streamdock_sdk_result_failed(result):
+        return f"set_brightness failed: SDK returned {result}"
     return None
 
 
@@ -4063,7 +4064,7 @@ def _set_n4pro_group_lighting(
     入参：`device` 是已 open/init 的官方 SDK 对象；`mode` 是 off 或 color；`color` 是经模型
     校验的 `#RRGGBB` 或 None；`breathe` 只用于完整接收持久化配置，亮度周期另由 LED brightness
     API 写入。
-    返回：成功时 None；缺方法、模式非法、SDK 返回 -1 或异常时返回错误说明。
+    返回：成功时 None；缺方法、模式非法、SDK 返回非零 TransportResult 或异常时返回错误说明。
     错误处理：不抛 SDK 异常，图像刷新仍可继续。
     副作用：成功时调用一次 `set_led_color(r, g, b)`，off 发送全零。
     """
@@ -4081,8 +4082,8 @@ def _set_n4pro_group_lighting(
         result = setter(red, green, blue)
     except Exception as exc:
         return f"set_led_color failed: {type(exc).__name__}: {exc}"
-    if result == -1:
-        return "set_led_color failed: SDK returned -1"
+    if streamdock_sdk_result_failed(result):
+        return f"set_led_color failed: SDK returned {result}"
     return None
 
 
@@ -4107,7 +4108,7 @@ def _set_n4pro_group_led_brightness(device: object, percent: int) -> str | None:
     """调用 N4 Pro group LED 亮度 API，供可选软件呼吸效果复用。
 
     入参：`device` 是已 open/init 的官方 SDK 对象；`percent` 必须是 0 到 100 的 group 灯圈亮度。
-    返回：成功时 None；SDK 缺少 API、返回 -1 或调用异常时返回诊断文本。
+    返回：成功时 None；SDK 缺少 API、返回非零 TransportResult 或调用异常时返回诊断文本。
     错误处理：不抛 SDK 异常，避免辅助灯光效果中断主图像刷新。
     副作用：成功时调用一次 `set_led_brightness(percent)`。
     """
@@ -4119,8 +4120,8 @@ def _set_n4pro_group_led_brightness(device: object, percent: int) -> str | None:
         result = setter(percent)
     except Exception as exc:
         return f"set_led_brightness failed: {type(exc).__name__}: {exc}"
-    if result == -1:
-        return "set_led_brightness failed: SDK returned -1"
+    if streamdock_sdk_result_failed(result):
+        return f"set_led_brightness failed: SDK returned {result}"
     return None
 
 
