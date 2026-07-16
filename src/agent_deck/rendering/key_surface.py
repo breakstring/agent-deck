@@ -11,6 +11,10 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from agent_deck.actions.keyboard import (
+    KeyboardShortcutSpec,
+    ShortcutIconSpec,
+)
 from agent_deck.core.state import AgentState
 from agent_deck.rendering.layout import KeyPlan
 from agent_deck.rendering.visuals import resolve_visual_icon_spec
@@ -32,6 +36,7 @@ class KeySurfaceKind(StrEnum):
     APP = "app"
     URL = "url"
     FOLDER = "folder"
+    KEYBOARD_SHORTCUT = "keyboard_shortcut"
     AGENT = "agent"
     QUOTA_STATUS = "quota_status"
     USAGE_SUMMARY = "usage_summary"
@@ -62,6 +67,8 @@ class N4ProKeyBinding(BaseModel):
     usage_period: str | None = None
     icon_token: str | None = None
     icon_color: str | None = None
+    shortcut: KeyboardShortcutSpec | None = None
+    icon: ShortcutIconSpec | None = None
 
     @field_validator("label", mode="before")
     @classmethod
@@ -124,6 +131,12 @@ class N4ProKeyBinding(BaseModel):
             raise ValueError("url key requires url")
         if self.kind == KeySurfaceKind.FOLDER and not self.path:
             raise ValueError("folder key requires path")
+        if self.kind == KeySurfaceKind.KEYBOARD_SHORTCUT and self.shortcut is None:
+            raise ValueError("keyboard_shortcut key requires shortcut")
+        if self.kind != KeySurfaceKind.KEYBOARD_SHORTCUT and self.shortcut is not None:
+            raise ValueError("shortcut is only valid for keyboard_shortcut keys")
+        if self.kind != KeySurfaceKind.KEYBOARD_SHORTCUT and self.icon is not None:
+            raise ValueError("shortcut icon is only valid for keyboard_shortcut keys")
         if (
             self.kind == KeySurfaceKind.QUOTA_STATUS
             and self.quota_window is not None
@@ -157,6 +170,8 @@ class N4ProKeyBinding(BaseModel):
             return self.url
         if self.kind == KeySurfaceKind.FOLDER and self.path:
             return self.path
+        if self.kind == KeySurfaceKind.KEYBOARD_SHORTCUT:
+            return "快捷键"
         if self.kind == KeySurfaceKind.QUOTA_STATUS:
             return "订阅 / 限额状态"
         if self.kind == KeySurfaceKind.USAGE_SUMMARY:
@@ -336,6 +351,17 @@ def _project_static_binding(binding: N4ProKeyBinding) -> KeyPlan:
             kind=binding.kind.value,
             action="open_path",
             payload=_compact_payload(path=binding.path),
+        )
+    if binding.kind == KeySurfaceKind.KEYBOARD_SHORTCUT:
+        return KeyPlan(
+            index=binding.index,
+            label=binding.display_label(),
+            intent="send_keyboard_shortcut",
+            role="user_action",
+            kind=binding.kind.value,
+            action="send_keyboard_shortcut",
+            shortcut=binding.shortcut,
+            shortcut_icon=binding.icon or ShortcutIconSpec(),
         )
     if binding.kind == KeySurfaceKind.QUOTA_STATUS:
         return KeyPlan(

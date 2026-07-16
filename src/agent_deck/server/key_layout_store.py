@@ -19,7 +19,8 @@ _KEY_LAYOUT_ENV = "AGENT_DECK_N4PRO_KEY_LAYOUT"
 _USER_KEY_LAYOUT_PATH = (
     Path.home() / "Library/Application Support/AgentDeck/n4pro-key-layout.json"
 )
-_STORE_VERSION = 1
+_STORE_VERSION = 2
+_SUPPORTED_STORE_VERSIONS = frozenset({1, 2})
 _DEVICE_PROFILE = "mirabox.n4pro"
 
 
@@ -71,6 +72,13 @@ def load_n4pro_key_layout(path: Path) -> N4ProKeyLayout | None:
         raise KeyLayoutStoreError(f"key layout 文件 {path} 不是合法 JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise KeyLayoutStoreError(f"key layout 文件 {path} 顶层必须是 object")
+    version = data.get("version")
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise KeyLayoutStoreError(f"key layout 文件 {path} 缺少合法整数 version")
+    if version not in _SUPPORTED_STORE_VERSIONS:
+        raise KeyLayoutStoreError(
+            f"key layout 文件 {path} 的 version 不支持: {version!r}"
+        )
     if data.get("device_profile") != _DEVICE_PROFILE:
         raise KeyLayoutStoreError(
             f"key layout 文件 {path} 的 device_profile 不支持: "

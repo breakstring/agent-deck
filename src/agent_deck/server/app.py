@@ -19,16 +19,30 @@ from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_deck.actions.app_icon_cache import (
     AppIconCache,
     resolve_app_icon_cache_root,
+)
+from agent_deck.actions.key_icon_store import (
+    ShortcutIconStore,
+    resolve_shortcut_icon_store_root,
+)
+from agent_deck.actions.keyboard import (
+    KeyboardShortcutExecutor,
+    KeyboardShortcutScheduler,
+    KeyboardShortcutSpec,
+)
+from agent_deck.actions.macos_keyboard import (
+    create_default_keyboard_shortcut_executor,
+    open_macos_accessibility_settings,
 )
 from agent_deck.actions.apps import (
     LocalAppActionResult,
@@ -140,6 +154,7 @@ from agent_deck.rendering.status_key import (
     render_quota_status_key_image,
     render_usage_summary_key_image,
 )
+from agent_deck.rendering.shortcut_key import ShortcutKeyImageCache
 from agent_deck.rendering.url_key import render_url_key_image, token_for_url
 from agent_deck.server.key_layout_store import (
     KeyLayoutStoreError,
@@ -168,6 +183,8 @@ VisibleSplashTouchscreenSink = Callable[[Any], StreamDockTouchscreenRenderResult
 LocalAppCatalogReader = Callable[[], tuple[LocalAppInfo, ...]]
 LocalAppActionExecutor = Callable[..., LocalAppActionResult]
 LocalUrlActionExecutor = Callable[..., LocalTargetActionResult]
+KeyboardAccessibilitySettingsOpener = Callable[[], None]
+"""由显式 GUI 操作调用、用于打开 macOS 辅助功能设置的可注入函数。"""
 
 _STREAMDOCK_TOUCH_TAP_DEBOUNCE_SECONDS = 0.45
 """真实 StreamDock touch bar 连续 touch_point 归并为一次 tap 的最短间隔。"""
@@ -262,6 +279,21 @@ class UrlIconUploadRequest(BaseModel):
     """
 
     url: str = Field(min_length=1)
+    filename: str | None = None
+    data_url: str = Field(min_length=1)
+
+
+class ShortcutIconUploadRequest(BaseModel):
+    """快捷键自定义图标上传请求体。
+
+    入参：``filename`` 是浏览器侧文件名；``data_url`` 是 FileReader 生成的 base64 图片。
+    返回：frozen 请求模型，供 ``/ui/shortcut-icons/upload`` 使用。
+    错误处理：缺少 data_url 或空字符串由 Pydantic/FastAPI 校验为 422。
+    副作用：模型自身不解码图片、不写资产。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
     filename: str | None = None
     data_url: str = Field(min_length=1)
 
@@ -703,8 +735,12 @@ class _DaemonRuntime:
     local_app_action_executor: LocalAppActionExecutor
     local_url_action_executor: LocalUrlActionExecutor
     system_control_executor: SystemControlExecutor
+    keyboard_shortcut_scheduler: KeyboardShortcutScheduler
+    keyboard_accessibility_settings_opener: KeyboardAccessibilitySettingsOpener
     app_icon_cache: AppIconCache
     url_icon_cache: UrlIconCache
+    shortcut_icon_store: ShortcutIconStore
+    shortcut_key_image_cache: ShortcutKeyImageCache
     status_key_image_cache: StatusKeyImageCache
     logical_panel_image_cache: LogicalPanelImageCache
     streamdock_quota_touchscreen_result: StreamDockTouchscreenRenderResult | None
@@ -1581,6 +1617,8 @@ class _DaemonRuntime:
                 )
             else:
                 action = _dry_run_action(intent, state=None)
+        elif intent.intent == "send_keyboard_shortcut":
+            action = self.submit_keyboard_shortcut(intent)
         elif intent.intent == "open_path":
             action = _unsupported_local_action(
                 intent,
@@ -1615,6 +1653,38 @@ class _DaemonRuntime:
             "interaction_intent": _dump_model(intent),
             "deck_selection": _dump_model(self.selection),
             "action": action,
+        }
+
+    def submit_keyboard_shortcut(self, intent: InteractionIntent) -> dict[str, Any]:
+        """把硬件快捷键意图无阻塞提交到单 worker executor。
+
+        入参：``intent`` 必须携带强类型 ``shortcut``；来源和 key index 用于任务诊断。
+        返回：JSON-safe 即时提交结果；accepted 不代表目标应用已处理，busy 时不会排队。
+        错误处理：缺 shortcut 返回 invalid_intent，不抛异常；线程池提交异常按原样传播。
+        副作用：accepted 时启动后台物理键序列；调用线程不等待执行完成。
+        """
+
+        if intent.shortcut is None:
+            return {
+                "intent": intent.intent,
+                "key_index": intent.key_index,
+                "status": "invalid_intent",
+                "ok": False,
+                "job_id": None,
+                "message": "keyboard shortcut intent is missing shortcut steps",
+            }
+        submission = self.keyboard_shortcut_scheduler.submit(
+            intent.shortcut,
+            source=intent.source,
+            key_index=intent.key_index,
+        )
+        return {
+            "intent": intent.intent,
+            "key_index": intent.key_index,
+            "status": submission.status.value,
+            "ok": submission.accepted,
+            "job_id": submission.job_id,
+            "message": submission.message,
         }
 
     def cycle_quota_status_window(self, intent: InteractionIntent) -> dict[str, Any]:
@@ -1765,6 +1835,8 @@ class _DaemonRuntime:
             resolved_layout,
             app_icon_cache=self.app_icon_cache,
             url_icon_cache=self.url_icon_cache,
+            shortcut_icon_store=self.shortcut_icon_store,
+            shortcut_key_cache=self.shortcut_key_image_cache,
             quota_snapshot=self.displayed_codex_quota_snapshot(),
             token_usage_snapshot=self.codex_token_usage_snapshot,
             status_key_cache=self.status_key_image_cache,
@@ -2264,6 +2336,7 @@ class _DaemonRuntime:
             "rotary_layout": _dump_model(self.current_rotary_layout_response()),
             "rotary_layout_last_error": self.rotary_layout_last_error,
             "hardware_capabilities": _dump_model(get_device_profile("mirabox.n4pro")),
+            "keyboard_shortcuts": self.keyboard_shortcut_diagnostics(),
             "render_count": self.surface.render_count,
             "pollers": {
                 "codex_app_state": {
@@ -2355,6 +2428,24 @@ class _DaemonRuntime:
                 "last_action": self.last_interaction_action,
                 "recent": list(self.recent_interactions),
             },
+        }
+
+    def keyboard_shortcut_diagnostics(self) -> dict[str, Any]:
+        """返回键盘权限、active job 和近期终态任务的 JSON-safe 诊断。
+
+        入参：无。
+        返回：capability、active 和 recent 三部分。
+        错误处理：平台 capability 检查异常按原样传播给 status/API。
+        副作用：只读 scheduler 与系统授权状态，不显示授权提示。
+        """
+
+        diagnostics = self.keyboard_shortcut_scheduler.diagnostics()
+        active = diagnostics["active"]
+        recent = diagnostics["recent"]
+        return {
+            "capability": _dump_model(diagnostics["capability"]),  # type: ignore[arg-type]
+            "active": _dump_optional_model(active),  # type: ignore[arg-type]
+            "recent": [_dump_model(item) for item in recent],  # type: ignore[union-attr]
         }
 
     def render_current(self) -> LayoutPlan:
@@ -2541,8 +2632,13 @@ def create_app(
     local_app_action_executor: LocalAppActionExecutor = open_or_focus_local_app,
     local_url_action_executor: LocalUrlActionExecutor = open_local_url,
     system_control_executor: SystemControlExecutor | None = None,
+    keyboard_shortcut_executor: KeyboardShortcutExecutor | None = None,
+    keyboard_accessibility_settings_opener: KeyboardAccessibilitySettingsOpener = (
+        open_macos_accessibility_settings
+    ),
     app_icon_cache_path: Path | None = None,
     url_icon_cache_path: Path | None = None,
+    shortcut_icon_store_path: Path | None = None,
     url_icon_fetcher: UrlIconFetcher | None = None,
     key_layout_path: Path | None = None,
     rotary_layout_path: Path | None = None,
@@ -2564,8 +2660,11 @@ def create_app(
     `focus_actions_enabled` 且目标 agent 有 focus target 时会被调用；`local_app_catalog_reader`
     支撑 GUI App 选择；`local_app_action_executor` 和 `local_url_action_executor`
     支撑本机快捷动作执行，测试可替换；
-    `app_icon_cache_path` 是 App 图标缓存根目录；`url_icon_cache_path` 是 URL favicon
-    缓存根目录；两者默认使用用户级 Application Support；`url_icon_fetcher` 供测试替换网络请求；
+    `keyboard_shortcut_executor` 是可注入物理键执行器，默认按平台选择 macOS/CoreGraphics 或
+    fail-closed 实现；`keyboard_accessibility_settings_opener` 只在用户显式点击后打开 macOS
+    辅助功能设置，测试可注入无副作用 fake；`app_icon_cache_path` 是 App 图标缓存根目录；`url_icon_cache_path` 是 URL
+    favicon 缓存根目录；`shortcut_icon_store_path` 是内容寻址自定义快捷键图标目录；这些路径
+    默认使用用户级 Application Support；`url_icon_fetcher` 供测试替换网络请求；
     `key_layout_path` 与 `rotary_layout_path` 为 None 时相应 GUI 布局只保存在进程内，传入路径时
     启动会读各自 JSON，保存会写回；`quota_presentation_path` 可选加载独立 quota 展示策略，
     只影响硬件显示而不改原始采集数据；`system_control_executor` 可注入 fake，默认按平台构造
@@ -2581,6 +2680,12 @@ def create_app(
     url_icon_cache = UrlIconCache(
         resolve_url_icon_cache_root(url_icon_cache_path),
         fetcher=url_icon_fetcher,
+    )
+    shortcut_icon_store = ShortcutIconStore(
+        resolve_shortcut_icon_store_root(shortcut_icon_store_path)
+    )
+    keyboard_shortcut_scheduler = KeyboardShortcutScheduler(
+        keyboard_shortcut_executor or create_default_keyboard_shortcut_executor()
     )
     initial_key_layout: N4ProKeyLayout | None = None
     initial_key_layout_source: str | None = None
@@ -2660,8 +2765,12 @@ def create_app(
         system_control_executor=(
             system_control_executor or create_default_system_control_executor()
         ),
+        keyboard_shortcut_scheduler=keyboard_shortcut_scheduler,
+        keyboard_accessibility_settings_opener=keyboard_accessibility_settings_opener,
         app_icon_cache=app_icon_cache,
         url_icon_cache=url_icon_cache,
+        shortcut_icon_store=shortcut_icon_store,
+        shortcut_key_image_cache=ShortcutKeyImageCache(),
         status_key_image_cache=StatusKeyImageCache(),
         logical_panel_image_cache=LogicalPanelImageCache(),
         streamdock_quota_touchscreen_result=None,
@@ -2785,6 +2894,7 @@ def create_app(
                 await _render_streamdock_n4pro_visible_splash(
                     visible_splash_touchscreen_sink,
                 )
+            runtime.keyboard_shortcut_scheduler.close()
             close_renderer = getattr(
                 resolved_streamdock_n4pro_renderer_sink,
                 "close",
@@ -2887,12 +2997,47 @@ def create_app(
         rotary = runtime.current_rotary_layout_response().layout
         return {
             "device_profile": _dump_model(get_device_profile("mirabox.n4pro")),
+            "keyboard_shortcuts": _dump_model(
+                runtime.keyboard_shortcut_scheduler.capability()
+            ),
             "system_display_targets": [
                 _dump_model(target)
                 for target in runtime.system_control_executor.list_display_targets()
             ],
             "selected_system_display_id": rotary.system_display_id,
         }
+
+    @app.post("/ui/keyboard-shortcuts/request-permission")
+    async def request_keyboard_shortcut_permission() -> dict[str, Any]:
+        """由用户显式点击后请求 macOS 键盘事件权限。
+
+        入参：无；路由只接受显式 POST，不在 daemon 启动或执行失败时自动调用。
+        返回：请求完成后的 JSON-safe capability。
+        错误处理：native 权限 API 异常返回 500。
+        副作用：macOS 可能显示辅助功能授权提示或引导用户打开隐私设置。
+        """
+
+        try:
+            capability = runtime.keyboard_shortcut_scheduler.request_permission()
+        except Exception as exc:  # noqa: BLE001 - native 错误需映射为明确 HTTP 诊断。
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return _dump_model(capability)
+
+    @app.post("/ui/keyboard-shortcuts/open-accessibility-settings")
+    async def open_keyboard_shortcut_accessibility_settings() -> dict[str, bool]:
+        """由用户显式点击后打开 macOS 辅助功能隐私设置。
+
+        入参：无；目标页面由固定 opener 决定，不接受 URL 或 shell 参数。
+        返回：成功时 ``{"opened": true}``。
+        错误处理：平台不支持、系统设置无法启动或 injected opener 失败时返回 500。
+        副作用：启动或聚焦系统设置；不会替用户修改授权开关。
+        """
+
+        try:
+            runtime.keyboard_accessibility_settings_opener()
+        except Exception as exc:  # noqa: BLE001 - 平台 opener 错误需映射成 UI 可见诊断。
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"opened": True}
 
     @app.get("/ui/apps")
     async def get_local_apps() -> dict[str, Any]:
@@ -3026,6 +3171,68 @@ def create_app(
         icon_path = runtime.url_icon_cache.resolve_file(cache_key, asset_name)
         if icon_path is None:
             raise HTTPException(status_code=404, detail="url icon is not cached")
+        return FileResponse(icon_path)
+
+    @app.get("/ui/shortcut-icons/auto-preview.png")
+    async def get_shortcut_auto_icon_preview(
+        spec: str = Query(min_length=1, max_length=12_000),
+    ) -> Response:
+        """返回与 N4 Pro 硬件下发共用 renderer 的快捷键自动图标。
+
+        入参：``spec`` 是 URL 编码后的 ``KeyboardShortcutSpec`` JSON。
+        返回：112px RGB PNG；Web 预览可直接把本路由用作 ``img.src``。
+        错误处理：JSON 或快捷键模型非法返回 422；PNG 编码异常按 500 传播。
+        副作用：只读取进程内自动图标缓存，并把图片编码到内存 buffer。
+        """
+
+        try:
+            shortcut = KeyboardShortcutSpec.model_validate_json(spec)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        image = runtime.shortcut_key_image_cache.image(shortcut)
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        return Response(
+            content=buffer.getvalue(),
+            media_type="image/png",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/ui/shortcut-icons/upload")
+    async def upload_shortcut_icon(body: ShortcutIconUploadRequest) -> dict[str, Any]:
+        """保存一个用户选择的快捷键自定义图标。
+
+        入参：body 包含可选文件名和 base64 data URL。
+        返回：内容寻址 asset id、原始尺寸和 Web/硬件 PNG URL。
+        错误处理：MIME、base64、图片、大小或尺寸非法返回 422；写入失败返回 500。
+        副作用：在快捷键图标 store 写规范化 PNG、96px 预览、112px key 图和 metadata。
+        """
+
+        try:
+            image_bytes = _decode_shortcut_icon_data_url(body.data_url)
+            asset = runtime.shortcut_icon_store.store(
+                image_bytes,
+                filename=body.filename,
+            )
+            return _dump_model(asset)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (OSError, binascii.Error) as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.get("/ui/shortcut-icons/{asset_id}/{asset_name}")
+    async def get_shortcut_icon(asset_id: str, asset_name: str) -> FileResponse:
+        """返回快捷键自定义图标的白名单派生 PNG。
+
+        入参：64 位内容 hash 和 preview-96.png/key-112.png 文件名。
+        返回：存在时返回 ``FileResponse``。
+        错误处理：非法 id、未知文件名或缺失资产返回 404。
+        副作用：只读图标 store 文件。
+        """
+
+        icon_path = runtime.shortcut_icon_store.resolve_file(asset_id, asset_name)
+        if icon_path is None:
+            raise HTTPException(status_code=404, detail="shortcut icon is not cached")
         return FileResponse(icon_path)
 
     @app.put("/ui/configuration")
@@ -3469,6 +3676,8 @@ def _key_images_from_layout(
     *,
     app_icon_cache: AppIconCache | None = None,
     url_icon_cache: UrlIconCache | None = None,
+    shortcut_icon_store: ShortcutIconStore | None = None,
+    shortcut_key_cache: ShortcutKeyImageCache | None = None,
     quota_snapshot: CodexQuotaSnapshot | None = None,
     token_usage_snapshot: CodexTokenUsageSnapshot | None = None,
     status_key_cache: StatusKeyImageCache | None = None,
@@ -3476,9 +3685,10 @@ def _key_images_from_layout(
     """从 layout 提取 N4 Pro 静态主键图片。
 
     入参：`layout` 是当前 daemon layout；`app_icon_cache` 是可选 App 图标缓存；
-    `url_icon_cache` 是可选 URL favicon 缓存；`quota_snapshot` 和 `token_usage_snapshot`
-    是 touchbar 面板已经复用的状态数据；`status_key_cache` 缓存状态按键渲染结果。
-    返回：物理按钮编号到 Pillow 图像的映射；包含 App、URL 和状态型主键。
+    `url_icon_cache` 是可选 URL favicon 缓存；`shortcut_icon_store` 只读自定义图标；
+    `shortcut_key_cache` 缓存自动快捷键图；`quota_snapshot` 和 `token_usage_snapshot` 是 touchbar
+    面板已经复用的状态数据；`status_key_cache` 缓存状态按键渲染结果。
+    返回：物理按钮编号到 Pillow 图像的映射；包含 App、URL、快捷键和状态型主键。
     错误处理：单个图标读取失败会 fallback 成 token 图，不影响整轮渲染。
     副作用：可能只读 `.app` bundle 图标资源或访问 favicon 缓存；状态图缓存 miss 时会创建
     内存图片；不访问硬件、不启动 App、不执行 ccusage。
@@ -3486,6 +3696,7 @@ def _key_images_from_layout(
 
     key_images: dict[int, Any] = {}
     resolved_status_key_cache = status_key_cache or StatusKeyImageCache()
+    resolved_shortcut_key_cache = shortcut_key_cache or ShortcutKeyImageCache()
     for key in layout.keys[:10]:
         if key.kind == "app":
             app_name = key.payload.get("app_name") or key.label
@@ -3515,6 +3726,20 @@ def _key_images_from_layout(
                 cached_url_image = url_icon_cache.key_image_for_url(url)
             key_images[key.index + 1] = cached_url_image or render_url_key_image(
                 url=url,
+            )
+        if key.kind == "keyboard_shortcut" and key.shortcut is not None:
+            custom_image = None
+            if (
+                shortcut_icon_store is not None
+                and key.shortcut_icon is not None
+                and key.shortcut_icon.mode.value == "custom"
+                and key.shortcut_icon.asset_id is not None
+            ):
+                custom_image = shortcut_icon_store.key_image(
+                    key.shortcut_icon.asset_id
+                )
+            key_images[key.index + 1] = (
+                custom_image or resolved_shortcut_key_cache.image(key.shortcut)
             )
         if key.kind == "quota_status" and quota_snapshot is not None:
             key_images[key.index + 1] = resolved_status_key_cache.quota_image(
@@ -4016,6 +4241,35 @@ def _decode_upload_data_url(data_url: str) -> bytes:
         return base64.b64decode(encoded, validate=True)
     except binascii.Error as exc:
         raise ValueError("invalid url icon base64 payload") from exc
+
+
+def _decode_shortcut_icon_data_url(data_url: str) -> bytes:
+    """解码快捷键图标上传的受限 base64 data URL。
+
+    入参：``data_url`` 应使用 PNG/JPEG/WebP/ICO MIME 且包含 base64 标记。
+    返回：原始图片 bytes；真实格式、5 MiB 和像素尺寸随后由 store 再校验。
+    错误处理：结构、MIME、非 base64 或 payload 非法时抛 ValueError。
+    副作用：无；只分配解码后的内存 bytes。
+    """
+
+    header, separator, encoded = data_url.partition(",")
+    if separator != "," or not header.startswith("data:") or ";base64" not in header:
+        raise ValueError("shortcut icon upload requires a base64 data URL")
+    media_type = header[5:].split(";", 1)[0].lower()
+    if media_type not in {
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/x-icon",
+        "image/vnd.microsoft.icon",
+    }:
+        raise ValueError(
+            f"unsupported shortcut icon media type: {media_type or '<none>'}"
+        )
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except binascii.Error as exc:
+        raise ValueError("invalid shortcut icon base64 payload") from exc
 
 
 def _dump_optional_model(model: BaseModel | None) -> dict[str, Any] | None:

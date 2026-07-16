@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent_deck.actions.keyboard import KeyboardShortcutSpec, ShortcutIconSpec
 from agent_deck.core.decisions import DecisionStatus, PendingDecision
 from agent_deck.core.modes import DeckMode, DeckSelection
 from agent_deck.core.state import AgentState, AgentStatus
@@ -60,6 +61,8 @@ class KeyPlan(BaseModel):
     kind: str | None = None
     action: str | None = None
     payload: dict[str, str] = Field(default_factory=dict)
+    shortcut: KeyboardShortcutSpec | None = None
+    shortcut_icon: ShortcutIconSpec | None = None
 
 
 class TouchscreenPlan(BaseModel):

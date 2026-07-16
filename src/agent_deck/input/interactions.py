@@ -12,6 +12,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent_deck.actions.keyboard import KeyboardShortcutSpec, ShortcutIconSpec
 from agent_deck.hardware.fake import HardwareInput
 from agent_deck.rendering.layout import KeyPlan, LayoutPlan
 
@@ -37,6 +38,8 @@ class InteractionIntent(BaseModel):
     decision_id: str | None = None
     action: str | None = None
     payload: dict[str, str] = Field(default_factory=dict)
+    shortcut: KeyboardShortcutSpec | None = None
+    shortcut_icon: ShortcutIconSpec | None = None
     dry_run: bool = True
 
 
@@ -137,10 +140,13 @@ def _intent_from_layout_key(
         decision_id=key.decision_id,
         action=key.action,
         payload=key.payload,
+        shortcut=key.shortcut,
+        shortcut_icon=key.shortcut_icon,
         dry_run=key.intent
         not in {
             "select_agent",
             "open_or_focus_app",
+            "send_keyboard_shortcut",
             "cycle_quota_status_window",
             "cycle_usage_summary_period",
         },

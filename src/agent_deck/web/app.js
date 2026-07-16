@@ -73,6 +73,11 @@ const state = {
   lastSaveStartedAt: null,
   keyLayoutSource: "default",
   urlIconCache: new Map(),
+  shortcutRecordingIndex: null,
+  shortcutManualOpenIndex: null,
+  shortcutPermissionDetailsOpen: false,
+  shortcutPermissionAction: null,
+  shortcutPermissionFeedback: null,
 };
 
 const el = {
@@ -132,6 +137,7 @@ function keyLabel(key) {
   if (key.kind === "unassigned") return "未设置快捷动作";
   if (key.kind === "app") return "打开或切换 App";
   if (key.kind === "url") return "打开网址";
+  if (key.kind === "keyboard_shortcut") return key.label || "键盘快捷键";
   if (key.kind === "agent") return "Agent 状态槽位";
   if (key.kind === "quota_status") return "订阅 / 限额状态";
   if (key.kind === "usage_summary") return "Token / 金额用量";
@@ -171,6 +177,74 @@ function usagePeriodLabel(value) {
   if (value === "month") return "Month";
   if (value === "all") return "All";
   return "Day";
+}
+
+const SHORTCUT_MODIFIERS = ["command", "control", "option", "shift"];
+const SHORTCUT_MODIFIER_SYMBOLS = {
+  command: "⌘",
+  control: "⌃",
+  option: "⌥",
+  shift: "⇧",
+};
+const SHORTCUT_SPECIAL_LABELS = {
+  Backquote: "`", Minus: "−", Equal: "=", BracketLeft: "[", BracketRight: "]",
+  Backslash: "\\", Semicolon: ";", Quote: "'", Comma: ",", Period: ".", Slash: "/",
+  Enter: "↩", Escape: "Esc", Backspace: "⌫", Tab: "⇥", Space: "Space",
+  Insert: "Ins", Delete: "Del", Home: "Home", End: "End", PageUp: "PgUp", PageDown: "PgDn",
+  ArrowUp: "↑", ArrowDown: "↓", ArrowLeft: "←", ArrowRight: "→",
+  NumpadDecimal: "Num .", NumpadMultiply: "Num ×", NumpadAdd: "Num +",
+  NumpadDivide: "Num ÷", NumpadEnter: "Num ↩", NumpadSubtract: "Num −",
+  NumpadEqual: "Num =", NumLock: "Clear",
+};
+const SHORTCUT_KEY_CODES = [
+  ..."ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("").map((letter) => `Key${letter}`),
+  ..."0123456789".split("").map((digit) => `Digit${digit}`),
+  "Backquote", "Minus", "Equal", "BracketLeft", "BracketRight", "Backslash",
+  "Semicolon", "Quote", "Comma", "Period", "Slash", "Enter", "Escape", "Backspace",
+  "Tab", "Space", "Insert", "Delete", "Home", "End", "PageUp", "PageDown",
+  "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+  ...Array.from({ length: 20 }, (_, index) => `F${index + 1}`),
+  ..."0123456789".split("").map((digit) => `Numpad${digit}`),
+  "NumpadDecimal", "NumpadMultiply", "NumpadAdd", "NumpadDivide", "NumpadEnter",
+  "NumpadSubtract", "NumpadEqual", "NumLock",
+];
+
+/** 将 W3C KeyboardEvent.code 转成硬件图标和序列列表共用的短标签。 */
+function shortcutKeyCodeLabel(code) {
+  if (!code) return "";
+  if (/^Key[A-Z]$/.test(code)) return code.slice(-1);
+  if (/^Digit[0-9]$/.test(code)) return code.slice(-1);
+  if (/^Numpad[0-9]$/.test(code)) return `Num ${code.slice(-1)}`;
+  return SHORTCUT_SPECIAL_LABELS[code] || code;
+}
+
+/** 返回一个步骤的 macOS 风格紧凑标签，例如 ⌘⇧P 或纯修饰键 ⇧。 */
+function shortcutStepLabel(step) {
+  const modifiers = SHORTCUT_MODIFIERS
+    .filter((modifier) => (step?.modifiers || []).includes(modifier))
+    .map((modifier) => SHORTCUT_MODIFIER_SYMBOLS[modifier])
+    .join("");
+  return `${modifiers}${shortcutKeyCodeLabel(step?.key)}` || "未设置";
+}
+
+/** 返回完整序列的单行摘要，供标题、choice 元信息和默认 label 使用。 */
+function shortcutSummary(shortcut) {
+  const steps = shortcut?.steps || [];
+  return steps.length ? steps.map(shortcutStepLabel).join(" → ") : "尚未设置";
+}
+
+/** 把快捷键草稿编码成由硬件 renderer 生成的同源 PNG 地址。 */
+function shortcutAutoPreviewUrl(shortcut) {
+  const spec = JSON.stringify(shortcut || { steps: [] });
+  return `/ui/shortcut-icons/auto-preview.png?spec=${encodeURIComponent(spec)}`;
+}
+
+/** 使用硬件 renderer 的 PNG；空序列只显示尚未配置占位。 */
+function renderShortcutAutoPreview(shortcut, className = "shortcut-auto-preview") {
+  if (!(shortcut?.steps || []).length) {
+    return `<div class="${className} empty" aria-label="尚未设置快捷键">+</div>`;
+  }
+  return `<img class="${className}" src="${escapeAttr(shortcutAutoPreviewUrl(shortcut))}" alt="${escapeAttr(`${shortcutSummary(shortcut)} 自动图标`)}">`;
 }
 
 function runtimeAgents() {
@@ -222,6 +296,24 @@ function uiKeyFromBinding(binding) {
       iconToken: tokenForUrl(binding.url),
       iconStatus: "使用域名缩写",
       iconLoading: false,
+    };
+  }
+  if (binding.kind === "keyboard_shortcut") {
+    const icon = binding.icon || { mode: "auto", asset_id: null };
+    return {
+      ...base,
+      role: "quick",
+      kind: "keyboard_shortcut",
+      label: binding.label || "",
+      shortcut: structuredClone(binding.shortcut || { steps: [] }),
+      shortcutIcon: {
+        mode: icon.mode === "custom" ? "custom" : "auto",
+        assetId: icon.asset_id || null,
+      },
+      shortcutIconUrl: icon.asset_id
+        ? `/ui/shortcut-icons/${encodeURIComponent(icon.asset_id)}/preview-96.png`
+        : "",
+      shortcutIconLoading: false,
     };
   }
   if (binding.kind === "agent") {
@@ -312,6 +404,23 @@ function bindingFromUiKey(key) {
       url: key.url || "https://agent.deck.local",
     };
   }
+  if (key.kind === "keyboard_shortcut") {
+    return {
+      index: key.index,
+      kind: "keyboard_shortcut",
+      label: key.label || shortcutSummary(key.shortcut),
+      shortcut: {
+        steps: (key.shortcut?.steps || []).map((step, index, steps) => ({
+          key: step.key || null,
+          modifiers: [...(step.modifiers || [])],
+          delay_after_ms: index === steps.length - 1 ? 0 : Number(step.delay_after_ms || 0),
+        })),
+      },
+      icon: key.shortcutIcon?.mode === "custom"
+        ? { mode: "custom", asset_id: key.shortcutIcon.assetId }
+        : { mode: "auto", asset_id: null },
+    };
+  }
   if (key.kind === "agent") {
     return { index: key.index, kind: "agent", label: "Agent" };
   }
@@ -355,6 +464,12 @@ function renderKeyFace(key) {
     }
     return `<div class="url-icon">${escapeHtml(key.iconToken || tokenForUrl(key.url))}</div>`;
   }
+  if (key.kind === "keyboard_shortcut") {
+    if (key.shortcutIcon?.mode === "custom" && key.shortcutIconUrl) {
+      return `<div class="shortcut-custom-stack">${renderShortcutAutoPreview(key.shortcut, "shortcut-key-preview")}<img class="shortcut-custom-icon" src="${escapeAttr(key.shortcutIconUrl)}" alt=""></div>`;
+    }
+    return renderShortcutAutoPreview(key.shortcut, "shortcut-key-preview");
+  }
   if (key.kind === "agent") {
     const agent = agentForSlot(key.slot);
     return `<div class="agent-visual ${agentVisualClass(agent)}"></div>`;
@@ -396,6 +511,9 @@ function renderKeys() {
 
   el.keyGrid.querySelectorAll(".deck-key").forEach((button) => {
     button.addEventListener("click", () => {
+      state.shortcutRecordingIndex = null;
+      state.shortcutManualOpenIndex = null;
+      state.shortcutPermissionDetailsOpen = false;
       state.selectedIndex = Number(button.dataset.key);
       state.selectedSurface = "key";
       render();
@@ -472,6 +590,147 @@ function renderUrlIconControls(key) {
   `;
 }
 
+/** 渲染快捷键的序列编辑、录制、手动添加、权限和图标控件。 */
+function renderShortcutControls(key) {
+  const steps = key.shortcut?.steps || [];
+  const capability = state.controlCapabilities?.keyboard_shortcuts;
+  const requester = capability?.permission_requester;
+  const permissionPending = state.shortcutPermissionAction !== null;
+  const permissionClass = capability?.permission_granted ? " granted" : "";
+  const permissionMessage = capability?.supported === false
+    ? capability.message || "当前平台不支持键盘快捷键"
+    : capability?.permission_granted
+      ? "当前快捷键执行宿主已获得键盘事件投递权限。"
+      : capability?.message || "需要 macOS 辅助功能权限才能执行";
+  const permissionStatus = capability === undefined
+    ? "正在检查"
+    : capability.supported === false
+      ? "不可用"
+      : capability.permission_granted
+        ? "已授权"
+        : "尚未授权";
+  const requesterName = requester?.display_name || "当前 agent-deckd 执行宿主";
+  const requesterPath = requester?.executable_path
+    ? `<code class="shortcut-permission-path" title="${escapeAttr(requester.executable_path)}">${escapeHtml(requester.executable_path)}</code>`
+    : "";
+  const requesterNote = requester?.note
+    ? `<small class="shortcut-permission-note${requester.stable_identity ? "" : " warning"}">${escapeHtml(requester.note)}</small>`
+    : "";
+  const permissionFeedback = state.shortcutPermissionFeedback
+    ? `<div class="shortcut-permission-feedback ${escapeAttr(state.shortcutPermissionFeedback.tone)}" role="status">${escapeHtml(state.shortcutPermissionFeedback.message)}</div>`
+    : "";
+  const recording = state.shortcutRecordingIndex === key.index;
+  const permissionDetailsOpen = state.shortcutPermissionDetailsOpen;
+  const stopWillApply = recording && state.dirty && steps.length > 0;
+  const recordLabel = recording
+    ? stopWillApply ? "停止并应用" : "停止录制"
+    : steps.length ? "继续录制" : "开始录制";
+  const recordNote = recording
+    ? `录制中 · 已记录 ${steps.length} 步；可继续按键，完成后点击“${stopWillApply ? "停止并应用" : "停止录制"}”。`
+    : steps.length
+      ? "可继续录制或编辑步骤；“应用到硬件”与顶部“保存并应用”是同一个动作。"
+      : "开始后可连续记录按键；纯修饰键请使用手动添加。";
+  const stepRows = steps.length
+    ? steps.map((step, index) => `
+      <div class="shortcut-step" data-step="${index}">
+        <div class="shortcut-step-main">
+          <span class="shortcut-step-number">${index + 1}</span>
+          <strong>${escapeHtml(shortcutStepLabel(step))}</strong>
+          <code>${escapeHtml(step.key || "modifier-only")}</code>
+        </div>
+        <div class="shortcut-step-actions">
+          ${index > 0 ? `<button type="button" class="mini-button" data-step-action="up" data-step-index="${index}" aria-label="上移步骤 ${index + 1}">↑</button>` : ""}
+          ${index < steps.length - 1 ? `<button type="button" class="mini-button" data-step-action="down" data-step-index="${index}" aria-label="下移步骤 ${index + 1}">↓</button>` : ""}
+          <button type="button" class="mini-button danger" data-step-action="delete" data-step-index="${index}" aria-label="删除步骤 ${index + 1}">×</button>
+        </div>
+        ${index < steps.length - 1 ? `
+          <label class="shortcut-delay">释放后等待
+            <input class="delay-input" data-step-delay="${index}" type="number" min="0" max="2000" step="10" value="${Number(step.delay_after_ms || 0)}">
+            <span>ms</span>
+          </label>` : '<div class="shortcut-delay terminal">序列结束 · 不等待</div>'}
+      </div>
+    `).join("")
+    : '<div class="shortcut-empty">先录制一步，或用手动选择器添加按键。</div>';
+  const keyOptions = [
+    '<option value="">仅修饰键</option>',
+    ...SHORTCUT_KEY_CODES.map((code) => `<option value="${escapeAttr(code)}">${escapeHtml(shortcutKeyCodeLabel(code))} · ${escapeHtml(code)}</option>`),
+  ].join("");
+  const iconPreview = key.shortcutIcon?.mode === "custom" && key.shortcutIconUrl
+    ? `<div class="shortcut-custom-stack">${renderShortcutAutoPreview(key.shortcut)}<img class="shortcut-icon-preview-img" src="${escapeAttr(key.shortcutIconUrl)}" alt=""></div>`
+    : renderShortcutAutoPreview(key.shortcut);
+
+  return `
+    <div class="field-group">
+      <div class="field-label">名称</div>
+      ${textField("shortcutLabel", "按键标签", key.label || "", shortcutSummary(key.shortcut))}
+    </div>
+    <div class="shortcut-permission-shell${permissionDetailsOpen ? " open" : ""}">
+      <div class="shortcut-permission${permissionClass}">
+        <div class="shortcut-permission-heading">
+          <strong>辅助功能</strong>
+          <span class="shortcut-permission-badge">${permissionStatus}</span>
+        </div>
+        <div class="shortcut-permission-summary-actions">
+          ${capability?.supported !== false && !capability?.permission_granted && capability?.can_request_permission
+            ? `<button id="requestShortcutPermission" class="ghost-button compact" type="button"${permissionPending ? " disabled" : ""}>${state.shortcutPermissionAction === "request" ? "授权中" : "去授权"}</button>`
+            : ""}
+          <button id="toggleShortcutPermissionDetails" class="shortcut-permission-details" type="button" aria-expanded="${permissionDetailsOpen}" aria-controls="shortcutPermissionDetails" title="悬停或点击查看授权对象与操作">详情</button>
+        </div>
+      </div>
+      <div id="shortcutPermissionDetails" class="shortcut-permission-popover" role="group" aria-label="辅助功能权限详情">
+        <small>${escapeHtml(permissionMessage)}</small>
+        ${capability?.supported === false ? "" : `<small class="shortcut-permission-target">授权对象：<strong>${escapeHtml(requesterName)}</strong>；浏览器无需授权。</small>`}
+        ${requesterPath}
+        ${requesterNote}
+        ${permissionFeedback}
+        ${capability?.supported === false ? "" : `
+        <div class="shortcut-permission-actions">
+          ${capability?.can_open_system_settings
+            ? `<button id="openShortcutAccessibilitySettings" class="ghost-button compact" type="button"${permissionPending ? " disabled" : ""}>${state.shortcutPermissionAction === "settings" ? "正在打开" : "打开辅助功能设置"}</button>`
+            : ""}
+          <button id="recheckShortcutPermission" class="ghost-button compact" type="button"${permissionPending ? " disabled" : ""}>${state.shortcutPermissionAction === "check" ? "正在检查" : "重新检查"}</button>
+        </div>`}
+      </div>
+    </div>
+    <div class="field-group">
+      <div class="field-label">动作序列 · ${steps.length}/16</div>
+      <div class="shortcut-steps">${stepRows}</div>
+      <div class="shortcut-record-actions">
+        <button id="recordShortcutStep" class="ghost-button${recording ? " recording" : ""}" type="button">${recordLabel}</button>
+        ${!recording && steps.length ? `<button id="applyShortcut" class="primary-button shortcut-apply-button" type="button"${!state.dirty || state.saving ? " disabled" : ""} title="与顶部保存并应用相同，会保存整份设备配置">${state.saving ? "保存中" : state.dirty ? "应用到硬件" : state.awaitingHardwareApply ? "等待下发" : "已应用"}</button>` : ""}
+      </div>
+      <p class="control-note">${escapeHtml(recordNote)}</p>
+    </div>
+    <details class="shortcut-manual"${state.shortcutManualOpenIndex === key.index ? " open" : ""}>
+      <summary>手动添加步骤</summary>
+      <div class="shortcut-manual-body">
+        <label class="text-field" for="manualShortcutKey"><span>物理按键</span>
+          <select id="manualShortcutKey" class="select-input">${keyOptions}</select>
+        </label>
+        <div class="modifier-picker" aria-label="修饰键">
+          ${SHORTCUT_MODIFIERS.map((modifier) => `
+            <label><input type="checkbox" data-manual-modifier="${modifier}"><span>${SHORTCUT_MODIFIER_SYMBOLS[modifier]} ${modifier}</span></label>
+          `).join("")}
+        </div>
+        <button id="addManualShortcutStep" class="ghost-button compact" type="button">添加步骤</button>
+      </div>
+    </details>
+    <div class="field-group">
+      <div class="field-label">默认图标</div>
+      <div class="shortcut-icon-control">
+        <div class="shortcut-icon-preview">${iconPreview}</div>
+        <div class="shortcut-icon-actions">
+          <button type="button" class="icon-mode-button${key.shortcutIcon?.mode !== "custom" ? " active" : ""}" data-shortcut-icon-mode="auto">自动生成</button>
+          <button type="button" class="icon-mode-button${key.shortcutIcon?.mode === "custom" ? " active" : ""}" data-shortcut-icon-mode="custom">自定义图片</button>
+          <button id="chooseShortcutIcon" class="ghost-button compact" type="button"${key.shortcutIconLoading ? " disabled" : ""}>${key.shortcutIconLoading ? "正在上传" : "选择图片"}</button>
+          <input id="shortcutIconFile" class="hidden-file-input" type="file" accept="image/png,image/jpeg,image/webp,image/x-icon,image/vnd.microsoft.icon">
+        </div>
+      </div>
+      <div class="url-icon-status">自定义图片缺失时，硬件会自动回退到组合键图标。</div>
+    </div>
+  `;
+}
+
 function renderKeyInspector() {
   const key = state.keys[state.selectedIndex];
   el.selectedEyebrow.textContent = `Key ${key.index + 1}`;
@@ -483,6 +742,8 @@ function renderKeyInspector() {
         ? "按下后切换 Auto、5H、Week 的订阅状态图。"
         : key.kind === "usage_summary"
           ? "按下后切换 Day、Week、Month、All 的 Token/金额统计图。"
+      : key.kind === "keyboard_shortcut"
+        ? "按下后向执行开始时的前台 App 发送一个物理键、组合键或有序序列。"
       : key.kind === "disabled"
         ? "这个键暂不显示内容，也不会响应按下。"
         : "修改只更新 GUI 预览，保存并应用后才下发。";
@@ -511,6 +772,11 @@ function renderKeyInspector() {
       detailRow("周期", usagePeriodLabel(key.usagePeriod)) +
       detailRow("按下", "切换 Day / Week / Month / All") +
       detailRow("数据", "复用 touch bar ccusage 快照");
+  } else if (key.kind === "keyboard_shortcut") {
+    details =
+      detailRow("序列", shortcutSummary(key.shortcut)) +
+      detailRow("目标", "执行开始时的前台 App") +
+      detailRow("并发", "执行中再次按下会返回忙碌");
   }
 
   el.inspectorBody.innerHTML = `
@@ -519,6 +785,7 @@ function renderKeyInspector() {
       <div class="choice-grid">
         ${choiceButton("app", "打开或切换 App", key.kind === "app" ? key.app.name : "")}
         ${choiceButton("url", "打开网址", "")}
+        ${choiceButton("keyboard_shortcut", "键盘快捷键", key.kind === "keyboard_shortcut" ? shortcutSummary(key.shortcut) : "")}
         ${choiceButton("quota_status", "订阅 / 限额状态", key.kind === "quota_status" ? quotaWindowLabel(key.quotaWindow) : "")}
         ${choiceButton("usage_summary", "Token / 金额用量", key.kind === "usage_summary" ? usagePeriodLabel(key.usagePeriod) : "")}
         ${choiceButton("agent", "Agent 状态", key.kind === "agent" ? `槽位 ${key.slot}` : "")}
@@ -535,6 +802,7 @@ function renderKeyInspector() {
         ? renderUrlIconControls(key)
         : ""
     }
+    ${key.kind === "keyboard_shortcut" ? renderShortcutControls(key) : ""}
     ${details ? `<div class="field-group"><div class="field-label">当前配置</div>${details}</div>` : ""}
     ${
       key.kind === "app"
@@ -581,6 +849,255 @@ function renderKeyInspector() {
     });
   }
 
+  if (key.kind === "keyboard_shortcut") {
+    bindShortcutControls(key);
+  }
+
+}
+
+/** 追加步骤并返回是否成功；达到 16 步时停止录制但保留现有草稿。 */
+function appendShortcutStep(key, step) {
+  const steps = key.shortcut?.steps || [];
+  if (steps.length >= 16) {
+    el.toast.textContent = "一个快捷键最多包含 16 个步骤";
+    state.shortcutRecordingIndex = null;
+    render();
+    return false;
+  }
+  if (steps.length) steps[steps.length - 1].delay_after_ms = 100;
+  steps.push({
+    key: step.key || null,
+    modifiers: SHORTCUT_MODIFIERS.filter((modifier) => (step.modifiers || []).includes(modifier)),
+    delay_after_ms: 0,
+  });
+  key.shortcut = { steps };
+  markDirty(key);
+  render();
+  return true;
+}
+
+/** 为当前快捷键 inspector 绑定序列、权限和图标控件事件。 */
+function bindShortcutControls(key) {
+  const manualDetails = el.inspectorBody.querySelector("details.shortcut-manual");
+  manualDetails?.addEventListener("toggle", () => {
+    state.shortcutManualOpenIndex = manualDetails.open ? key.index : null;
+    if (manualDetails.open && state.shortcutRecordingIndex === key.index) {
+      state.shortcutRecordingIndex = null;
+      render();
+    }
+  });
+
+  document.getElementById("shortcutLabel")?.addEventListener("input", (event) => {
+    key.label = event.target.value.trimStart();
+    markDirty(key);
+    el.selectedTitle.textContent = keyLabel(key);
+  });
+
+  document.getElementById("recordShortcutStep")?.addEventListener("click", () => {
+    if (state.shortcutRecordingIndex === key.index) {
+      const shouldApply = state.dirty && (key.shortcut?.steps || []).length > 0;
+      state.shortcutRecordingIndex = null;
+      render();
+      if (shouldApply) saveAndApply();
+      return;
+    }
+    state.shortcutManualOpenIndex = null;
+    state.shortcutRecordingIndex = key.index;
+    el.toast.textContent = "录制已开始；请按下一个或多个物理按键";
+    render();
+  });
+
+  document.getElementById("applyShortcut")?.addEventListener("click", saveAndApply);
+
+  document.getElementById("addManualShortcutStep")?.addEventListener("click", () => {
+    const selectedKey = document.getElementById("manualShortcutKey")?.value || null;
+    const modifiers = Array.from(document.querySelectorAll("[data-manual-modifier]:checked"))
+      .map((input) => input.dataset.manualModifier);
+    if (!selectedKey && !modifiers.length) {
+      el.toast.textContent = "请选择物理按键或至少一个修饰键";
+      return;
+    }
+    state.shortcutRecordingIndex = null;
+    appendShortcutStep(key, { key: selectedKey, modifiers });
+  });
+
+  el.inspectorBody.querySelectorAll("[data-step-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.stepIndex);
+      const steps = key.shortcut?.steps || [];
+      if (!Number.isInteger(index) || !steps[index]) return;
+      if (button.dataset.stepAction === "delete") {
+        steps.splice(index, 1);
+      } else if (button.dataset.stepAction === "up" && index > 0) {
+        [steps[index - 1], steps[index]] = [steps[index], steps[index - 1]];
+      } else if (button.dataset.stepAction === "down" && index < steps.length - 1) {
+        [steps[index], steps[index + 1]] = [steps[index + 1], steps[index]];
+      }
+      steps.forEach((step, stepIndex) => {
+        if (stepIndex === steps.length - 1) step.delay_after_ms = 0;
+        else if (!Number.isFinite(Number(step.delay_after_ms))) step.delay_after_ms = 100;
+      });
+      markDirty(key);
+      render();
+    });
+  });
+
+  el.inspectorBody.querySelectorAll("[data-step-delay]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const index = Number(input.dataset.stepDelay);
+      const step = key.shortcut?.steps?.[index];
+      if (!step) return;
+      step.delay_after_ms = Math.max(0, Math.min(2000, Number(input.value) || 0));
+      input.value = String(step.delay_after_ms);
+      markDirty(key);
+    });
+  });
+
+  el.inspectorBody.querySelectorAll("[data-shortcut-icon-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const mode = button.dataset.shortcutIconMode;
+      if (mode === "custom" && !key.shortcutIcon?.assetId) {
+        document.getElementById("shortcutIconFile")?.click();
+        return;
+      }
+      key.shortcutIcon = mode === "custom"
+        ? { mode: "custom", assetId: key.shortcutIcon.assetId }
+        : { mode: "auto", assetId: null };
+      markDirty(key);
+      render();
+    });
+  });
+
+  const chooseIcon = document.getElementById("chooseShortcutIcon");
+  const iconFile = document.getElementById("shortcutIconFile");
+  if (chooseIcon && iconFile) {
+    chooseIcon.addEventListener("click", () => iconFile.click());
+    iconFile.addEventListener("change", () => {
+      const file = iconFile.files?.[0];
+      if (file) uploadShortcutIconForKey(key.index, file);
+      iconFile.value = "";
+    });
+  }
+
+  document.getElementById("requestShortcutPermission")?.addEventListener("click", requestShortcutPermission);
+  document.getElementById("toggleShortcutPermissionDetails")?.addEventListener("click", () => {
+    state.shortcutPermissionDetailsOpen = !state.shortcutPermissionDetailsOpen;
+    render();
+  });
+  document.getElementById("openShortcutAccessibilitySettings")?.addEventListener("click", openShortcutAccessibilitySettings);
+  document.getElementById("recheckShortcutPermission")?.addEventListener("click", recheckShortcutPermission);
+}
+
+/** 从显式按钮请求 macOS 键盘事件权限，并刷新 capability banner。 */
+async function requestShortcutPermission() {
+  state.shortcutPermissionAction = "request";
+  state.shortcutPermissionFeedback = {
+    tone: "info",
+    message: "正在由当前 Agent 后台进程请求 macOS 权限……",
+  };
+  render();
+  try {
+    const response = await fetch("/ui/keyboard-shortcuts/request-permission", { method: "POST" });
+    if (!response.ok) throw new Error(`permission ${response.status}`);
+    const capability = await response.json();
+    state.controlCapabilities = state.controlCapabilities || {};
+    state.controlCapabilities.keyboard_shortcuts = capability;
+    state.shortcutPermissionDetailsOpen = !capability.permission_granted;
+    state.shortcutPermissionFeedback = capability.permission_granted
+      ? { tone: "success", message: "当前快捷键执行宿主已获得权限。" }
+      : { tone: "warning", message: "系统尚未授权。请打开辅助功能设置，启用刚出现的执行宿主条目，然后点“重新检查”。" };
+    el.toast.textContent = state.shortcutPermissionFeedback.message;
+  } catch (error) {
+    state.shortcutPermissionDetailsOpen = true;
+    state.shortcutPermissionFeedback = { tone: "error", message: `权限请求失败：${error.message}` };
+    el.toast.textContent = state.shortcutPermissionFeedback.message;
+  } finally {
+    state.shortcutPermissionAction = null;
+    render();
+  }
+}
+
+/** 从显式按钮让 daemon 打开固定的 macOS 辅助功能设置页面。 */
+async function openShortcutAccessibilitySettings() {
+  state.shortcutPermissionDetailsOpen = true;
+  state.shortcutPermissionAction = "settings";
+  state.shortcutPermissionFeedback = { tone: "info", message: "正在打开 macOS 辅助功能设置……" };
+  render();
+  try {
+    const response = await fetch("/ui/keyboard-shortcuts/open-accessibility-settings", { method: "POST" });
+    if (!response.ok) throw new Error(`system settings ${response.status}`);
+    state.shortcutPermissionFeedback = {
+      tone: "info",
+      message: "系统设置已打开。请授权当前执行宿主；浏览器不需要授权。完成后返回并点“重新检查”。",
+    };
+    el.toast.textContent = state.shortcutPermissionFeedback.message;
+  } catch (error) {
+    state.shortcutPermissionFeedback = { tone: "error", message: `系统设置打开失败：${error.message}` };
+    el.toast.textContent = state.shortcutPermissionFeedback.message;
+  } finally {
+    state.shortcutPermissionAction = null;
+    render();
+  }
+}
+
+/** 重新读取 daemon 当前键盘事件权限，并在卡片内显示结果。 */
+async function recheckShortcutPermission() {
+  state.shortcutPermissionAction = "check";
+  state.shortcutPermissionFeedback = { tone: "info", message: "正在重新检查当前执行宿主权限……" };
+  render();
+  try {
+    const response = await fetch("/ui/control-capabilities", { cache: "no-store" });
+    if (!response.ok) throw new Error(`control capabilities ${response.status}`);
+    state.controlCapabilities = await response.json();
+    const capability = state.controlCapabilities.keyboard_shortcuts;
+    state.shortcutPermissionFeedback = capability?.permission_granted
+      ? { tone: "success", message: "权限检查通过，可以执行快捷键。" }
+      : { tone: "warning", message: "仍未检测到权限。请确认授权的是当前执行宿主，而不是浏览器。" };
+    el.toast.textContent = state.shortcutPermissionFeedback.message;
+  } catch (error) {
+    state.shortcutPermissionFeedback = { tone: "error", message: `权限检查失败：${error.message}` };
+    el.toast.textContent = state.shortcutPermissionFeedback.message;
+  } finally {
+    state.shortcutPermissionAction = null;
+    render();
+  }
+}
+
+/** 上传快捷键自定义图标并把内容寻址 asset id 写入当前 GUI 草稿。 */
+async function uploadShortcutIconForKey(index, file) {
+  if (file.size > 5 * 1024 * 1024) {
+    el.toast.textContent = "快捷键图标不能超过 5 MiB";
+    return;
+  }
+  const key = state.keys.find((item) => item.index === index);
+  if (!key || key.kind !== "keyboard_shortcut") return;
+  key.shortcutIconLoading = true;
+  render();
+  try {
+    const dataUrl = await fileToDataUrl(file);
+    const response = await fetch("/ui/shortcut-icons/upload", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ filename: file.name, data_url: dataUrl }),
+    });
+    if (!response.ok) {
+      const errorBody = await response.json().catch(() => ({}));
+      throw new Error(errorBody.detail || `upload ${response.status}`);
+    }
+    const asset = await response.json();
+    const current = state.keys.find((item) => item.index === index);
+    if (!current || current.kind !== "keyboard_shortcut") return;
+    current.shortcutIcon = { mode: "custom", assetId: asset.asset_id };
+    current.shortcutIconUrl = asset.preview_url;
+    current.shortcutIconLoading = false;
+    markDirty(current);
+    render();
+  } catch (error) {
+    const current = state.keys.find((item) => item.index === index);
+    if (current) current.shortcutIconLoading = false;
+    el.toast.textContent = `快捷键图标上传失败：${error.message}`;
+    render();
+  }
 }
 
 /**
@@ -746,6 +1263,9 @@ function markRotaryDirty() {
 
 function updateKeyKind(kind) {
   const key = state.keys[state.selectedIndex];
+  state.shortcutRecordingIndex = null;
+  state.shortcutManualOpenIndex = null;
+  state.shortcutPermissionDetailsOpen = false;
   if (kind === "app") {
     openAppModal();
     return;
@@ -759,6 +1279,18 @@ function updateKeyKind(kind) {
       iconToken: "AD",
       iconStatus: "使用域名缩写",
       iconLoading: false,
+    });
+  } else if (kind === "keyboard_shortcut") {
+    Object.assign(key, {
+      role: "quick",
+      kind: "keyboard_shortcut",
+      label: key.kind === "keyboard_shortcut" ? key.label || "" : "",
+      shortcut: key.kind === "keyboard_shortcut" ? key.shortcut || { steps: [] } : { steps: [] },
+      shortcutIcon: key.kind === "keyboard_shortcut"
+        ? key.shortcutIcon || { mode: "auto", assetId: null }
+        : { mode: "auto", assetId: null },
+      shortcutIconUrl: key.kind === "keyboard_shortcut" ? key.shortcutIconUrl || "" : "",
+      shortcutIconLoading: false,
     });
   } else if (kind === "agent") {
     const agentCountBefore = state.keys.filter((item) => item.kind === "agent" && item.index < key.index).length;
@@ -1228,9 +1760,16 @@ async function refreshAppIcons() {
  * 保存当前 GUI 预览并请求 daemon 应用到硬件；失败时保留本地状态并提示错误。
  */
 async function saveAndApply() {
+  state.shortcutRecordingIndex = null;
+  const validationError = validateShortcutDrafts();
+  if (validationError) {
+    el.toast.textContent = validationError;
+    render();
+    return;
+  }
   const saveStartedAt = Date.now();
   state.saving = true;
-  renderSyncState();
+  render();
   el.toast.textContent = "";
   try {
     const response = await fetch("/ui/configuration", {
@@ -1269,6 +1808,69 @@ async function saveAndApply() {
     }, 3200);
   }
 }
+
+/** 在发送完整配置前校验快捷键步骤数、时长和自定义图标引用。 */
+function validateShortcutDrafts() {
+  for (const key of state.keys) {
+    if (key.kind !== "keyboard_shortcut") continue;
+    const steps = key.shortcut?.steps || [];
+    if (!steps.length) return `Key ${key.index + 1} 还没有快捷键步骤`;
+    if (steps.length > 16) return `Key ${key.index + 1} 超过 16 个步骤`;
+    const duration = steps.length * 20 + steps.reduce((sum, step, index) => {
+      const delay = index === steps.length - 1 ? 0 : Number(step.delay_after_ms || 0);
+      return sum + delay;
+    }, 0);
+    if (steps.some((step) => Number(step.delay_after_ms || 0) < 0 || Number(step.delay_after_ms || 0) > 2000)) {
+      return `Key ${key.index + 1} 的步骤间隔必须在 0–2000 ms`;
+    }
+    if (duration > 10000) return `Key ${key.index + 1} 的序列总时长不能超过 10 秒`;
+    if (key.shortcutIcon?.mode === "custom" && !key.shortcutIcon.assetId) {
+      return `Key ${key.index + 1} 尚未上传自定义图标`;
+    }
+  }
+  return "";
+}
+
+window.addEventListener("keydown", (event) => {
+  if (state.shortcutRecordingIndex === null) {
+    if (event.key === "Escape" && state.shortcutPermissionDetailsOpen) {
+      state.shortcutPermissionDetailsOpen = false;
+      render();
+    }
+    return;
+  }
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  if (event.repeat) return;
+  if (["MetaLeft", "MetaRight", "ControlLeft", "ControlRight", "AltLeft", "AltRight", "ShiftLeft", "ShiftRight"].includes(event.code)) {
+    el.toast.textContent = "继续按主键；纯修饰键步骤可在手动选择器中添加";
+    return;
+  }
+  if (!SHORTCUT_KEY_CODES.includes(event.code)) {
+    el.toast.textContent = `暂不支持物理键 ${event.code || event.key}`;
+    return;
+  }
+  const key = state.keys.find((item) => item.index === state.shortcutRecordingIndex);
+  if (!key || key.kind !== "keyboard_shortcut") {
+    state.shortcutRecordingIndex = null;
+    return;
+  }
+  const modifiers = [];
+  if (event.metaKey) modifiers.push("command");
+  if (event.ctrlKey) modifiers.push("control");
+  if (event.altKey) modifiers.push("option");
+  if (event.shiftKey) modifiers.push("shift");
+  if (appendShortcutStep(key, { key: event.code, modifiers })) {
+    el.toast.textContent = `已录制 ${shortcutStepLabel({ key: event.code, modifiers })} · 共 ${key.shortcut.steps.length} 步`;
+  }
+}, { capture: true });
+
+document.addEventListener("click", (event) => {
+  if (!state.shortcutPermissionDetailsOpen) return;
+  if (event.target.closest?.(".shortcut-permission-shell")) return;
+  state.shortcutPermissionDetailsOpen = false;
+  render();
+});
 
 el.saveButton.addEventListener("click", saveAndApply);
 el.themeToggle?.addEventListener("click", () => {

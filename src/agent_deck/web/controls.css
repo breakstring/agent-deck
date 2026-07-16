@@ -279,6 +279,396 @@
   display: none;
 }
 
+.shortcut-permission-shell {
+  position: relative;
+  z-index: 8;
+  margin: 0 0 20px;
+}
+
+.shortcut-permission {
+  min-height: 42px;
+  padding: 7px 9px;
+  border: 1px solid rgba(255, 200, 87, 0.34);
+  border-radius: var(--radius);
+  background: rgba(255, 200, 87, 0.06);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.shortcut-permission.granted {
+  border-color: rgba(123, 216, 143, 0.3);
+  background: rgba(123, 216, 143, 0.06);
+}
+
+.shortcut-permission-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.shortcut-permission strong {
+  font-size: 13px;
+}
+
+.shortcut-permission-popover small {
+  color: var(--quiet);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.shortcut-permission-badge {
+  padding: 2px 7px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  color: #d7a938;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.shortcut-permission.granted .shortcut-permission-badge {
+  color: #70c987;
+}
+
+.shortcut-permission-summary-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.shortcut-permission-details {
+  height: 30px;
+  padding: 0 8px;
+  border: 0;
+  background: transparent;
+  color: var(--quiet);
+  font-size: 11px;
+}
+
+.shortcut-permission-details:hover,
+.shortcut-permission-details:focus-visible {
+  color: var(--text);
+  outline: none;
+}
+
+.shortcut-permission-popover {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 6px);
+  right: 0;
+  left: 0;
+  display: none;
+  gap: 7px;
+  padding: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  /* 该浮层会覆盖后续表单，背景必须保持不透明，避免底层控件透出造成文字重叠。 */
+  background: var(--surface);
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.34);
+}
+
+.shortcut-permission-shell:hover .shortcut-permission-popover,
+.shortcut-permission-shell:focus-within .shortcut-permission-popover,
+.shortcut-permission-shell.open .shortcut-permission-popover {
+  display: grid;
+}
+
+.shortcut-permission-target strong {
+  color: var(--text);
+  font-size: inherit;
+}
+
+.shortcut-permission-path {
+  max-width: 100%;
+  color: var(--quiet);
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.shortcut-permission-note.warning {
+  color: #d7a938;
+}
+
+.shortcut-permission-feedback {
+  padding: 7px 9px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--quiet);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.shortcut-permission-feedback.success {
+  color: #70c987;
+}
+
+.shortcut-permission-feedback.warning {
+  color: #d7a938;
+}
+
+.shortcut-permission-feedback.error {
+  color: #ff8d86;
+}
+
+.shortcut-permission-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.shortcut-permission-actions .ghost-button {
+  white-space: nowrap;
+}
+
+.shortcut-steps {
+  display: grid;
+  gap: 8px;
+}
+
+.shortcut-empty {
+  min-height: 64px;
+  padding: 14px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  color: var(--quiet);
+  display: grid;
+  place-items: center;
+  text-align: center;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.shortcut-step {
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--control-bg);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 10px;
+}
+
+.shortcut-step-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.shortcut-step-number {
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  background: rgba(111, 213, 255, 0.12);
+  color: var(--accent);
+  display: grid;
+  place-items: center;
+  font-size: 10px;
+  flex: 0 0 auto;
+}
+
+.shortcut-step-main strong {
+  font-size: 15px;
+  white-space: nowrap;
+}
+
+.shortcut-step-main code {
+  min-width: 0;
+  color: var(--quiet);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shortcut-step-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.mini-button {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--control-bg-strong);
+  color: var(--muted);
+}
+
+.mini-button:hover {
+  border-color: rgba(111, 213, 255, 0.48);
+  color: var(--text);
+}
+
+.mini-button.danger:hover {
+  border-color: rgba(255, 107, 107, 0.48);
+  color: var(--error);
+}
+
+.shortcut-delay {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--quiet);
+  font-size: 11px;
+}
+
+.shortcut-delay.terminal {
+  min-height: 26px;
+}
+
+.delay-input {
+  width: 74px;
+  height: 28px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--control-bg-strong);
+  color: var(--text);
+}
+
+.ghost-button.recording {
+  border-color: rgba(255, 200, 87, 0.72);
+  color: var(--warn);
+  box-shadow: 0 0 0 2px rgba(255, 200, 87, 0.08);
+}
+
+.shortcut-record-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.shortcut-record-actions > :only-child {
+  grid-column: 1 / -1;
+}
+
+.shortcut-apply-button {
+  min-height: 40px;
+  padding: 0 12px;
+}
+
+.shortcut-manual {
+  margin: -10px 0 24px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--control-bg);
+}
+
+.shortcut-manual summary {
+  padding: 11px 12px;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.shortcut-manual-body {
+  padding: 0 12px 12px;
+  display: grid;
+  gap: 12px;
+}
+
+.modifier-picker {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.modifier-picker label {
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.modifier-picker input {
+  accent-color: var(--accent);
+}
+
+.shortcut-icon-control {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+}
+
+.shortcut-icon-preview {
+  width: 72px;
+  height: 72px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #0b0e12;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+
+.shortcut-icon-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.icon-mode-button {
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--control-bg);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.icon-mode-button.active {
+  border-color: rgba(111, 213, 255, 0.72);
+  background: var(--control-active);
+  color: var(--accent);
+}
+
+.shortcut-auto-preview {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+}
+
+.shortcut-auto-preview.empty {
+  padding: 8px;
+  display: grid;
+  place-items: center;
+  color: var(--text);
+  font-weight: 720;
+  font-size: 17px;
+  line-height: 1;
+}
+
+.shortcut-custom-stack {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+}
+
+.shortcut-icon-preview-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #0b0e12;
+}
+
 .url-icon-status {
   color: var(--quiet);
   font-size: 12px;
@@ -523,6 +913,11 @@
   .inspector {
     border-left: 0;
     border-top: 1px solid var(--line);
+  }
+
+  .shortcut-permission-popover {
+    position: static;
+    margin-top: 6px;
   }
 
   .bottom-bar,

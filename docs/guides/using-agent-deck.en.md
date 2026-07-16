@@ -131,12 +131,40 @@ scripts/agent-deckd-tmux.sh restart
 
 ### 4.3 Current N4 Pro Behavior
 
-- The ten main keys can open or switch applications, open URLs, show agent status, show quota/usage status, or remain unassigned.
-- Application and website icons are cached locally and shared by the configuration preview and hardware rendering.
+- The ten main keys can open or switch applications, open URLs, send keyboard shortcuts, show agent status, show quota/usage status, or remain unassigned.
+- A shortcut can be one physical key, a chord, or a sequence of up to 16 steps. Each released step may wait 0–2000 ms, and the full sequence is limited to 10 seconds.
+- Application, website, and custom shortcut icons are cached locally and shared by the configuration preview and hardware rendering. A shortcut without a custom image gets an auto-generated chord icon, and the Web preview uses the exact PNG emitted by the hardware renderer.
 - Each of the four knobs can have its own rotation action. For volume actions, pressing the knob implicitly toggles output mute or microphone mute; pressing is not separately configured.
 - Knob lighting is configured independently: off, or a base color with an optional breathing effect. When the device supports it, volume/brightness actions reflect state from the base color; muted states use red or turn off.
 - The bottom virtual panel rotates through the brand image, quota, and usage. Usage can switch among Day, Week, Month, and All.
 - If the N4 Pro is unplugged, loses power, or restarts, the background service waits for it to return and restores the display, lighting, and input. This normally takes a few seconds and does not require the official StreamDock application.
+
+### 4.4 Keyboard Shortcuts and macOS Permission
+
+After assigning **Keyboard Shortcut** to a main key, select **Start Recording** and enter one or more real
+chords continuously; **Continue Recording** resumes an existing sequence. While recording, the control
+becomes **Stop and Apply**. It stops capture and invokes the same full-device save action as the header
+**Save and Apply** button. The nearby **Apply to Hardware** action is the same operation, not a second save
+mechanism. Use the manual picker for modifier-only steps. Saving the binding enables it; there is no
+separate global or per-key enable switch.
+
+Before the first execution, select **Request Current Agent Permission** in the configuration UI. The
+browser is only the configuration surface and does not need Accessibility access; the Agent background
+process that posts key events is the permission requester. The UI keeps this as a compact status row; hover,
+keyboard focus, or a **Details** click reveals the current executable plus **Open Accessibility Settings**
+and **Recheck** actions. Startup and normal status refreshes only preflight this permission and never request
+it automatically.
+
+Starting through `scripts/agent-deckd-tmux.sh` is a development mode whose final executable is a Python
+runtime. Depending on the launch chain, macOS may show Codex, Terminal, or Python as the responsible entry,
+and changing launch methods may require another authorization. Use the entry introduced by the explicit
+request; do not authorize the browser. The distribution roadmap replaces this with a signed
+`Agent Deck.app` and user-level Agent service with a stable identity.
+
+The sequence pins the frontmost application PID at execution start. A `succeeded` job means events were
+posted, not that the target application handled them. Only one sequence runs at a time; another key press
+returns `busy` and is not queued. Version 1 does not support Fn, media keys, Caps Lock, text, mouse, shell,
+or mixed actions.
 
 If you intentionally need to replace a residual device image after the daemon has exited, use this write operation to show the branded splash image:
 
@@ -151,6 +179,7 @@ This command changes the device display. Quit the official StreamDock applicatio
 For everyday use, open [http://127.0.0.1:8765/](http://127.0.0.1:8765/), edit the layout, and choose **Save and Apply**. To back up or move settings to another Mac, the main files saved by the Web configuration page are:
 
 - Key layout: `~/Library/Application Support/AgentDeck/n4pro-key-layout.json`
+- Custom shortcut icons: `~/Library/Application Support/AgentDeck/shortcut-icons/`
 - Knob and lighting layout: `~/Library/Application Support/AgentDeck/n4pro-rotary-layout.json`
 - Codex quota presentation policy: `~/Library/Application Support/AgentDeck/quota-presentation.json`
 
@@ -204,6 +233,14 @@ Follow the SDK compatibility steps under [Run with Physical Hardware](#run-with-
 ### Insufficient macOS permission reports successful writes but leaves the brand image
 
 When launching or debugging from Codex Desktop, set its execution policy to **Full Access**, then quit and restart Codex completely. If `not permitted` still appears, open System Settings -> Privacy & Security -> Input Monitoring, allow Codex or the terminal that launches Agent Deck, and restart that application.
+
+### A shortcut reports permission required or does not affect the frontmost app
+
+Use **Request Permission** in the configuration page, then allow the application that runs the daemon in
+System Settings -> Privacy & Security -> Accessibility. Restart that terminal/application and refresh the
+page. Make sure the intended target is frontmost when the hardware key is pressed; Agent Deck pins that app
+and does not infer a target from the shortcut label. The `/status` response exposes capability, active, and
+recent job diagnostics under `keyboard_shortcuts`.
 
 ### N4 Pro does not recover after a restart or reconnect
 

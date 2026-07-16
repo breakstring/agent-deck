@@ -197,6 +197,20 @@ flowchart LR
     `[actions.focus].enabled = false` 仅作为排障关闭开关。tmux pane/window、terminal client
     attach、结构化 host context 和递归熔断仍属于后续扩展。
 
+    已完成 N4 Pro 键盘快捷键扩展：`keyboard_shortcut` binding 支持一个 W3C 物理键、
+    Command/Control/Option/Shift 组合键或最多 16 步的有序序列。强类型 shortcut 从
+    `N4ProKeyBinding` 投影到 `KeyPlan` 和 `InteractionIntent`；macOS executor 只用公开
+    AppKit/CoreGraphics API，在执行开始时固定前台 App PID，并通过单 worker、零等待队列调度。
+    执行中再次按下返回 `busy`，权限缺失 fail-closed，系统授权只从配置页显式请求。所有路径
+    都尽力补发 key-up；`succeeded` 只表示事件已投递。第一版明确排除 Fn、媒体键、Caps Lock、
+    文本、鼠标、shell 和混合动作。
+
+    配置页已支持连续录制与“停止并应用”、手动添加纯修饰键、重排/删除、0–2000ms 间隔、紧凑
+    权限状态和悬停/点击详情，以及自动/自定义默认图标。Web 自动预览与硬件下发复用同一 renderer
+    PNG；自定义图标以规范化 PNG SHA-256 内容寻址，限制 5 MiB 和 4096×4096，自定义资产缺失时
+    自动回退组合键图。key layout store 已升级 v2 并兼容 v1，未知未来版本 fail-closed；
+    `/status.keyboard_shortcuts` 暴露 capability、active 和 recent job。
+
 16. installer / doctor
     检查 Codex 配置、SDK、设备权限、端口占用、官方软件设备占用，提供 dry-run patch。
     当前 `agent-deckctl doctor` 已提供只读本机诊断：输出 Agent Deck 版本、
@@ -251,6 +265,10 @@ P1 验收清单：
 - [x] 超时默认策略按配置执行。
 - [x] 拔插设备服务不崩溃。
 - [x] 设备以相同 USB path 重启或重新插入后，失效句柄会被识别并在后续 renderer 周期重连。
+- [x] 主按键可发送受限单键、组合键或序列，并固定执行开始时的前台 App。
+- [x] 键盘权限只在显式 UI 操作时请求，缺权限与 executor busy 均 fail-closed 且可诊断。
+- [x] 快捷键自动图标、自定义内容寻址图标与缺失资产 fallback 可用于配置预览和 N4 Pro 渲染；
+  Web 自动预览与硬件下发使用同一 renderer PNG。
 - [x] `pytest` 通过。
 
 ## P2：Claude Code Adapter
@@ -365,14 +383,29 @@ P4 关键设计点：
 
 可拆任务：
 
-1. 本地 Web 管理页。
+1. [x] 本地 Web 管理页（当前覆盖 N4 Pro 主键、快捷键、状态键、旋钮与灯光配置）。
 2. session/slot 可视化。
 3. 配置编辑和 dry-run preview。
 4. 日志查看。
-5. macOS LaunchAgent。
-6. 菜单栏状态。
-7. 权限引导：Accessibility、Automation、设备访问。
-8. 打包和自动更新策略。
+5. 签名的 `Agent Deck.app`：安装、首次启动、菜单栏状态、打开配置页与升级入口。
+6. 用 `SMAppService` 注册用户级 `Agent Deck Agent` LaunchAgent，承载当前 daemon、N4 Pro、
+   用户级 Codex hooks 和需要前台用户会话的动作；tmux/Python launcher 继续作为开发模式。
+7. 将 macOS 辅助功能权限授予 `Agent Deck Agent`，而不是浏览器；首次启动页分别展示
+   Accessibility、后台运行、设备访问和用户级 Codex 集成状态。
+8. 为 managed-system Codex hooks 增加按需、最小权限的 `Agent Deck Privileged Installer`
+   LaunchDaemon，只允许校验过的 `/etc/codex/requirements.toml` 与
+   `/usr/local/lib/agent-deck/...` 安装/更新/卸载操作，不持有 Accessibility。
+9. App、Agent 与 Privileged Installer 使用签名校验的 XPC/受限 IPC；生产版不能把当前开放的
+   localhost HTTP 路由直接当作高权限信任边界，也不得接受任意路径、shell 或未建模动作。
+10. 打包、Developer ID 签名、公证、安装镜像和自动更新策略。
+
+P5 macOS 产品化边界：
+
+- `Agent Deck.app` 是用户安装和交互的产品主体，不直接把浏览器升级成有权限的宿主。
+- `Agent Deck Agent` 是用户级常驻服务，可以写用户自己的 `~/.codex` 配置并执行硬件/快捷键能力；
+  修改 hooks 仍需产品内显式确认、dry-run、备份和回滚，不能把 Accessibility 当作文件写入授权。
+- `Agent Deck Privileged Installer` 只服务 managed-system 模式。管理员批准、后台运行批准和
+  Accessibility 是彼此独立的系统授权，不用一个模糊的“执行权限”状态合并展示。
 
 ## P6：宠物/环境反馈扩展
 

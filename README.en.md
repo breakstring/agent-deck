@@ -31,10 +31,21 @@ Codex and the N4 Pro are the currently verified combination; the core architectu
 
 The local configuration page uses the N4 Pro preview as its workspace. Select a key or knob to edit it; changes appear in the GUI preview first and reach a connected device only after you choose **Save and Apply**. You can configure:
 
-- Ten LCD main keys for local apps, URLs, subscription/quota, token/cost usage, and agent-status entry points.
+- Ten LCD main keys for local apps, URLs, keyboard shortcuts, subscription/quota, token/cost usage, and agent-status entry points.
 - A bottom logical panel for the brand card, Codex quota, and usage trends. Usage trends come from local caches so a panel switch does not block hardware interaction.
 - Four knob rotation actions, such as changing a panel or time period, adjusting system input/output volume, display brightness, and console-screen brightness.
 - A shared knob-ring color and optional breathing effect, both previewable before saving.
+
+A keyboard shortcut may be one physical key, a chord with Command/Control/Option/Shift, or an ordered
+sequence of up to 16 steps. One recording session can capture multiple steps; **Stop and Apply** invokes
+the same full-device save action as the header **Save and Apply** button. The UI can also add modifier-only
+steps manually, edit inter-step delays, and use either an auto-generated or uploaded default icon. The Web
+auto preview is the exact PNG produced by the hardware renderer, so it cannot drift from the N4 Pro image.
+Execution pins the
+frontmost application at the start of the sequence. Only one sequence runs at a time; another press
+returns busy instead of waiting in a queue. The first use requires an explicit macOS Accessibility request
+from the configuration UI. The compact permission row reveals the actual requester and system-setting
+actions only on hover, focus, or **Details** click; the browser itself does not need Accessibility access.
 
 Without a connected device, the configuration page and core service still run with fake hardware for exploration, development, and troubleshooting.
 
@@ -88,7 +99,7 @@ uv run agent-deckctl codex-install
 uv run agent-deckctl codex-install --apply
 ```
 
-The default approval mode keeps Codex's native approval UI and does not automatically move approval control to hardware. Text input and approval/deny actions are high-risk capabilities that require explicit configuration. If the daemon is unavailable, a response is invalid, or a wait times out, the approval path follows a fail-closed policy.
+The default approval mode keeps Codex's native approval UI and does not automatically move approval control to hardware. Keyboard shortcuts are limited to physical keys, chords, and timing; they do not expose text, mouse, shell, media-key, or Fn injection. Text input and approval/deny actions remain high-risk capabilities that require explicit configuration. If the daemon is unavailable, a response is invalid, or a wait times out, the approval path follows a fail-closed policy.
 
 ## Common Commands and Process Management
 

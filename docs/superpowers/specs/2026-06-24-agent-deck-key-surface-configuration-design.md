@@ -1,8 +1,58 @@
 # Agent Deck 按键表面配置设计
 
-状态：草案  
+状态：部分落地；N4 Pro 逐键配置与键盘快捷键扩展已实现，通用 Zone 仍为后续设计
 日期：2026-06-24  
 范围：产品语义与配置模型设计；第一阶段只覆盖硬件按键，不覆盖触屏、旋钮、旋钮 LED 或常驻启动。
+
+## 2026-07-16 键盘快捷键实现补记
+
+N4 Pro 主键现在新增 `keyboard_shortcut` binding。它不是任意自动化脚本，而是一个有界的
+物理键事件模型：
+
+```json
+{
+  "index": 0,
+  "kind": "keyboard_shortcut",
+  "label": "Command Palette",
+  "shortcut": {
+    "steps": [
+      {
+        "key": "KeyP",
+        "modifiers": ["command", "shift"],
+        "delay_after_ms": 0
+      }
+    ]
+  },
+  "icon": {"mode": "auto", "asset_id": null}
+}
+```
+
+实现合同：
+
+- `key` 使用 W3C `KeyboardEvent.code`；允许字母、数字、常用标点、导航键、F1–F20 和数字键盘。
+  `key=null` 可表达纯修饰键步骤；第一版不支持 Fn、媒体键或 Caps Lock。
+- 修饰键仅限 `command`、`control`、`option`、`shift`。一个序列 1–16 步，每步释放后等待
+  0–2000ms，固定按住 20ms，整条序列最长 10 秒，末步 delay 必须为 0。
+- `KeyPlan` 和 `InteractionIntent` 用强类型 `shortcut` / `shortcut_icon` 字段传递，不把嵌套
+  动作编码进 `dict[str, str]` payload。
+- macOS executor 在执行开始时通过 `NSWorkspace.frontmostApplication` 读取并固定 PID，随后用
+  CoreGraphics 向该 PID 发送完整 down/up 序列。成功只表示事件已投递，不保证目标 App 消费。
+- scheduler 是单 worker、零等待队列；已有任务运行时立即返回 `busy`。无论成功失败，executor
+  都在 `finally` 中尽力释放已按下的键。
+- daemon 启动和 status 只调用权限 preflight。只有配置页显式点击才调用系统权限 request。
+- 浏览器只负责配置，不持有辅助功能权限。配置页常态只显示紧凑授权状态；悬停、键盘聚焦或点击
+  “详情”后，才显示实际请求权限的 Agent 后台进程、执行文件路径、开发身份不稳定提示，以及请求、
+  打开系统设置、重新检查动作。tmux/Python 只作为开发模式；正式分发的稳定授权身份由
+  `Agent Deck.app` 内的用户级 Agent 服务提供。
+- 保存 `keyboard_shortcut` binding 本身即表示启用；没有另一个全局或逐键 enabled 开关。
+- 录制是一次可连续追加多步的会话；录制按钮在有新步骤后变成“停止并应用”，并复用顶部
+  “保存并应用”的完整配置 API。停止后的局部“应用到硬件”也只镜像同一动作，不建立第二套保存合同。
+- 自动图标单步居中、双步分行、多步显示前两步和 `+N`；Web 预览直接读取硬件 renderer 输出的
+  同源 PNG。自定义图标支持 PNG/JPEG/WebP/ICO，最大 5 MiB、4096×4096，以规范化 PNG SHA-256
+  内容寻址；资产缺失时硬件回退自动图标。
+- 持久化 envelope 升级为 v2，v1 可直接迁移，未知未来版本 fail-closed。
+
+该能力仍不允许文本、鼠标、shell 或跨动作类型序列，也不改变审批只能出现在明确上下文中的边界。
 
 ## 背景
 
@@ -31,7 +81,7 @@ Agent Deck 默认触屏图。这个阶段解决了“不要残留旧 quota 图�
 
 - 触屏 panel 的完整重设计。
 - 旋钮和旋钮 LED 的语义设计。
-- 图形化配置 UI。
+- 通用跨设备 Zone 图形编辑器；当前已实现 N4 Pro 逐键 Web 配置页。
 - LaunchAgent 常驻启动。
 - 云同步、多用户配置或配置 marketplace。
 - 允许任意 shell 命令、文本注入或无上下文审批快捷键。
@@ -87,6 +137,7 @@ Agent slot 不拥有全部按键，只拥有配置给它的 zone。
 - `focus_app`
 - `open_url`
 - `open_path`
+- `send_keyboard_shortcut`（仅受限物理键、组合键和时序）
 - `agent_deck_command`
 
 暂不默认开放：
@@ -261,7 +312,8 @@ Binding 字段建议：
 - `action`：动作类型。
 - `bundle_id`、`app_path`、`url`、`path`：动作参数。
 - `icon`：可选图标路径或内置图标 id。
-- `enabled`：是否启用。
+- `enabled`：其他 binding 可选的启用标记；当前 `keyboard_shortcut` 以 binding 是否存在表达启用，
+  不额外保存 enabled 字段。
 
 ### Zone 与 Binding 的关系
 

@@ -214,6 +214,8 @@ def test_doctor_json_reports_streamdock_probe_and_occupants(monkeypatch: Any) ->
     assert payload["streamdock_probe_error"] is None
     assert payload["streamdock_devices"][0]["device_type"] == "N4Pro"
     assert payload["streamdock_devices"][0]["can_open"] is True
+    assert isinstance(payload["keyboard_shortcut_capability"], dict)
+    assert "permission_granted" in payload["keyboard_shortcut_capability"]
     assert payload["hardware_occupants"][0]["matched_pattern"] == "donglemonitor"
     assert any("疑似硬件占用进程" in warning for warning in payload["warnings"])
 

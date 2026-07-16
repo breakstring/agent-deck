@@ -24,6 +24,9 @@ import typer
 import uvicorn
 
 from agent_deck import __version__
+from agent_deck.actions.macos_keyboard import (
+    create_default_keyboard_shortcut_executor,
+)
 from agent_deck.config import (
     AgentDeckConfigError,
     PermissionRequestMode,
@@ -1104,9 +1107,12 @@ def _build_doctor_report(*, skip_streamdock_probe: bool = False) -> dict[str, An
     """构建本机诊断报告，不修改硬件或用户配置。
 
     入参：`skip_streamdock_probe` 为 True 时不加载官方 SDK，也不短暂 open StreamDock 设备。
-    返回：包含版本、SDK 路径、StreamDock 探针结果、疑似硬件占用进程和 warnings 的 JSON-like dict。
-    错误处理：SDK probe 或进程表读取失败会被捕获并写入报告，避免诊断命令在最需要时中断。
-    副作用：可能读取环境变量、短暂执行 StreamDock 只读 probe，以及运行一次 `ps` 读取进程表。
+    返回：包含版本、SDK 路径、StreamDock 探针、键盘快捷键权限、疑似硬件占用进程和 warnings
+    的 JSON-like dict。
+    错误处理：SDK probe、键盘权限 preflight 或进程表读取失败会被捕获并写入报告，避免诊断
+    命令在最需要时中断。
+    副作用：可能读取环境变量、短暂执行 StreamDock 只读 probe、只读检查键盘事件权限，以及
+    运行一次 `ps` 读取进程表；不会请求权限或投递按键。
     """
 
     sdk_path = os.environ.get(_STREAMDOCK_SDK_PATH_ENV)
@@ -1138,6 +1144,18 @@ def _build_doctor_report(*, skip_streamdock_probe: bool = False) -> dict[str, An
             "至少一个 StreamDock 设备无法 open；可能被官方软件、旧 agent-deckd 或其他 HID 进程占用"
         )
 
+    keyboard_shortcut_error: str | None = None
+    keyboard_shortcut_capability: dict[str, Any] | None = None
+    try:
+        keyboard_shortcut_capability = (
+            create_default_keyboard_shortcut_executor()
+            .capability()
+            .model_dump(mode="json")
+        )
+    except Exception as exc:
+        keyboard_shortcut_error = str(exc)
+        warnings.append(f"键盘快捷键权限检查失败: {exc}")
+
     try:
         hardware_occupants = _scan_hardware_occupants()
     except Exception as exc:
@@ -1154,6 +1172,8 @@ def _build_doctor_report(*, skip_streamdock_probe: bool = False) -> dict[str, An
         "streamdock_probe_skipped": skip_streamdock_probe,
         "streamdock_probe_error": streamdock_probe_error,
         "streamdock_devices": streamdock_devices,
+        "keyboard_shortcut_capability": keyboard_shortcut_capability,
+        "keyboard_shortcut_error": keyboard_shortcut_error,
         "hardware_occupants": hardware_occupants,
         "warnings": warnings,
     }
@@ -1467,6 +1487,21 @@ def _echo_doctor_report(report: dict[str, Any]) -> None:
             )
             if device.get("error"):
                 typer.echo(f"     error={device['error']}")
+
+    keyboard_capability = report.get("keyboard_shortcut_capability")
+    if isinstance(keyboard_capability, dict):
+        typer.echo(
+            "Keyboard shortcuts: "
+            f"supported={_yes_no(keyboard_capability.get('supported'))} "
+            f"permission={_yes_no(keyboard_capability.get('permission_granted'))} "
+            f"platform={keyboard_capability.get('platform', 'unknown')}"
+        )
+    elif report.get("keyboard_shortcut_error"):
+        typer.echo(
+            f"Keyboard shortcuts: error: {report['keyboard_shortcut_error']}"
+        )
+    else:
+        typer.echo("Keyboard shortcuts: unavailable")
 
     occupants = report.get("hardware_occupants")
     if not isinstance(occupants, list):
