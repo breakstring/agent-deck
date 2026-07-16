@@ -792,10 +792,17 @@ class StreamDockN4ProPersistentAnimator:
 
         active_manager = self._manager if self._manager is not None else _load_default_manager()
         had_opened_device = self._has_opened_device
-        device = _first_n4pro_device(active_manager.enumerate())
+        enumerated_devices = list(active_manager.enumerate())
+        device = _first_n4pro_device(enumerated_devices)
+        for enumerated_device in enumerated_devices:
+            if enumerated_device is device or enumerated_device is self._device:
+                continue
+            _close_discarded_enumerated_device(enumerated_device)
         if self._device is not None:
             same_path = device is not None and _safe_path(device) == self._path
             if same_path and _device_is_writable(self._device) is not False:
+                if device is not self._device:
+                    _close_discarded_enumerated_device(device)
                 timing["open_init"] = 0.0
                 timing["handshake"] = 0.0
                 timing["device_handshaken"] = 0.0
@@ -823,6 +830,7 @@ class StreamDockN4ProPersistentAnimator:
             try:
                 handshake_result = handshake()
             except Exception as exc:
+                _close_discarded_enumerated_device(device)
                 return StreamDockN4ProAnimationResult(
                     ok=False,
                     device_type=self._device_type,
@@ -830,6 +838,7 @@ class StreamDockN4ProPersistentAnimator:
                     error=f"handshake failed: {type(exc).__name__}: {exc}",
                 )
             if streamdock_sdk_result_failed(handshake_result):
+                _close_discarded_enumerated_device(device)
                 return StreamDockN4ProAnimationResult(
                     ok=False,
                     device_type=self._device_type,
@@ -845,8 +854,13 @@ class StreamDockN4ProPersistentAnimator:
         )
         timing["device_handshaken"] = 1.0 if device_handshaken else 0.0
         timing["device_handshake_count"] = float(self._device_handshake_count)
-        open_result = device.open()
+        try:
+            open_result = device.open()
+        except Exception:
+            _close_discarded_enumerated_device(device)
+            raise
         if open_result is False:
+            _close_discarded_enumerated_device(device)
             return StreamDockN4ProAnimationResult(
                 ok=False,
                 device_type=self._device_type,
@@ -1326,6 +1340,22 @@ def _first_n4pro_device(
         if "N4Pro" in type(device).__name__:
             return device
     return None
+
+
+def _close_discarded_enumerated_device(device: StreamDockN4ProDeviceLike) -> None:
+    """释放本轮枚举后不会被 persistent animator 采用的 SDK device wrapper。
+
+    入参：`device` 是刚由官方 `DeviceManager.enumerate()` 构造、但不会成为当前活动会话的对象。
+    返回：无。
+    错误处理：SDK `close()` 异常被吞掉，避免一个无关设备阻断 N4 Pro 健康检查。
+    副作用：调用 `close(notify=False)`；官方 SDK 会由此停止构造时立即启动的 GIF 后台线程，
+    防止每轮重枚举泄漏一个线程。未 open 的 transport 不会收到断开通知或修改设备画面。
+    """
+
+    try:
+        device.close(notify=False)
+    except Exception:
+        pass
 
 
 def _save_temp_jpeg(image: Image.Image, *, temp_dir: Path | None) -> Path:

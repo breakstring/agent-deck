@@ -481,7 +481,7 @@ def test_persistent_animator_reports_handshake_permission_error_without_opening(
     assert result.error is not None
     assert "handshake failed: OSError" in result.error
     assert "not permitted" in result.error
-    assert device.calls == [("send_handshake", None)]
+    assert device.calls == [("send_handshake", None), ("close", False)]
 
 
 def test_persistent_animator_reopens_when_n4pro_reenumerates(
@@ -1073,6 +1073,52 @@ def test_persistent_animator_reuses_open_device_between_calls(
     animator.close()
 
     assert device.calls[-1] == ("close", False)
+
+
+def test_persistent_animator_closes_same_path_enumeration_wrapper(
+    tmp_path: Path,
+) -> None:
+    """稳定会话应释放只用于 path 比较的新 SDK wrapper，避免每轮泄漏后台线程。
+
+    入参：`tmp_path` 提供临时背景目录；第二轮枚举返回同 path 的另一个 fake device。
+    返回：无返回值；断言通过表示活动会话继续复用，临时 wrapper 立即无通知关闭。
+    错误处理：重复 open 活动设备、采用临时 wrapper 或漏掉 close 时由 pytest 报告。
+    副作用：只操作 fake device 与 pytest 临时图片，不启动线程、不访问真实 N4 Pro。
+    """
+
+    active = FakeN4ProUnifiedDevice(path="stable-n4pro-path")
+    duplicate = FakeN4ProUnifiedDevice(path="stable-n4pro-path")
+    manager = FakeUnifiedManager([active])
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=manager,
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+    background = Image.new("RGB", (800, 480), (1, 2, 3))
+
+    first = animator(
+        background_image=background,
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+    manager.devices = [duplicate]
+    second = animator(
+        background_image=background,
+        key_frame_paths={},
+        duration_seconds=0.01,
+        fps=1,
+    )
+
+    assert first.ok is True
+    assert second.ok is True
+    assert [name for name, _ in active.calls].count("open") == 1
+    assert ("close", False) not in active.calls
+    assert duplicate.calls == [("close", False)]
+
+    animator.close()
+
+    assert active.calls[-1] == ("close", False)
 
 
 def test_persistent_animator_registers_input_callbacks_on_open(

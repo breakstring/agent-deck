@@ -39,6 +39,24 @@
 
 默认渲染周期约为 3 秒，因此普通重连通常在数秒内恢复，无需重启 daemon。
 
+### Q：为什么运行几小时后旋钮、按键和管理页面会一起变慢？
+
+官方 SDK 的 `DeviceManager.enumerate()` 每次都会创建新的 device wrapper，而 device 构造函数会
+立即启动一个 GIF 后台线程，即使该 wrapper 只用于读取 USB path、从未 open。如果 persistent
+renderer 复用已有会话，却不关闭本轮新枚举出的同 path wrapper，就会按渲染周期持续泄漏线程；
+累积到上千个线程后，输入回调、HTTP API 和图片渲染会一起争抢 CPU/GIL。
+
+`StreamDockN4ProPersistentAnimator` 必须保留每轮枚举以探测拔插和原地重启，但对以下对象立即
+执行 `close(notify=False)`：
+
+- 与活动会话 path 相同、仅用于健康比较的新 wrapper。
+- 枚举结果中未被选中的其他 wrapper。
+- 握手或 open 失败、不会进入活动会话的 wrapper。
+
+排查时不能只看输入事件计数；如果 `/status` 也超时、进程 CPU 异常升高，可用
+`ps -M -p <pid> | wc -l` 查看线程数量。修复代码后必须重启旧 daemon，因为已经泄漏的 SDK
+线程无法在原进程内统一回收。
+
 ### Q：为什么设备会只显示品牌图？
 
 N4 Pro 收到 SDK 的断开命令或进入某些设备侧状态后，会显示品牌图。只调用 Python SDK 的
