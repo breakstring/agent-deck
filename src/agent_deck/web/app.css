@@ -353,6 +353,22 @@ button:focus-visible,
   overflow: hidden;
 }
 
+@media (min-width: 981px) {
+  .app-shell {
+    height: 100vh;
+    min-height: 0;
+  }
+
+  .workspace {
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  .stage,
+  .workspace > .inspector {
+    min-height: 0;
+  }
+}
+
 :root[data-theme="light"] .stage {
   background: #ffffff;
 }
