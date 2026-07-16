@@ -106,6 +106,55 @@ const el = {
   closeAppModal: document.getElementById("closeAppModal"),
 };
 
+/** 返回硬件按键 DOM 对应的稳定位置标识。 */
+function keySwapItemId(item) {
+  return Number(item.dataset.key);
+}
+
+/** 只允许已有操作定义且当前未保存、未录制快捷键的主键发起拖拽。 */
+function canDragConfiguredKey(item) {
+  const key = state.keys.find((candidate) => candidate.index === keySwapItemId(item));
+  return item.dataset.swapEnabled === "true"
+    && !state.saving
+    && state.shortcutRecordingIndex === null
+    && !keyHasPendingAssetWork(key);
+}
+
+/** 拒绝把操作放到仍在解析或上传图标的目标键，避免异步回调按旧位置回写。 */
+function canDropOnKey(_source, target) {
+  const key = state.keys.find((candidate) => candidate.index === keySwapItemId(target));
+  return Boolean(key) && !keyHasPendingAssetWork(key);
+}
+
+/** 判断一个按键草稿是否仍有依赖物理 index 的图标异步任务。 */
+function keyHasPendingAssetWork(key) {
+  return key?.iconLoading === true || key?.shortcutIconLoading === true;
+}
+
+/** 把通用表面控制器的有效放置结果转换成按键操作交换。 */
+function handleKeySwap({ sourceId, targetId }) {
+  swapKeyOperations(Number(sourceId), Number(targetId));
+}
+
+/** 对越界、空隙或取消放置给出短暂说明，不修改按键草稿。 */
+function handleRejectedKeySwap({ reason }) {
+  if (reason === "cancelled") return;
+  const message = reason === "outside-boundary"
+    ? "按键只能在主键区域内交换"
+    : "拖到另一个按键上即可交换操作";
+  showTransientToast(message, 2200);
+}
+
+const keySwapController = window.AgentDeckSurfaceSwap.createBoundedSwapController({
+  container: el.keyGrid,
+  itemSelector: ".deck-key",
+  getItemId: keySwapItemId,
+  isDraggable: canDragConfiguredKey,
+  canDrop: canDropOnKey,
+  onSwap: handleKeySwap,
+  onDropRejected: handleRejectedKeySwap,
+});
+
 /**
  * 根据当前主题刷新右上角切换按钮的文案、图标和无障碍状态。
  */
@@ -496,14 +545,19 @@ function renderKeyFace(key) {
   return "";
 }
 
+/** 渲染当前硬件 profile 的主键草稿；活动拖拽期间保持现有 DOM，避免中断手势。 */
 function renderKeys() {
+  if (keySwapController.isDragging()) return;
   el.keyGrid.innerHTML = state.keys
     .map((key) => {
       const selected = state.selectedSurface === "key" && key.index === state.selectedIndex ? " selected" : "";
       const dirty = key.dirty ? " dirty" : "";
+      const swapEnabled = key.kind !== "unassigned" && !keyHasPendingAssetWork(key);
+      const dragHint = swapEnabled ? "，可拖拽到其他按键交换操作" : "";
       return `
-        <button class="deck-key${selected}${dirty}" data-key="${key.index}" type="button" aria-label="Key ${key.index + 1} ${keyLabel(key)}">
+        <button class="deck-key${selected}${dirty}" data-key="${key.index}" data-swap-enabled="${swapEnabled}" type="button" aria-label="${escapeAttr(`Key ${key.index + 1} ${keyLabel(key)}${dragHint}`)}"${swapEnabled ? ' title="拖拽到其他按键交换操作"' : ""}>
           <span class="key-inner">${renderKeyFace(key)}</span>
+          ${swapEnabled ? '<span class="key-drag-affordance" aria-hidden="true"></span>' : ""}
         </button>
       `;
     })
@@ -1259,6 +1313,59 @@ function markDirty(key) {
 function markRotaryDirty() {
   state.dirty = true;
   renderSyncState();
+}
+
+/** 在不改变两个物理位置 index 的前提下交换完整操作定义，并标记草稿待保存。 */
+function swapKeyOperations(sourceIndex, targetIndex) {
+  if (sourceIndex === targetIndex) return;
+  const sourcePosition = state.keys.findIndex((key) => key.index === sourceIndex);
+  const targetPosition = state.keys.findIndex((key) => key.index === targetIndex);
+  if (sourcePosition < 0 || targetPosition < 0) return;
+  const sourceKey = state.keys[sourcePosition];
+  const targetKey = state.keys[targetPosition];
+  if (sourceKey.kind === "unassigned") return;
+
+  state.keys[sourcePosition] = {
+    ...structuredClone(targetKey),
+    index: sourceIndex,
+    dirty: true,
+  };
+  state.keys[targetPosition] = {
+    ...structuredClone(sourceKey),
+    index: targetIndex,
+    dirty: true,
+  };
+  renumberAgentSlots();
+  state.shortcutRecordingIndex = null;
+  state.shortcutManualOpenIndex = null;
+  state.shortcutPermissionDetailsOpen = false;
+  state.selectedIndex = targetIndex;
+  state.selectedSurface = "key";
+  state.dirty = true;
+  render();
+  flashSwappedKeys(sourceIndex, targetIndex);
+  showTransientToast(`已交换 Key ${sourceIndex + 1} 与 Key ${targetIndex + 1}，保存并应用后下发`, 2800);
+}
+
+/** 为刚完成交换的两个物理键播放一次短促确认动画，不进入持久状态。 */
+function flashSwappedKeys(sourceIndex, targetIndex) {
+  window.requestAnimationFrame(() => {
+    const buttons = [sourceIndex, targetIndex]
+      .map((index) => el.keyGrid.querySelector(`.deck-key[data-key="${index}"]`))
+      .filter(Boolean);
+    buttons.forEach((button) => button.classList.add("surface-swap-complete"));
+    window.setTimeout(() => {
+      buttons.forEach((button) => button.classList.remove("surface-swap-complete"));
+    }, 620);
+  });
+}
+
+/** 展示短暂底部提示；只清理由本次调用写入且尚未被新消息替换的内容。 */
+function showTransientToast(message, durationMs) {
+  el.toast.textContent = message;
+  window.setTimeout(() => {
+    if (el.toast.textContent === message) el.toast.textContent = "";
+  }, durationMs);
 }
 
 function updateKeyKind(kind) {

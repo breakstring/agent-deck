@@ -2946,13 +2946,19 @@ def create_app(
         """Return a whitelisted CSS/JS asset for the local GUI.
 
         入参：`asset_name` 是 URL path 中的资源名；只允许 `index.html` 引用的
-        `app.css`、`device.css`、`controls.css` 和 `app.js`。
+        `app.css`、`device.css`、`controls.css`、`surface-swap.js` 和 `app.js`。
         返回：`FileResponse`，由 FastAPI/Starlette 按扩展名设置内容类型。
         错误处理：未知文件名、路径穿越或文件缺失返回 404。
         副作用：只读取包内静态前端资源，不读取用户目录、不访问网络或硬件。
         """
 
-        allowed_assets = {"app.css", "device.css", "controls.css", "app.js"}
+        allowed_assets = {
+            "app.css",
+            "device.css",
+            "controls.css",
+            "surface-swap.js",
+            "app.js",
+        }
         if asset_name not in allowed_assets:
             raise HTTPException(status_code=404, detail="unknown web asset")
         asset_path = _WEB_ASSET_ROOT / asset_name

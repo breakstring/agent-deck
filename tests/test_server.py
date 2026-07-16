@@ -76,21 +76,23 @@ def test_web_index_serves_n4pro_layout_editor() -> None:
     assert 'data-device-profile="mirabox.n4pro"' in response.text
     assert "keyGrid" in response.text
     assert "knob-strip" in response.text
+    assert response.text.index("surface-swap.js") < response.text.index("app.js")
 
 
 def test_web_asset_route_serves_only_whitelisted_assets() -> None:
     """Verify packaged web assets are served through a narrow allowlist.
 
-    入参：无；测试内读取允许和不允许的 `/assets/{name}`。
-    返回：无返回值；断言通过代表 GUI 所需品牌图可用，任意文件名不会被暴露。
+    入参：无；测试内读取允许的品牌/CSS/JS 资源和不允许的路径。
+    返回：无返回值；断言通过代表 GUI 静态资源可用，任意文件名不会被暴露。
     错误处理：允许资源缺失或未知资源未返回 404 时由 pytest 报告。
-    副作用：只读取包内静态 PNG，不访问真实硬件、用户配置或网络。
+    副作用：只读取包内静态资源，不访问真实硬件、用户配置或网络。
     """
 
     client = TestClient(create_app())
 
     logo_response = client.get("/assets/logo_command_core.png")
     css_response = client.get("/web/app.css")
+    swap_controller_response = client.get("/web/surface-swap.js")
     missing_response = client.get("/assets/../config.py")
     missing_web_response = client.get("/web/../server/app.py")
 
@@ -98,6 +100,8 @@ def test_web_asset_route_serves_only_whitelisted_assets() -> None:
     assert logo_response.headers["content-type"] == "image/png"
     assert css_response.status_code == 200
     assert css_response.headers["content-type"].startswith("text/css")
+    assert swap_controller_response.status_code == 200
+    assert "createBoundedSwapController" in swap_controller_response.text
     assert missing_response.status_code == 404
     assert missing_web_response.status_code == 404
 
