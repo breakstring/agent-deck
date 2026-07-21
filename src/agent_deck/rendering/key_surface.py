@@ -38,6 +38,7 @@ class KeySurfaceKind(StrEnum):
     FOLDER = "folder"
     KEYBOARD_SHORTCUT = "keyboard_shortcut"
     AGENT = "agent"
+    CODEX_PET = "codex_pet"
     QUOTA_STATUS = "quota_status"
     USAGE_SUMMARY = "usage_summary"
     DISABLED = "disabled"
@@ -172,6 +173,8 @@ class N4ProKeyBinding(BaseModel):
             return self.path
         if self.kind == KeySurfaceKind.KEYBOARD_SHORTCUT:
             return "快捷键"
+        if self.kind == KeySurfaceKind.CODEX_PET:
+            return "Codex 宠物"
         if self.kind == KeySurfaceKind.QUOTA_STATUS:
             return "订阅 / 限额状态"
         if self.kind == KeySurfaceKind.USAGE_SUMMARY:
@@ -302,7 +305,7 @@ def project_n4pro_key_layout(
 def _project_static_binding(binding: N4ProKeyBinding) -> KeyPlan:
     """把非 Agent binding 投影成单个 key plan。
 
-    入参：`binding` 是 unassigned/app/url/folder/status/disabled 按键配置。
+    入参：`binding` 是 unassigned/app/url/folder/status/codex_pet/disabled 按键配置。
     返回：对应的 `KeyPlan`。
     错误处理：未知 kind 降级为无 intent 空键。
     副作用：无。
@@ -362,6 +365,13 @@ def _project_static_binding(binding: N4ProKeyBinding) -> KeyPlan:
             action="send_keyboard_shortcut",
             shortcut=binding.shortcut,
             shortcut_icon=binding.icon or ShortcutIconSpec(),
+        )
+    if binding.kind == KeySurfaceKind.CODEX_PET:
+        return KeyPlan(
+            index=binding.index,
+            label=binding.display_label(),
+            role="ambient",
+            kind=binding.kind.value,
         )
     if binding.kind == KeySurfaceKind.QUOTA_STATUS:
         return KeyPlan(

@@ -182,16 +182,50 @@ function applyTheme(theme, options = {}) {
   if (options.persist) persistTheme(resolvedTheme);
 }
 
+/** 返回主键用途的中文标题；宠物键只描述展示用途，不暗示可点击动作。 */
 function keyLabel(key) {
   if (key.kind === "unassigned") return "未设置快捷动作";
   if (key.kind === "app") return "打开或切换 App";
   if (key.kind === "url") return "打开网址";
   if (key.kind === "keyboard_shortcut") return key.label || "键盘快捷键";
   if (key.kind === "agent") return "Agent 状态槽位";
+  if (key.kind === "codex_pet") return "Codex 宠物";
   if (key.kind === "quota_status") return "订阅 / 限额状态";
   if (key.kind === "usage_summary") return "Token / 金额用量";
   if (key.kind === "disabled") return "暂不设定";
   return "按键";
+}
+
+/** 返回 daemon 当前 Codex 宠物诊断；尚未加载状态时返回空对象。 */
+function codexPetStatus() {
+  return state.status?.codex_pet || {};
+}
+
+/** 把宠物全局活动枚举转换成紧凑中文预览文案。 */
+function codexPetActivityLabel(activity) {
+  if (activity === "running") return "运行中";
+  if (activity === "needs_input") return "等待输入";
+  if (activity === "blocked") return "受阻";
+  if (activity === "ready") return "已完成";
+  return "闲置";
+}
+
+/** 汇总宠物选择和解析结果，供检查器展示真实 daemon 状态。 */
+function codexPetResolutionLabel(pet) {
+  const resolution = pet.resolution_status || pet.resolution || pet.status;
+  if (resolution === "loaded" || resolution === "resolved" || resolution === "ready") return "已加载";
+  if (resolution === "stale") return "使用最近一次成功素材";
+  if (resolution === "builtin_unsupported" || resolution === "builtin") return "内置宠物首版暂不解析";
+  if (resolution === "disabled") return "功能已关闭";
+  if (resolution === "not_selected") return "Codex 尚未选择宠物";
+  if (pet.last_error) return `加载失败：${pet.last_error}`;
+  return "等待 daemon 解析";
+}
+
+/** 汇总宠物动画模式，并把 auto 读取失败与素材错误分开呈现。 */
+function codexPetMotionLabel(pet) {
+  const effective = pet.effective_motion === "reduced" ? "减少动态" : "完整动画";
+  return pet.motion_error ? `${effective}（自动检测失败）` : effective;
 }
 
 function quotaWindowLabel(value) {
@@ -330,6 +364,7 @@ function appFromBinding(binding) {
   };
 }
 
+/** 把 daemon key binding 转为可编辑的 Web 草稿，并保留无动作宠物用途。 */
 function uiKeyFromBinding(binding) {
   const base = { index: binding.index, dirty: false };
   if (binding.kind === "app") {
@@ -367,6 +402,9 @@ function uiKeyFromBinding(binding) {
   }
   if (binding.kind === "agent") {
     return { ...base, role: "agent", kind: "agent", slot: 1 };
+  }
+  if (binding.kind === "codex_pet") {
+    return { ...base, role: "ambient", kind: "codex_pet" };
   }
   if (binding.kind === "quota_status") {
     return {
@@ -432,6 +470,7 @@ function impliedPressDescription(rotateAction) {
   return "不执行动作";
 }
 
+/** 把 Web 草稿序列化为 daemon binding；宠物键不携带 action 或 intent。 */
 function bindingFromUiKey(key) {
   if (key.kind === "app") {
     return {
@@ -473,6 +512,9 @@ function bindingFromUiKey(key) {
   if (key.kind === "agent") {
     return { index: key.index, kind: "agent", label: "Agent" };
   }
+  if (key.kind === "codex_pet") {
+    return { index: key.index, kind: "codex_pet", label: "Codex 宠物" };
+  }
   if (key.kind === "quota_status") {
     return {
       index: key.index,
@@ -495,6 +537,7 @@ function bindingFromUiKey(key) {
   return { index: key.index, kind: "unassigned" };
 }
 
+/** 渲染硬件键位的配置预览；真实宠物帧由 daemon 的硬件 provider 提供。 */
 function renderKeyFace(key) {
   if (key.kind === "unassigned") {
     return '<div class="unassigned-mark">+</div>';
@@ -522,6 +565,14 @@ function renderKeyFace(key) {
   if (key.kind === "agent") {
     const agent = agentForSlot(key.slot);
     return `<div class="agent-visual ${agentVisualClass(agent)}"></div>`;
+  }
+  if (key.kind === "codex_pet") {
+    return `
+      <div class="status-key-preview quota-status-preview">
+        <span>${escapeHtml(codexPetActivityLabel(codexPetStatus().activity))}</span>
+        <strong>Pet</strong>
+      </div>
+    `;
   }
   if (key.kind === "quota_status") {
     return `
@@ -785,6 +836,7 @@ function renderShortcutControls(key) {
   `;
 }
 
+/** 渲染当前主键的用途检查器；宠物用途只展示解析状态，不提供点击动作控件。 */
 function renderKeyInspector() {
   const key = state.keys[state.selectedIndex];
   el.selectedEyebrow.textContent = `Key ${key.index + 1}`;
@@ -792,6 +844,8 @@ function renderKeyInspector() {
   el.selectedSubtitle.textContent =
     key.kind === "agent"
       ? "按键只表达状态，不显示文字或详情。"
+      : key.kind === "codex_pet"
+        ? "跟随 Codex 当前选择的宠物；仅展示，点击无动作。"
       : key.kind === "quota_status"
         ? "按下后切换 Auto、5H、Week 的订阅状态图。"
         : key.kind === "usage_summary"
@@ -814,6 +868,15 @@ function renderKeyInspector() {
       detailRow("槽位", `第 ${key.slot} 个 Agent`) +
       detailRow("当前", agent ? agent.status : "空槽") +
       detailRow("按下", "选择并聚焦");
+  } else if (key.kind === "codex_pet") {
+    const pet = codexPetStatus();
+    const petName = pet.display_name || pet.name || pet.selected_avatar_id || "尚未选择";
+    details =
+      detailRow("当前宠物", petName) +
+      detailRow("全局状态", codexPetActivityLabel(pet.activity)) +
+      detailRow("素材", codexPetResolutionLabel(pet)) +
+      detailRow("动画", codexPetMotionLabel(pet)) +
+      detailRow("按下", "仅展示，不执行动作");
   } else if (key.kind === "url") {
     details = detailRow("网址", key.url || "https://example.com") + detailRow("图标", key.iconStatus || "使用域名缩写");
   } else if (key.kind === "quota_status") {
@@ -842,6 +905,7 @@ function renderKeyInspector() {
         ${choiceButton("keyboard_shortcut", "键盘快捷键", key.kind === "keyboard_shortcut" ? shortcutSummary(key.shortcut) : "")}
         ${choiceButton("quota_status", "订阅 / 限额状态", key.kind === "quota_status" ? quotaWindowLabel(key.quotaWindow) : "")}
         ${choiceButton("usage_summary", "Token / 金额用量", key.kind === "usage_summary" ? usagePeriodLabel(key.usagePeriod) : "")}
+        ${choiceButton("codex_pet", "Codex 宠物", key.kind === "codex_pet" ? codexPetActivityLabel(codexPetStatus().activity) : "仅展示")}
         ${choiceButton("agent", "Agent 状态", key.kind === "agent" ? `槽位 ${key.slot}` : "")}
         ${choiceButton("disabled", "暂不设定", "")}
       </div>
@@ -1368,6 +1432,7 @@ function showTransientToast(message, durationMs) {
   }, durationMs);
 }
 
+/** 切换当前键用途；Codex 宠物只写入 ambient 展示类型，不附加点击动作。 */
 function updateKeyKind(kind) {
   const key = state.keys[state.selectedIndex];
   state.shortcutRecordingIndex = null;
@@ -1402,7 +1467,8 @@ function updateKeyKind(kind) {
   } else if (kind === "agent") {
     const agentCountBefore = state.keys.filter((item) => item.kind === "agent" && item.index < key.index).length;
     Object.assign(key, { role: "agent", kind: "agent", slot: agentCountBefore + 1 });
-    renumberAgentSlots();
+  } else if (kind === "codex_pet") {
+    Object.assign(key, { role: "ambient", kind: "codex_pet" });
   } else if (kind === "quota_status") {
     Object.assign(key, {
       role: "status",
@@ -1418,6 +1484,7 @@ function updateKeyKind(kind) {
   } else if (kind === "disabled") {
     Object.assign(key, { role: "disabled", kind: "disabled" });
   }
+  renumberAgentSlots();
   markDirty(key);
   render();
 }
@@ -1497,6 +1564,7 @@ function renderAppList() {
       key.role = "quick";
       key.kind = "app";
       key.app = app;
+      renumberAgentSlots();
       markDirty(key);
       closeAppModal();
       render();

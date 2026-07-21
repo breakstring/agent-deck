@@ -73,6 +73,38 @@ def test_manual_panel_cycle_includes_brand_and_returns_to_brand() -> None:
     assert selection.active_kind == PanelKind.BRAND
 
 
+def test_manual_panel_cycle_appends_pets_only_when_enabled() -> None:
+    """启用宠物系统时应追加 Pets，关闭时从 Pets 安全归位到 Quota。
+
+    入参：无；测试分别从 Tokens 和已失效的 Pets selection 前进。
+    返回：无；断言通过代表配置开关完整控制 Pets 的人工轮换可达性。
+    错误处理：Pets 无法进入、关闭后仍可达或归位规则错误时由 pytest 报告。
+    副作用：仅创建不可变 selection。
+    """
+
+    enabled = cycle_virtual_panel(
+        PanelSelection(active_kind=PanelKind.TOKENS),
+        direction=PanelContentDirection.NEXT,
+        pets_enabled=True,
+    )
+    assert enabled.active_kind == PanelKind.PETS
+    assert (
+        cycle_virtual_panel(
+            enabled,
+            direction=PanelContentDirection.NEXT,
+            pets_enabled=True,
+        ).active_kind
+        == PanelKind.BRAND
+    )
+
+    disabled = cycle_virtual_panel(
+        PanelSelection(active_kind=PanelKind.PETS),
+        direction=PanelContentDirection.NEXT,
+        pets_enabled=False,
+    )
+    assert disabled.active_kind == PanelKind.QUOTA
+
+
 def test_panel_content_cycle_changes_quota_and_tokens_but_brand_is_silent_noop() -> None:
     """内容轮换只作用于 Quota/Usage，Brand 必须保持安静无变化。
 

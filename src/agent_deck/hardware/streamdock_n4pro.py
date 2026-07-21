@@ -28,13 +28,22 @@ StreamDockInputCallback = Callable[[object, object], None]
 StreamDockN4ProSessionOutputCallback = Callable[[object, bool], str | None]
 StreamDockN4ProBackgroundUpdateProvider = Callable[[], tuple[int, Image.Image | None]]
 StreamDockN4ProBackgroundWaiter = Callable[[float], bool]
-StreamDockN4ProKeyImageUpdateProvider = Callable[[], tuple[int, Mapping[int, Image.Image]]]
+StreamDockN4ProKeyImageSource = Image.Image | Path
+"""持久动画器可直接下发的按键图来源：内存 Pillow 图或已预渲染 PNG 路径。"""
+
+StreamDockN4ProKeyImageUpdateProvider = Callable[
+    [], tuple[int, Mapping[int, StreamDockN4ProKeyImageSource]]
+]
+"""返回静态按键完整映射及其 revision 的热更新 provider。"""
 
 _MIN_BACKGROUND_UPDATE_INTERVAL_SECONDS = 0.04
 """连续输入时同会话背景热更新的最短间隔，超过此频率时只保留最新 revision。"""
 
 _HANDSHAKE_SETTLE_SECONDS = 0.05
 """N4 Pro 接受 `HAN` 握手后、常驻 SDK 会话 open 前的最短稳定等待。"""
+
+_REMOVED_KEY_IMAGE = Image.new("RGB", (112, 112), (0x0B, 0x0F, 0x16))
+"""完整静态键映射删除某键时下发的稳定清屏图，避免旧图留在设备显存。"""
 
 
 class StreamDockN4ProDeviceLike(Protocol):
@@ -228,7 +237,8 @@ class StreamDockN4ProPersistentAnimator:
         self._last_background_update_monotonic: float | None = None
         self._key_image_update_provider: StreamDockN4ProKeyImageUpdateProvider | None = None
         self._last_key_image_revision: int | None = None
-        self._last_key_images: dict[int, Image.Image] = {}
+        self._last_key_images: dict[int, StreamDockN4ProKeyImageSource] = {}
+        self._animation_overwritten_keys: set[int] = set()
         self._background_update_event = Event()
         self._background_wait = background_wait or (
             self._background_update_event.wait if sleep is time.sleep else None
@@ -277,8 +287,10 @@ class StreamDockN4ProPersistentAnimator:
     ) -> None:
         """设置静态主按键的热更新 provider。
 
-        入参：`provider` 返回单调递增 revision 与当前完整静态键图映射；映射不得包含当前由动画帧
-        控制的 agent 键。animator 会基于上次已写图片引用计算本次仅需下发的差异。
+        入参：`provider` 返回单调递增 revision 与当前完整静态键图映射；值可以是 Pillow 图像，
+        也可以是已预渲染且仍存在的 `Path`。正常映射不应包含当前由动画帧控制的 agent 键；
+        若布局热切换短暂产生重叠，animator 会延迟该键的静态写入，待动画释放后恢复。
+        animator 会基于上次已写图片引用或路径计算本次仅需下发的差异。
         返回：无显式返回值。
         错误处理：设置阶段不读取 provider，也不访问 SDK。
         副作用：覆盖实例内存 provider；当前活跃帧循环会在下次检查 revision 时使用新值。
@@ -304,13 +316,13 @@ class StreamDockN4ProPersistentAnimator:
         key_frame_paths: Mapping[int, tuple[Path, ...]],
         duration_seconds: float,
         fps: int,
-        key_images: Mapping[int, Image.Image] | None = None,
+        key_images: Mapping[int, StreamDockN4ProKeyImageSource] | None = None,
     ) -> StreamDockN4ProAnimationResult:
         """播放一轮按键动画，复用已经打开的 N4 Pro 会话。
 
         入参：`background_image` 是可选 800x480 背景图；`key_frame_paths` 是 key 到帧 PNG
-        路径的映射；`key_images` 是 key 到静态 Pillow 图的映射；`duration_seconds` 是本轮
-        播放窗口；`fps` 是目标帧率。
+        路径的映射；`key_images` 是 key 到静态 Pillow 图或预渲染图片路径的映射；
+        `duration_seconds` 是本轮播放窗口；`fps` 是目标帧率。
         返回：`StreamDockN4ProAnimationResult`，成功结果包含 timing 诊断；persistent 模式下
         `close` 阶段耗时固定为 0，真实 close 只在 `close()` 中发生。
         错误处理：非法参数、设备不可用或 SDK 返回非零 TransportResult 时返回 `ok=False`；
@@ -331,6 +343,7 @@ class StreamDockN4ProPersistentAnimator:
         normalized_frames = {
             key: tuple(paths) for key, paths in key_frame_paths.items()
         }
+        animated_keys = set(normalized_frames)
         normalized_key_images = dict(key_images or {})
         key_count = len(set(normalized_frames) | set(normalized_key_images))
         frame_budget = max(1, int(round(duration_seconds * fps)))
@@ -343,6 +356,7 @@ class StreamDockN4ProPersistentAnimator:
             device = self._ensure_open_device(timing=timing, started_at=started_at)
             if isinstance(device, StreamDockN4ProAnimationResult):
                 return device
+            self._animation_overwritten_keys.update(animated_keys)
 
             session_output_error = self._apply_session_output(
                 device,
@@ -359,10 +373,39 @@ class StreamDockN4ProPersistentAnimator:
             initial_key_image_revision = self._read_key_image_revision()
             if initial_key_image_revision is not None:
                 initial_key_revision, initial_key_images = initial_key_image_revision
-                if initial_key_images:
-                    normalized_key_images = dict(initial_key_images)
-                self._last_key_image_revision = initial_key_revision
-                self._last_key_images = dict(normalized_key_images)
+                normalized_key_images = dict(initial_key_images)
+                source_error = _key_image_sources_error(normalized_key_images)
+                if source_error is not None:
+                    self.close()
+                    return StreamDockN4ProAnimationResult(
+                        ok=False,
+                        key_count=len(set(normalized_frames) | set(normalized_key_images)),
+                        error=f"key image update failed: {source_error}",
+                    )
+                if (
+                    initial_key_revision == self._last_key_image_revision
+                    and not self._animation_overwritten_keys
+                ):
+                    initial_key_images_to_write = {}
+                else:
+                    initial_key_images_to_write = _changed_key_image_sources(
+                        previous=self._last_key_images,
+                        current=normalized_key_images,
+                    )
+                    for key in self._animation_overwritten_keys:
+                        initial_key_images_to_write[key] = normalized_key_images.get(
+                            key,
+                            _REMOVED_KEY_IMAGE,
+                        )
+            else:
+                initial_key_images_to_write = dict(normalized_key_images)
+                for key in self._animation_overwritten_keys:
+                    initial_key_images_to_write[key] = normalized_key_images.get(
+                        key,
+                        _REMOVED_KEY_IMAGE,
+                    )
+            for key in animated_keys:
+                initial_key_images_to_write.pop(key, None)
             key_count = len(set(normalized_frames) | set(normalized_key_images))
             after_open_init = self._monotonic()
             after_background = after_open_init
@@ -390,11 +433,14 @@ class StreamDockN4ProPersistentAnimator:
             else:
                 timing["background"] = 0.0
 
-            if normalized_key_images:
+            if initial_key_images_to_write:
                 static_started_at = self._monotonic()
-                for key, image in normalized_key_images.items():
-                    key_path = _save_temp_png(image, temp_dir=self._temp_dir)
-                    temp_paths.append(key_path)
+                for key, image_source in initial_key_images_to_write.items():
+                    key_path = _key_image_source_path(
+                        image_source,
+                        temp_dir=self._temp_dir,
+                        temp_paths=temp_paths,
+                    )
                     key_result = device.set_key_image(key, str(key_path))
                     if streamdock_sdk_result_failed(key_result):
                         self.close()
@@ -417,6 +463,12 @@ class StreamDockN4ProPersistentAnimator:
             else:
                 timing["static_keys"] = 0.0
                 after_static = after_background
+            self._animation_overwritten_keys.difference_update(
+                initial_key_images_to_write
+            )
+            if initial_key_image_revision is not None:
+                self._last_key_image_revision = initial_key_revision
+                self._last_key_images = dict(normalized_key_images)
 
             frames_rendered = 0
             background_hot_updates = 0
@@ -461,6 +513,7 @@ class StreamDockN4ProPersistentAnimator:
                         self._write_pending_key_image_update(
                             device,
                             temp_paths=temp_paths,
+                            animated_keys=animated_keys,
                         )
                     )
                     key_update_elapsed = _elapsed_seconds(
@@ -599,6 +652,7 @@ class StreamDockN4ProPersistentAnimator:
         self._last_background_update_monotonic = None
         self._last_key_image_revision = None
         self._last_key_images = {}
+        self._animation_overwritten_keys.clear()
         self._background_update_event.clear()
         if device is None:
             return
@@ -648,13 +702,13 @@ class StreamDockN4ProPersistentAnimator:
 
     def _read_key_image_revision(
         self,
-    ) -> tuple[int, Mapping[int, Image.Image]] | None:
+    ) -> tuple[int, Mapping[int, StreamDockN4ProKeyImageSource]] | None:
         """读取静态按键 provider 的最新 revision，并将异常降级为本帧无更新。
 
         入参：无。
-        返回：无 provider 时为 None；正常时返回 revision 与当前完整静态键图映射。
+        返回：无 provider 时为 None；正常时返回 revision 与当前完整静态键图来源映射。
         错误处理：provider 异常被吞掉，避免一次缓存读取失败关闭真实设备会话。
-        副作用：只读取 daemon 内存中的 revision 与 Pillow 图像引用，不访问 SDK。
+        副作用：只读取 daemon 内存中的 revision 与 Pillow 图像或路径引用，不访问 SDK。
         """
 
         provider = self._key_image_update_provider
@@ -713,10 +767,12 @@ class StreamDockN4ProPersistentAnimator:
         device: StreamDockN4ProDeviceLike,
         *,
         temp_paths: list[Path],
+        animated_keys: set[int],
     ) -> tuple[bool, int, str | None]:
         """在活跃帧循环内下发 revision 已变化的静态键图。
 
-        入参：`device` 是当前已 open/init 的 N4 Pro；`temp_paths` 收集本轮 PNG 以便统一清理。
+        入参：`device` 是当前已 open/init 的 N4 Pro；`temp_paths` 收集本轮 PNG 以便统一清理；
+        `animated_keys` 是本轮仍由 agent 动画帧占用的键，静态更新必须延迟到下一轮释放后。
         返回：依次为是否写入、写入键数和可选错误文本；没有新 revision 时返回 `(False, 0, None)`。
         错误处理：provider 缺失或异常降级为无更新；非法键或 SDK 写入失败返回错误，调用方关闭会话。
         副作用：revision 变化时只比较并调用本次完整映射中发生变化的键的 `set_key_image`，由同一帧
@@ -727,21 +783,33 @@ class StreamDockN4ProPersistentAnimator:
         if pending is None:
             return False, 0, None
         revision, key_images = pending
-        if revision == self._last_key_image_revision:
+        if (
+            revision == self._last_key_image_revision
+            and not self._animation_overwritten_keys
+        ):
             return False, 0, None
         normalized_images = dict(key_images)
         invalid_keys = sorted(key for key in normalized_images if key not in range(1, 16))
         if invalid_keys:
             return False, 0, f"key image update keys must be in range 1..15: {invalid_keys}"
-        changed_images = {
-            key: image
-            for key, image in normalized_images.items()
-            if self._last_key_images.get(key) is not image
-        }
+        source_error = _key_image_sources_error(normalized_images)
+        if source_error is not None:
+            return False, 0, f"key image update failed: {source_error}"
+        changed_images = _changed_key_image_sources(
+            previous=self._last_key_images,
+            current=normalized_images,
+        )
+        for key in self._animation_overwritten_keys:
+            changed_images[key] = normalized_images.get(key, _REMOVED_KEY_IMAGE)
+        for key in animated_keys:
+            changed_images.pop(key, None)
         try:
-            for key, image in changed_images.items():
-                key_path = _save_temp_png(image, temp_dir=self._temp_dir)
-                temp_paths.append(key_path)
+            for key, image_source in changed_images.items():
+                key_path = _key_image_source_path(
+                    image_source,
+                    temp_dir=self._temp_dir,
+                    temp_paths=temp_paths,
+                )
                 result = device.set_key_image(key, str(key_path))
                 if streamdock_sdk_result_failed(result):
                     return (
@@ -756,6 +824,7 @@ class StreamDockN4ProPersistentAnimator:
             return False, 0, f"set_key_image update failed: {type(exc).__name__}: {exc}"
         self._last_key_image_revision = revision
         self._last_key_images = normalized_images
+        self._animation_overwritten_keys.difference_update(changed_images)
         return bool(changed_images), len(changed_images), None
 
     def _wait_for_next_frame(self, delay_seconds: float) -> None:
@@ -1277,17 +1346,17 @@ def _validate_animation_inputs(
     duration_seconds: float,
     fps: int,
     key_frame_paths: Mapping[int, tuple[Path, ...]],
-    key_images: Mapping[int, Image.Image] | None,
+    key_images: Mapping[int, StreamDockN4ProKeyImageSource] | None,
     require_surface: bool,
 ) -> StreamDockN4ProAnimationResult | None:
     """校验 N4 Pro 按键动画 sink 的硬件无关参数。
 
     入参：`duration_seconds` 是播放窗口；`fps` 是目标帧率；`key_frame_paths` 是 key 到帧路径；
-    `key_images` 是 key 到静态图的映射；`require_surface` 表示调用方已经提供背景或其他非 key
-    surface。
+    `key_images` 是 key 到静态 Pillow 图或预渲染路径的映射；`require_surface` 表示调用方已经
+    提供背景或其他非 key surface。
     返回：参数合法时返回 None；非法时返回 `ok=False` 的错误结果。
     错误处理：本函数不抛业务异常，统一把校验失败转成结果对象。
-    副作用：无；只读取内存参数，不访问文件或硬件。
+    副作用：只读检查 `Path` 是否为现存普通文件，不访问硬件也不修改文件。
     """
 
     if duration_seconds <= 0:
@@ -1317,6 +1386,9 @@ def _validate_animation_inputs(
             ok=False,
             error=f"keys must have at least one frame: {empty_keys}",
         )
+    source_error = _key_image_sources_error(normalized_key_images)
+    if source_error is not None:
+        return StreamDockN4ProAnimationResult(ok=False, error=source_error)
     if not require_surface and not normalized_frames and not normalized_key_images:
         return StreamDockN4ProAnimationResult(
             ok=False,
@@ -1356,6 +1428,86 @@ def _close_discarded_enumerated_device(device: StreamDockN4ProDeviceLike) -> Non
         device.close(notify=False)
     except Exception:
         pass
+
+
+def _key_image_sources_error(
+    sources: Mapping[int, StreamDockN4ProKeyImageSource],
+) -> str | None:
+    """校验静态按键图来源是否为 Pillow 图或现存文件路径。
+
+    入参：`sources` 是逻辑键号到静态按键图来源的映射；键号范围由上层独立校验。
+    返回：全部合法时返回 None；否则返回第一条可直接进入诊断的短错误。
+    错误处理：路径状态读取异常转换为错误文本，不向调用方传播。
+    副作用：只调用路径的 `is_file()`，不打开、写入或删除文件。
+    """
+
+    for key, source in sources.items():
+        if isinstance(source, Image.Image):
+            continue
+        if not isinstance(source, Path):
+            return (
+                f"key image source for key {key} must be Pillow Image or pathlib.Path"
+            )
+        try:
+            is_file = source.is_file()
+        except OSError as exc:
+            return f"key image path for key {key} is unreadable: {type(exc).__name__}: {exc}"
+        if not is_file:
+            return f"key image path for key {key} must be an existing file: {source}"
+    return None
+
+
+def _changed_key_image_sources(
+    *,
+    previous: Mapping[int, StreamDockN4ProKeyImageSource],
+    current: Mapping[int, StreamDockN4ProKeyImageSource],
+) -> dict[int, StreamDockN4ProKeyImageSource]:
+    """返回相对上一轮确实需要重新下发的静态按键图来源。
+
+    入参：`previous` 是上次成功写入后的完整映射；`current` 是新 revision 的完整映射。
+    返回：仅含新增、删除或视觉来源发生变化的键；删除项映射到稳定清屏图，Path 按路径值
+    比较，Pillow 图按对象引用比较。
+    错误处理：不做文件校验；调用方须先调用 `_key_image_sources_error` 或在物化时处理错误。
+    副作用：无；只读取映射和值。
+    """
+
+    changed: dict[int, StreamDockN4ProKeyImageSource] = {}
+    for key, source in current.items():
+        old_source = previous.get(key)
+        if isinstance(source, Path):
+            if not isinstance(old_source, Path) or old_source != source:
+                changed[key] = source
+        elif old_source is not source:
+            changed[key] = source
+    for key in previous.keys() - current.keys():
+        changed[key] = _REMOVED_KEY_IMAGE
+    return changed
+
+
+def _key_image_source_path(
+    source: StreamDockN4ProKeyImageSource,
+    *,
+    temp_dir: Path | None,
+    temp_paths: list[Path],
+) -> Path:
+    """把静态键图来源转换为可直接交给 SDK 的路径。
+
+    入参：`source` 是 Pillow 图或预渲染 Path；`temp_dir` 是 Pillow 编码临时目录；
+    `temp_paths` 收集由本函数新建且应在本轮结束时删除的 PNG。
+    返回：Path 输入原样返回，Pillow 输入返回新编码的临时 PNG 路径。
+    错误处理：Path 不存在或不是文件时抛 ValueError；Pillow 保存错误按原异常传播。
+    副作用：仅 Pillow 来源会创建临时 PNG；预渲染 Path 不复制、不编码、也不加入清理列表。
+    """
+
+    if isinstance(source, Path):
+        if not source.is_file():
+            raise ValueError(f"key image path must be an existing file: {source}")
+        return source
+    if not isinstance(source, Image.Image):
+        raise TypeError("key image source must be Pillow Image or pathlib.Path")
+    key_path = _save_temp_png(source, temp_dir=temp_dir)
+    temp_paths.append(key_path)
+    return key_path
 
 
 def _save_temp_jpeg(image: Image.Image, *, temp_dir: Path | None) -> Path:

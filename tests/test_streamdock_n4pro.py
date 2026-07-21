@@ -829,6 +829,262 @@ def test_persistent_animator_writes_static_key_diff_during_active_frame_loop(
     assert result.timing_seconds["key_hot_update"] >= 0.0
 
 
+def test_persistent_animator_clears_a_removed_static_key_in_same_session(
+    tmp_path: Path,
+) -> None:
+    """静态键从完整映射删除时应写一张清屏图，不重开设备或遗留旧帧。
+
+    入参：``tmp_path`` 提供初始静态键图片；provider 从 ``{1: image}`` 切到空映射。
+    返回：无；断言 Key 1 写入两次、第二次计为一次 hot update 且 open/init 仍各一次。
+    错误处理：删除只改变 Python 映射却没有真实 ``set_key_image`` 时由 pytest 报告。
+    副作用：只操作 fake device 和 pytest 临时图片，不访问真实 N4 Pro。
+    """
+
+    device = FakeN4ProUnifiedDevice()
+    initial = Image.new("RGB", (112, 112), (1, 2, 3))
+    revisions = iter(((1, {1: initial}), (2, {}), (2, {})))
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=FakeUnifiedManager([device]),
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+    animator.set_key_image_update_provider(lambda: next(revisions))
+
+    result = animator(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={},
+        duration_seconds=0.2,
+        fps=10,
+    )
+
+    assert result.ok is True
+    assert [entry for entry in device.calls if entry == ("set_key_image", 1)] == [
+        ("set_key_image", 1),
+        ("set_key_image", 1),
+    ]
+    assert [name for name, _ in device.calls].count("open") == 1
+    assert [name for name, _ in device.calls].count("init") == 1
+    assert result.timing_seconds["key_hot_updates"] == 1.0
+    assert result.timing_seconds["key_hot_keys"] == 1.0
+
+
+def test_persistent_animator_reuses_prerendered_key_paths_during_hot_updates(
+    tmp_path: Path,
+) -> None:
+    """长连接动画循环应原样复用预渲染路径，并只下发实际切换的宠物帧。
+
+    入参：`tmp_path` 提供两个预渲染宠物键 PNG 和一个普通动画键帧；provider 在活跃循环中
+    从第一帧切到第二帧，随后仅增加 revision 而保持同一路径。
+    返回：无返回值；断言通过表示 Path 未被二次编码、同一路径未重复写入且仍共用一次会话。
+    错误处理：路径被复制/清理、revision 空转导致重复写或 open/init 次数变化时由 pytest 报告。
+    副作用：只操作 fake device 和 pytest 临时图片，不访问真实 N4 Pro。
+    """
+
+    animation_frame = tmp_path / "agent-frame.png"
+    pet_frame_a = tmp_path / "pet-a.png"
+    pet_frame_b = tmp_path / "pet-b.png"
+    Image.new("RGB", (96, 96), (10, 20, 30)).save(animation_frame)
+    Image.new("RGB", (112, 112), (1, 2, 3)).save(pet_frame_a)
+    Image.new("RGB", (112, 112), (4, 5, 6)).save(pet_frame_b)
+    revisions = iter(
+        (
+            (1, {1: pet_frame_a}),
+            (1, {1: pet_frame_a}),
+            (2, {1: pet_frame_b}),
+            (3, {1: pet_frame_b}),
+        )
+    )
+    device = FakeN4ProUnifiedDevice()
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=FakeUnifiedManager([device]),
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+    animator.set_key_image_update_provider(lambda: next(revisions))
+
+    result = animator(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={2: (animation_frame,)},
+        duration_seconds=0.3,
+        fps=10,
+    )
+
+    assert result.ok is True
+    assert [entry for entry in device.calls if entry == ("set_key_image", 1)] == [
+        ("set_key_image", 1),
+        ("set_key_image", 1),
+    ]
+    assert device.paths_seen.count(pet_frame_a) == 1
+    assert device.paths_seen.count(pet_frame_b) == 1
+    assert not any(path.name.startswith("agent-deck-n4pro-key-") for path in device.paths_seen)
+    assert pet_frame_a.is_file()
+    assert pet_frame_b.is_file()
+    assert [name for name, _ in device.calls].count("open") == 1
+    assert [name for name, _ in device.calls].count("init") == 1
+    assert result.timing_seconds["key_hot_updates"] == 1.0
+    assert result.timing_seconds["key_hot_keys"] == 1.0
+
+
+def test_persistent_animator_rewrites_static_pet_after_agent_animation_releases_key(
+    tmp_path: Path,
+) -> None:
+    """动画键被静态宠物接管时，下一轮必须真正重写同 revision 的宠物帧。
+
+    入参：`tmp_path` 提供一张 agent 动画帧和一张预渲染宠物帧；provider 在首轮动画中途
+    从空映射切到键 1 宠物，并在第二轮保持相同 revision。
+    返回：无返回值；断言第二轮释放动画键后仍写入宠物，且 persistent 会话不重新 open/init。
+    错误处理：若热更新被随后 agent 帧覆盖却仍被误记为已生效，路径与调用次数断言会失败。
+    副作用：只操作 fake device 和 pytest 临时图片，不访问真实 N4 Pro。
+    """
+
+    agent_frame = tmp_path / "agent-frame.png"
+    pet_frame = tmp_path / "pet-frame.png"
+    Image.new("RGB", (96, 96), (10, 20, 30)).save(agent_frame)
+    Image.new("RGB", (112, 112), (4, 5, 6)).save(pet_frame)
+    provider_calls = [0]
+
+    def provide_key_images() -> tuple[int, dict[int, Path]]:
+        """首读返回空映射，后续始终返回同一宠物 revision。
+
+        入参：无。
+        返回：第一次为 revision 1 的空映射，随后为 revision 2 的键 1 宠物路径。
+        错误处理：无。
+        副作用：递增内存调用计数，用来模拟首轮动画中途发生布局切换。
+        """
+
+        provider_calls[0] += 1
+        if provider_calls[0] == 1:
+            return 1, {}
+        return 2, {1: pet_frame}
+
+    device = FakeN4ProUnifiedDevice()
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=FakeUnifiedManager([device]),
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+    animator.set_key_image_update_provider(provide_key_images)
+
+    first = animator(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={1: (agent_frame,)},
+        duration_seconds=0.1,
+        fps=10,
+    )
+    writes_after_first = [
+        entry for entry in device.calls if entry == ("set_key_image", 1)
+    ]
+    second = animator(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={},
+        duration_seconds=0.1,
+        fps=10,
+    )
+
+    assert first.ok is True
+    assert second.ok is True
+    assert len(writes_after_first) == 1
+    assert [entry for entry in device.calls if entry == ("set_key_image", 1)] == [
+        ("set_key_image", 1),
+        ("set_key_image", 1),
+    ]
+    assert device.paths_seen[-1] == pet_frame
+    assert [name for name, _ in device.calls].count("open") == 1
+    assert [name for name, _ in device.calls].count("init") == 1
+
+
+def test_persistent_animator_does_not_repeat_same_prerendered_path_between_calls(
+    tmp_path: Path,
+) -> None:
+    """相同 revision 或仅 revision 变化但路径未变时不应跨 renderer 轮次重写宠物键。
+
+    入参：`tmp_path` 提供一个预渲染宠物键 PNG 和普通动画键帧；provider 状态由测试原地更新。
+    返回：无返回值；断言通过表示相同路径只下发一次，且多轮调用仍复用首次 open/init 会话。
+    错误处理：同帧重复写、provider revision 空转触发写入或额外重连时由 pytest 报告。
+    副作用：只操作 fake device 和 pytest 临时图片，不访问真实硬件。
+    """
+
+    animation_frame = tmp_path / "agent-frame.png"
+    pet_frame = tmp_path / "pet.png"
+    Image.new("RGB", (96, 96), (10, 20, 30)).save(animation_frame)
+    Image.new("RGB", (112, 112), (1, 2, 3)).save(pet_frame)
+    current_revision = [1]
+    device = FakeN4ProUnifiedDevice()
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=FakeUnifiedManager([device]),
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+    animator.set_key_image_update_provider(
+        lambda: (current_revision[0], {1: pet_frame})
+    )
+
+    first = animator(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={2: (animation_frame,)},
+        duration_seconds=0.1,
+        fps=10,
+    )
+    second = animator(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={2: (animation_frame,)},
+        duration_seconds=0.1,
+        fps=10,
+    )
+    current_revision[0] = 2
+    third = animator(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={2: (animation_frame,)},
+        duration_seconds=0.1,
+        fps=10,
+    )
+
+    assert first.ok is True
+    assert second.ok is True
+    assert third.ok is True
+    assert [entry for entry in device.calls if entry == ("set_key_image", 1)] == [
+        ("set_key_image", 1)
+    ]
+    assert [name for name, _ in device.calls].count("open") == 1
+    assert [name for name, _ in device.calls].count("init") == 1
+
+
+def test_persistent_animator_rejects_missing_prerendered_path_and_closes(
+    tmp_path: Path,
+) -> None:
+    """provider 返回不存在的预渲染路径时应失败并关闭已打开的持久会话。
+
+    入参：`tmp_path` 提供不会实际创建的宠物键路径。
+    返回：无返回值；断言通过表示错误清晰、没有调用按键写入且 open 后执行 close(False)。
+    错误处理：无效路径被交给 SDK、会话泄漏或异常逸出时由 pytest 报告。
+    副作用：只操作 fake device 的内存调用记录，不访问真实 N4 Pro。
+    """
+
+    missing_path = tmp_path / "missing-pet-frame.png"
+    device = FakeN4ProUnifiedDevice()
+    animator = StreamDockN4ProPersistentAnimator(
+        manager=FakeUnifiedManager([device]),
+        temp_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+    animator.set_key_image_update_provider(lambda: (1, {1: missing_path}))
+
+    result = animator(
+        background_image=Image.new("RGB", (800, 480), (1, 2, 3)),
+        key_frame_paths={},
+        duration_seconds=0.1,
+        fps=10,
+    )
+
+    assert result.ok is False
+    assert result.error is not None
+    assert "must be an existing file" in result.error
+    assert ("set_key_image", 1) not in device.calls
+    assert [name for name, _ in device.calls].count("open") == 1
+    assert [name for name, _ in device.calls].count("init") == 1
+    assert device.calls[-1] == ("close", False)
+
+
 def test_persistent_animator_background_notification_wakes_frame_wait(
     tmp_path: Path,
 ) -> None:

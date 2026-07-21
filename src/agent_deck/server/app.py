@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from threading import RLock
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
@@ -72,6 +74,7 @@ from agent_deck.adapters.codex_app_state import (
     read_codex_app_active_sessions,
 )
 from agent_deck.adapters.codex_quota import CodexQuotaSnapshot, read_codex_quota
+from agent_deck.adapters.codex_pet import CodexPetResolver
 from agent_deck.adapters.codex_tokens import (
     CodexTokenPeriod,
     CodexTokenUsageSnapshot,
@@ -86,6 +89,7 @@ from agent_deck.core.decisions import (
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
 from agent_deck.core.modes import DeckSelection
 from agent_deck.core.state import AgentState, AgentStateStore
+from agent_deck.config import CodexPetMotion
 from agent_deck.hardware.fake import FakeHardwareSurface, HardwareInput
 from agent_deck.hardware.capabilities import get_device_profile
 from agent_deck.hardware.streamdock_n4pro import (
@@ -130,6 +134,7 @@ from agent_deck.rendering.logical_panel import (
     cycle_panel_content,
     cycle_virtual_panel,
     message_panel_plan,
+    pets_panel_plan,
 )
 from agent_deck.rendering.control_feedback import (
     ControlFeedback,
@@ -171,6 +176,7 @@ from agent_deck.server.quota_presentation_store import (
     QuotaPresentationStoreError,
     load_quota_presentation,
 )
+from agent_deck.server.codex_pet_runtime import CodexPetRuntime, ReducedMotionReader
 
 CodexAppStateEventReader = Callable[[], tuple[NormalizedEvent, ...]]
 CodexAppActiveSessionsReader = Callable[..., tuple[CodexAppActiveSession, ...]]
@@ -232,6 +238,7 @@ class DaemonPollerConfig(BaseModel):
     最近有效会话筛选；`codex_quota_enabled` 控制是否读取 Codex app-server quota；
     `codex_quota_interval_seconds` 是 quota 间隔，默认 5 分钟；
     `codex_quota_timeout_seconds` 是单次 app-server 读取超时；
+    `codex_pet_enabled`、刷新间隔、面板 FPS 与 motion 控制只读 Codex 宠物展示；
     `streamdock_quota_touchscreen_enabled` 控制是否把 quota 触屏图下发到真实硬件；
     `streamdock_quota_device` 是目标设备能力 profile，当前只支持 `n4pro`；
     `streamdock_n4pro_renderer_enabled` 控制是否启用统一 N4 Pro 背景+按钮渲染循环，启用后
@@ -257,6 +264,10 @@ class DaemonPollerConfig(BaseModel):
     codex_quota_timeout_seconds: float = Field(default=10.0, gt=0)
     codex_token_usage_enabled: bool = False
     codex_token_usage_interval_seconds: float = Field(default=300.0, gt=0)
+    codex_pet_enabled: bool = False
+    codex_pet_refresh_interval_seconds: float = Field(default=5.0, gt=0)
+    codex_pet_panel_fps: int = Field(default=8, ge=1, le=20)
+    codex_pet_motion: CodexPetMotion = CodexPetMotion.AUTO
     streamdock_quota_touchscreen_enabled: bool = False
     streamdock_quota_device: str = "n4pro"
     streamdock_n4pro_renderer_enabled: bool = False
@@ -709,7 +720,12 @@ class _DaemonRuntime:
     codex_token_usage_snapshot: CodexTokenUsageSnapshot | None
     codex_token_usage_updated_at: datetime | None
     codex_token_usage_last_error: str | None
+    codex_pet: CodexPetRuntime
+    codex_pet_panel_revision_seen: int
+    codex_pet_key_indexes: set[int]
+    codex_pet_key_visual_key: tuple[object, ...] | None
     logical_panel_selection: PanelSelection
+    logical_panel_render_lock: RLock
     logical_panel_background_revision: int
     logical_panel_last_render_duration_ms: float | None
     hardware_background_notifier: Callable[[], None] | None
@@ -1139,6 +1155,7 @@ class _DaemonRuntime:
             self.logical_panel_selection,
             body.event,
             available_quota_windows=self._available_quota_windows(),
+            pets_enabled=self.codex_pet.enabled,
         )
         self.render_current_logical_panel_image()
         return {
@@ -1192,6 +1209,7 @@ class _DaemonRuntime:
                     if direction > 0
                     else PanelContentDirection.PREVIOUS
                 ),
+                pets_enabled=self.codex_pet.enabled,
             )
             self.render_current_logical_panel_image()
             return {
@@ -1823,8 +1841,8 @@ class _DaemonRuntime:
 
         入参：`layout` 可复用本次业务路径已生成的 renderer-neutral layout；为空时重建当前
         layout。`notify` 仅在调用方即将同步执行 renderer 首帧时设为 False，避免无意义唤醒。
-        返回：当前完整静态键图映射，只包含 App、URL、quota status 和 usage summary，不含由
-        agent 动画帧控制的键。
+        返回：当前完整静态/热更新键图映射，包含 App、URL、状态键和配置的 Codex 宠物 Key，
+        不含由 agent 动画帧序列控制的键。
         错误处理：图标或状态图渲染失败按原语义传播；本方法不访问 SDK。
         副作用：内容引用发生变化时替换待下发差异、递增 revision，并可唤醒持久硬件帧循环；
         多次快速调用只保留最新差异图，保证硬件侧 latest-wins。
@@ -1841,12 +1859,22 @@ class _DaemonRuntime:
             token_usage_snapshot=self.codex_token_usage_snapshot,
             status_key_cache=self.status_key_image_cache,
         )
-        changed_images = {
-            key: image
-            for key, image in key_images.items()
-            if self.hardware_key_surface_images.get(key) is not image
+        pet_key_indexes = {
+            key.index + 1 for key in resolved_layout.keys[:10] if key.kind == "codex_pet"
         }
+        pet_visual_key: tuple[object, ...] | None = None
+        if pet_key_indexes:
+            pet_source, pet_visual_key = self.codex_pet.key_image_source()
+            if pet_source is not None:
+                for key_index in pet_key_indexes:
+                    key_images[key_index] = pet_source
+        changed_images = _changed_hardware_key_image_sources(
+            self.hardware_key_surface_images,
+            key_images,
+        )
         self.hardware_key_surface_images = key_images
+        self.codex_pet_key_indexes = pet_key_indexes
+        self.codex_pet_key_visual_key = pet_visual_key
         if not changed_images:
             return key_images
         self.hardware_key_surface_pending_images = changed_images
@@ -1865,7 +1893,52 @@ class _DaemonRuntime:
         副作用：无；复制映射以避免硬件线程遍历时看到 handler 的后续替换。
         """
 
+        self._refresh_dynamic_codex_pet_key_images()
         return self.hardware_key_surface_revision, dict(self.hardware_key_surface_images)
+
+    def _refresh_dynamic_codex_pet_key_images(self) -> None:
+        """在现有硬件 tick 中把配置的宠物 Key 切到当前预渲染 Path。
+
+        入参：无；读取当前不可变 key layout 和线程安全宠物 runtime。
+        返回：无。
+        错误处理：无可用自定义图集时由宠物 runtime 返回静态 fallback 或 None；不编码图片。
+        副作用：视觉 key 或宠物键位置变化时更新完整 key mapping、待下发差异和单调 revision；
+        不主动唤醒，因为本方法已经由 persistent animator 的 provider tick 调用。
+        """
+
+        layout = self.current_key_layout_response().layout
+        indexes = {
+            binding.index + 1
+            for binding in layout.sorted_keys()
+            if binding.kind.value == "codex_pet"
+        }
+        if not indexes:
+            self.codex_pet_key_indexes = set()
+            self.codex_pet_key_visual_key = None
+            return
+        source, visual_key = self.codex_pet.key_image_source()
+        if (
+            indexes == self.codex_pet_key_indexes
+            and visual_key == self.codex_pet_key_visual_key
+        ):
+            return
+        images = dict(self.hardware_key_surface_images)
+        for old_index in self.codex_pet_key_indexes:
+            images.pop(old_index, None)
+        if source is not None:
+            for key_index in indexes:
+                images[key_index] = source
+        changed = _changed_hardware_key_image_sources(
+            self.hardware_key_surface_images,
+            images,
+        )
+        self.hardware_key_surface_images = images
+        self.codex_pet_key_indexes = indexes
+        self.codex_pet_key_visual_key = visual_key
+        if not changed:
+            return
+        self.hardware_key_surface_pending_images = changed
+        self.hardware_key_surface_revision += 1
 
     def show_brand_feedback_panel(self, intent: InteractionIntent) -> dict[str, Any]:
         """短暂显示 Agent Deck 默认品牌面板。
@@ -2022,22 +2095,30 @@ class _DaemonRuntime:
     def build_current_logical_panel_background(self) -> tuple[Any, str] | None:
         """Build the current logical panel background image without recording it.
 
-        入参：无；读取当前 `logical_panel_selection` 和已缓存的 quota/token snapshot。
+        入参：无；读取人工 `logical_panel_selection`、pending MESSAGE override、宠物场景和
+        已缓存的 quota/token snapshot。
         返回：`(image, source)`；当前 panel 缺少真实数据时返回占位面板，保证真实 renderer
         能启动并注册硬件输入回调。
         错误处理：Pillow 渲染异常按原语义传播。
         副作用：只创建内存图像，不修改 fake surface。
         """
 
-        if self._is_brand_feedback_active():
+        decision = self._current_pending_decision()
+        effective_kind = self.effective_logical_panel_kind()
+        if decision is not None:
+            plan = _decision_message_panel_plan(decision)
+            base_image, base_source = (
+                render_logical_panel_touchscreen(plan),
+                "decision_message",
+            )
+        elif self._is_brand_feedback_active():
             base_image, base_source = (
                 self.logical_panel_image_cache.brand_image(),
                 "agent_deck:brand_feedback",
             )
         else:
-            active_kind = self.logical_panel_selection.active_kind
             quota_snapshot = self.displayed_codex_quota_snapshot()
-            if active_kind == PanelKind.QUOTA and quota_snapshot is not None:
+            if effective_kind == PanelKind.QUOTA and quota_snapshot is not None:
                 base_image, base_source = (
                     self.logical_panel_image_cache.quota_image(
                         quota_snapshot,
@@ -2046,7 +2127,7 @@ class _DaemonRuntime:
                     "codex_quota",
                 )
             elif (
-                active_kind == PanelKind.TOKENS
+                effective_kind == PanelKind.TOKENS
                 and self.codex_token_usage_snapshot is not None
             ):
                 base_image, base_source = (
@@ -2056,18 +2137,17 @@ class _DaemonRuntime:
                     ),
                     "codex_tokens",
                 )
-            elif active_kind == PanelKind.MESSAGE:
-                decision = self._current_pending_decision()
-                if decision is not None:
-                    plan = _decision_message_panel_plan(decision)
-                    base_image, base_source = (
-                        render_logical_panel_touchscreen(plan),
-                        "decision_message",
-                    )
+            elif effective_kind == PanelKind.PETS:
+                _pet_revision, pet_image = self.codex_pet.panel_background()
+                if pet_image is not None:
+                    base_image, base_source = pet_image, "codex_pet"
                 else:
+                    title, mood, lines = self.codex_pet.diagnostic_panel_content()
                     base_image, base_source = (
-                        self.logical_panel_image_cache.brand_image(),
-                        "agent_deck:splash",
+                        render_logical_panel_touchscreen(
+                            pets_panel_plan(name=title, mood=mood, lines=lines)
+                        ),
+                        "codex_pet_diagnostic",
                     )
             else:
                 base_image, base_source = (
@@ -2075,7 +2155,7 @@ class _DaemonRuntime:
                     "agent_deck:splash",
                 )
 
-        feedback = self._active_control_feedback()
+        feedback = None if decision is not None else self._active_control_feedback()
         if feedback is not None:
             return (
                 render_control_feedback_touchscreen(
@@ -2087,6 +2167,23 @@ class _DaemonRuntime:
             )
         return base_image, base_source
 
+    def effective_logical_panel_kind(self) -> PanelKind:
+        """返回当前真实显示的 panel kind，而不改写用户的人工选择。
+
+        入参：无；读取 pending decisions、配置开关和 ``logical_panel_selection``。
+        返回：有审批时始终 MESSAGE；Pets 关闭但旧选择仍为 Pets 时安全归位 Brand；否则返回
+        人工选择。
+        错误处理：无。
+        副作用：无；不会覆盖 selection，因此 transient MESSAGE 结束后自然恢复原面板。
+        """
+
+        if self._current_pending_decision() is not None:
+            return PanelKind.MESSAGE
+        active_kind = self.logical_panel_selection.active_kind
+        if active_kind == PanelKind.PETS and not self.codex_pet.enabled:
+            return PanelKind.BRAND
+        return active_kind
+
     def render_current_logical_panel_image(self) -> Any | None:
         """Render and record the current logical panel image when possible.
 
@@ -2096,18 +2193,27 @@ class _DaemonRuntime:
         副作用：可能更新 fake surface 的 touchscreen image 和计数。
         """
 
-        started_at = time.perf_counter()
-        built = self.build_current_logical_panel_background()
-        if built is None:
-            return None
-        image, source = built
-        self.surface.render_touchscreen_image(image, source=source)
-        self.logical_panel_background_revision += 1
-        self.logical_panel_last_render_duration_ms = (
-            time.perf_counter() - started_at
-        ) * 1000
-        self._notify_hardware_background_update()
-        return image
+        with self.logical_panel_render_lock:
+            started_at = time.perf_counter()
+            built = self.build_current_logical_panel_background()
+            if built is None:
+                return None
+            image, source = built
+            if source == "codex_pet":
+                pet_revision, _pet_image = self.codex_pet.panel_background()
+                if (
+                    pet_revision == self.codex_pet_panel_revision_seen
+                    and self.surface.last_touchscreen_image_source == source
+                ):
+                    return self.surface.last_touchscreen_image
+                self.codex_pet_panel_revision_seen = pet_revision
+            self.surface.render_touchscreen_image(image, source=source)
+            self.logical_panel_background_revision += 1
+            self.logical_panel_last_render_duration_ms = (
+                time.perf_counter() - started_at
+            ) * 1000
+            self._notify_hardware_background_update()
+            return image
 
     def _notify_hardware_background_update(self) -> None:
         """通知已连接 persistent animator 读取最新 logical panel revision。
@@ -2134,12 +2240,73 @@ class _DaemonRuntime:
         副作用：HUD 过期时更新 fake surface 缓存和 revision；不创建硬件会话。
         """
 
-        source = self.surface.last_touchscreen_image_source or ""
-        if source.startswith("control_feedback:") and self._active_control_feedback() is None:
-            self.render_current_logical_panel_image()
-        if self.surface.last_touchscreen_image is None:
-            self.render_current_logical_panel_image()
-        return self.logical_panel_background_revision, self.surface.last_touchscreen_image
+        with self.logical_panel_render_lock:
+            source = self.surface.last_touchscreen_image_source or ""
+            pending_decision = self._current_pending_decision()
+            if pending_decision is not None:
+                if source != "decision_message":
+                    self.render_current_logical_panel_image()
+                return (
+                    self.logical_panel_background_revision,
+                    self.surface.last_touchscreen_image,
+                )
+            should_sample_pet = (
+                self.effective_logical_panel_kind() == PanelKind.PETS
+                and not self._is_brand_feedback_active()
+                and self._active_control_feedback() is None
+            )
+
+        if should_sample_pet:
+            started_at = time.perf_counter()
+            pet_revision, pet_image = self.codex_pet.panel_background()
+            with self.logical_panel_render_lock:
+                if self._current_pending_decision() is not None:
+                    self.render_current_logical_panel_image()
+                elif (
+                    self.effective_logical_panel_kind() == PanelKind.PETS
+                    and not self._is_brand_feedback_active()
+                    and self._active_control_feedback() is None
+                ):
+                    source = self.surface.last_touchscreen_image_source or ""
+                    if (
+                        pet_image is not None
+                        and pet_revision != self.codex_pet_panel_revision_seen
+                    ):
+                        self.surface.render_touchscreen_image(
+                            pet_image,
+                            source="codex_pet",
+                        )
+                        self.codex_pet_panel_revision_seen = pet_revision
+                        self.logical_panel_background_revision += 1
+                        self.logical_panel_last_render_duration_ms = (
+                            time.perf_counter() - started_at
+                        ) * 1000
+                    elif pet_image is None and source != "codex_pet_diagnostic":
+                        self.render_current_logical_panel_image()
+
+        with self.logical_panel_render_lock:
+            source = self.surface.last_touchscreen_image_source or ""
+            if self._current_pending_decision() is not None:
+                if source != "decision_message":
+                    self.render_current_logical_panel_image()
+                return (
+                    self.logical_panel_background_revision,
+                    self.surface.last_touchscreen_image,
+                )
+            if source == "decision_message":
+                self.render_current_logical_panel_image()
+                source = self.surface.last_touchscreen_image_source or ""
+            if (
+                source.startswith("control_feedback:")
+                and self._active_control_feedback() is None
+            ):
+                self.render_current_logical_panel_image()
+            if self.surface.last_touchscreen_image is None:
+                self.render_current_logical_panel_image()
+            return (
+                self.logical_panel_background_revision,
+                self.surface.last_touchscreen_image,
+            )
 
     def _is_brand_feedback_active(self) -> bool:
         """判断 transient 品牌反馈面板是否仍在有效时间内。
@@ -2235,29 +2402,27 @@ class _DaemonRuntime:
         approval event；随后 render fake surface 一帧。
         """
 
-        created_at = datetime.now(UTC)
-        decision = self.broker.create(
-            agent_key=body.agent_key,
-            session_id=body.session_id,
-            turn_id=body.turn_id,
-            tool_name=body.tool_name,
-            reason=body.reason,
-            created_at=created_at,
-            timeout=body.timeout_seconds,
-        )
-        self._reflect_pending_decision_if_agent_exists(decision, created_at)
-        self.selection = self.selection.model_copy(
-            update={
-                "selected_agent_key": body.agent_key,
-                "selected_decision_id": decision.decision_id,
-            }
-        )
-        self.render_current()
-        self.logical_panel_selection = self.logical_panel_selection.model_copy(
-            update={"active_kind": PanelKind.MESSAGE}
-        )
-        self.render_current_logical_panel_image()
-        return decision
+        with self.logical_panel_render_lock:
+            created_at = datetime.now(UTC)
+            decision = self.broker.create(
+                agent_key=body.agent_key,
+                session_id=body.session_id,
+                turn_id=body.turn_id,
+                tool_name=body.tool_name,
+                reason=body.reason,
+                created_at=created_at,
+                timeout=body.timeout_seconds,
+            )
+            self._reflect_pending_decision_if_agent_exists(decision, created_at)
+            self.selection = self.selection.model_copy(
+                update={
+                    "selected_agent_key": body.agent_key,
+                    "selected_decision_id": decision.decision_id,
+                }
+            )
+            self.render_current()
+            self.render_current_logical_panel_image()
+            return decision
 
     def resolve_decision(
         self,
@@ -2281,10 +2446,6 @@ class _DaemonRuntime:
                 update={"selected_decision_id": None}
             )
         self.render_current()
-        if not self.broker.pending():
-            self.logical_panel_selection = self.logical_panel_selection.model_copy(
-                update={"active_kind": PanelKind.QUOTA}
-            )
         self.render_current_logical_panel_image()
         return resolved
 
@@ -2315,6 +2476,7 @@ class _DaemonRuntime:
                     update={"selected_decision_id": None}
                 )
             self.render_current()
+            self.render_current_logical_panel_image()
         return result
 
     def status(self) -> dict[str, Any]:
@@ -2377,8 +2539,10 @@ class _DaemonRuntime:
                 "updated_at": _dump_datetime(self.codex_token_usage_updated_at),
                 "last_error": self.codex_token_usage_last_error,
             },
+            "codex_pet": self.codex_pet.diagnostics(),
             "logical_panel": {
                 "selection": _dump_model(self.logical_panel_selection),
+                "effective_kind": self.effective_logical_panel_kind().value,
                 "touchscreen_render_count": self.surface.touchscreen_render_count,
                 "touchscreen_image_size": _image_size(
                     self.surface.last_touchscreen_image
@@ -2459,6 +2623,7 @@ class _DaemonRuntime:
 
         self._reflect_pending_decisions_for_known_agents()
         states = self.store.snapshot()
+        self.codex_pet.update_activity(states)
         self._ensure_first_agent_selected(states)
         decisions = self.broker.pending()
         layout = build_layout_plan(
@@ -2468,6 +2633,8 @@ class _DaemonRuntime:
             key_layout=self.current_key_layout_response().layout,
         )
         self.surface.render(layout)
+        if self.effective_logical_panel_kind() == PanelKind.PETS:
+            self.render_current_logical_panel_image()
         return layout
 
     def _current_pending_decision(self) -> PendingDecision | None:
@@ -2640,6 +2807,9 @@ def create_app(
     url_icon_cache_path: Path | None = None,
     shortcut_icon_store_path: Path | None = None,
     url_icon_fetcher: UrlIconFetcher | None = None,
+    codex_pet_resolver: CodexPetResolver | None = None,
+    codex_pet_reduced_motion_reader: ReducedMotionReader | None = None,
+    codex_pet_cache_path: Path | None = None,
     key_layout_path: Path | None = None,
     rotary_layout_path: Path | None = None,
     quota_presentation_path: Path | None = None,
@@ -2665,6 +2835,8 @@ def create_app(
     辅助功能设置，测试可注入无副作用 fake；`app_icon_cache_path` 是 App 图标缓存根目录；`url_icon_cache_path` 是 URL
     favicon 缓存根目录；`shortcut_icon_store_path` 是内容寻址自定义快捷键图标目录；这些路径
     默认使用用户级 Application Support；`url_icon_fetcher` 供测试替换网络请求；
+    `codex_pet_resolver`、reduced-motion reader 与 cache path 供宠物解析/可访问性/临时缓存测试
+    注入，生产默认只读跟随 Codex 并使用 daemon 生命周期临时目录；
     `key_layout_path` 与 `rotary_layout_path` 为 None 时相应 GUI 布局只保存在进程内，传入路径时
     启动会读各自 JSON，保存会写回；`quota_presentation_path` 可选加载独立 quota 展示策略，
     只影响硬件显示而不改原始采集数据；`system_control_executor` 可注入 fake，默认按平台构造
@@ -2676,6 +2848,31 @@ def create_app(
     """
 
     resolved_poller_config = poller_config or DaemonPollerConfig()
+    codex_pet_temp_directory: TemporaryDirectory[str] | None = None
+    if resolved_poller_config.codex_pet_enabled and codex_pet_cache_path is None:
+        codex_pet_temp_directory = TemporaryDirectory(
+            prefix="agent-deck-codex-pet-"
+        )
+    resolved_codex_pet_cache_path = (
+        codex_pet_cache_path
+        if codex_pet_cache_path is not None
+        else (
+            Path(codex_pet_temp_directory.name)
+            if codex_pet_temp_directory is not None
+            else Path(".")
+        )
+    )
+    codex_pet_runtime = CodexPetRuntime(
+        enabled=resolved_poller_config.codex_pet_enabled,
+        panel_fps=resolved_poller_config.codex_pet_panel_fps,
+        motion=resolved_poller_config.codex_pet_motion,
+        cache_root=resolved_codex_pet_cache_path,
+        fallback_key_path=(
+            resolved_poller_config.streamdock_n4pro_frame_root / "offline.png"
+        ),
+        resolver=codex_pet_resolver,
+        reduced_motion_reader=codex_pet_reduced_motion_reader,
+    )
     app_icon_cache = AppIconCache(resolve_app_icon_cache_root(app_icon_cache_path))
     url_icon_cache = UrlIconCache(
         resolve_url_icon_cache_root(url_icon_cache_path),
@@ -2737,7 +2934,12 @@ def create_app(
         codex_token_usage_snapshot=None,
         codex_token_usage_updated_at=None,
         codex_token_usage_last_error=None,
+        codex_pet=codex_pet_runtime,
+        codex_pet_panel_revision_seen=0,
+        codex_pet_key_indexes=set(),
+        codex_pet_key_visual_key=None,
         logical_panel_selection=PanelSelection(),
+        logical_panel_render_lock=RLock(),
         logical_panel_background_revision=0,
         logical_panel_last_render_duration_ms=None,
         hardware_background_notifier=None,
@@ -2868,6 +3070,17 @@ def create_app(
                     )
                 )
             )
+        if resolved_poller_config.codex_pet_enabled:
+            tasks.append(
+                asyncio.create_task(
+                    _poll_codex_pet_loop(
+                        runtime,
+                        interval_seconds=(
+                            resolved_poller_config.codex_pet_refresh_interval_seconds
+                        ),
+                    )
+                )
+            )
         if resolved_poller_config.streamdock_n4pro_renderer_enabled:
             tasks.append(
                 asyncio.create_task(
@@ -2890,18 +3103,26 @@ def create_app(
             for task in tasks:
                 with suppress(asyncio.CancelledError):
                     await task
-            if resolved_poller_config.streamdock_n4pro_renderer_enabled:
-                await _render_streamdock_n4pro_visible_splash(
-                    visible_splash_touchscreen_sink,
-                )
-            runtime.keyboard_shortcut_scheduler.close()
-            close_renderer = getattr(
-                resolved_streamdock_n4pro_renderer_sink,
-                "close",
-                None,
-            )
-            if callable(close_renderer):
-                close_renderer()
+            try:
+                if resolved_poller_config.streamdock_n4pro_renderer_enabled:
+                    await _render_streamdock_n4pro_visible_splash(
+                        visible_splash_touchscreen_sink,
+                    )
+            finally:
+                try:
+                    runtime.keyboard_shortcut_scheduler.close()
+                finally:
+                    try:
+                        close_renderer = getattr(
+                            resolved_streamdock_n4pro_renderer_sink,
+                            "close",
+                            None,
+                        )
+                        if callable(close_renderer):
+                            close_renderer()
+                    finally:
+                        if codex_pet_temp_directory is not None:
+                            codex_pet_temp_directory.cleanup()
 
     app = FastAPI(title="Agent Deck Daemon API", lifespan=lifespan)
     app.state.runtime = runtime
@@ -3436,6 +3657,8 @@ async def _run_enabled_pollers_once(
             runtime,
             token_usage_reader=codex_token_usage_reader,
         )
+    if config.codex_pet_enabled:
+        await _poll_codex_pet_once(runtime)
     if config.streamdock_n4pro_renderer_enabled:
         await _render_streamdock_n4pro_once(
             runtime,
@@ -3534,6 +3757,47 @@ async def _poll_codex_token_usage_loop(
         )
 
 
+async def _poll_codex_pet_loop(
+    runtime: _DaemonRuntime,
+    *,
+    interval_seconds: float,
+) -> None:
+    """周期性只读刷新 Codex 全局宠物选择与自定义素材。
+
+    入参：``runtime`` 持有 resolver/controller；``interval_seconds`` 来自 ``[codex.pet]``。
+    返回：不主动返回；任务取消时结束。
+    错误处理：单次意外异常由 ``_poll_codex_pet_once`` 写入短诊断，不终止循环。
+    副作用：周期性读取 Codex 配置/图集；素材指纹变化时重建 daemon 临时 Key PNG。
+    """
+
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await _poll_codex_pet_once(runtime)
+
+
+async def _run_tracked_sync_worker(
+    function: Callable[..., Any],
+    /,
+    *args: object,
+    **kwargs: object,
+) -> Any:
+    """在线程池执行一个同步 worker，并在调用任务取消后等待已启动工作真正结束。
+
+    入参：``function`` 是可能访问 renderer 或宠物临时缓存的同步函数；其余位置和关键字参数
+    原样传入。返回：同步函数的返回值。错误处理：正常执行时原样传播 worker 异常；调用任务
+    被取消时先等待已启动 worker 收尾，再重新抛出 ``CancelledError``。副作用：创建一个仅跟踪
+    本次已开始工作的 asyncio task；不会预排下一轮 poll，也不会让尚在 sleep 的循环启动工作。
+    """
+
+    worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        with suppress(Exception):
+            await worker
+        raise
+
+
 async def _render_streamdock_n4pro_loop(
     runtime: _DaemonRuntime,
     *,
@@ -3600,7 +3864,7 @@ async def _render_streamdock_n4pro_once(
             layout,
             notify=False,
         )
-        result = await asyncio.to_thread(
+        result = await _run_tracked_sync_worker(
             renderer_sink,
             background_image=background,
             key_frame_paths=key_frame_paths,
@@ -3758,6 +4022,46 @@ def _key_images_from_layout(
                 period=key.payload.get("usage_period"),
             )
     return key_images
+
+
+def _same_key_image_source(previous: Any, current: Any) -> bool:
+    """比较硬件 Key 图来源是否代表同一缓存视觉。
+
+    入参：``previous``/``current`` 可以是 Pillow image、预渲染 ``Path`` 或 None。
+    返回：Path 按路径值相等、其他对象按引用相同则为 True。
+    错误处理：无；未知来源仍按引用保守比较。
+    副作用：无；不检查路径存在性、不打开图片。
+    """
+
+    if isinstance(previous, Path) or isinstance(current, Path):
+        return isinstance(previous, Path) and isinstance(current, Path) and previous == current
+    return previous is current
+
+
+def _changed_hardware_key_image_sources(
+    previous: dict[int, Any],
+    current: dict[int, Any],
+) -> dict[int, Any]:
+    """比较 daemon 两轮完整静态键映射，并显式保留删除项。
+
+    入参：``previous`` 是上轮已发布映射；``current`` 是本轮完整映射。
+    返回：新增/替换项携带当前图片，删除项携带 ``None``，供 revision 与诊断计数传播；
+    persistent animator 会在硬件边界把删除项转换成稳定清屏图。
+    错误处理：无；Path/图片比较由 ``_same_key_image_source`` 完成。
+    副作用：无；只创建差异字典，不访问文件或硬件。
+    """
+
+    changed: dict[int, Any] = {}
+    for key in previous.keys() | current.keys():
+        if key not in current:
+            changed[key] = None
+            continue
+        if key not in previous or not _same_key_image_source(
+            previous[key],
+            current[key],
+        ):
+            changed[key] = current[key]
+    return changed
 
 
 def _normalize_quota_status_window(value: str | None) -> QuotaStatusWindow:
@@ -4055,6 +4359,28 @@ async def _poll_codex_token_usage_once(
         runtime.update_codex_token_usage(snapshot, updated_at=polled_at)
     except Exception as exc:  # noqa: BLE001 - poller 必须保护 daemon 主循环。
         runtime.mark_codex_token_usage_poll_error(exc, polled_at=polled_at)
+
+
+async def _poll_codex_pet_once(runtime: _DaemonRuntime) -> None:
+    """只读刷新一次 Codex 宠物，并发布最新 Key/PETS surface。
+
+    入参：``runtime`` 持有线程安全宠物协调器与当前 layout。
+    返回：无。
+    错误处理：resolver 的已建模失败进入 ``codex_pet`` status；未建模异常也转成短诊断，
+    不阻断其他 poller 或 daemon 启动。
+    副作用：在线程中读取 Codex 配置/自定义图集并按需写临时 Key PNG；成功或降级后只更新
+    内存 surface revision，不创建硬件会话。
+    """
+
+    polled_at = datetime.now(UTC)
+    try:
+        await _run_tracked_sync_worker(runtime.codex_pet.refresh, now=polled_at)
+        layout = runtime.render_current()
+        runtime.publish_hardware_key_surface_images(layout)
+        if runtime.effective_logical_panel_kind() == PanelKind.PETS:
+            runtime.render_current_logical_panel_image()
+    except Exception as exc:  # noqa: BLE001 - 宠物展示不能杀 daemon。
+        runtime.codex_pet.mark_refresh_error(exc, updated_at=polled_at)
 
 
 async def _send_quota_touchscreen_to_streamdock(

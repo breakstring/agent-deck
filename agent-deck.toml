@@ -9,3 +9,9 @@ frame_root = "assets/codex/generated/n4pro-key-112-fps10"
 mode = "passthrough"
 timeout_seconds = 25.0
 deny_message = "Denied by Agent Deck."
+
+[codex.pet]
+enabled = true
+refresh_interval_seconds = 5.0
+panel_fps = 8
+motion = "auto"

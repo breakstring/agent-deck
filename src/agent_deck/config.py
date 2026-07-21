@@ -83,10 +83,44 @@ class CodexPermissionRequestConfig(BaseModel):
     deny_message: str = Field(default="Denied by Agent Deck.", min_length=1)
 
 
+class CodexPetMotion(StrEnum):
+    """定义 Codex 宠物在硬件表面上的动态展示策略。
+
+    入参：枚举值来自 ``[codex.pet].motion``。
+    返回：字符串枚举，可直接传给 daemon 的宠物场景控制器。
+    错误处理：未知字符串由 Pydantic 配置校验拒绝。
+    副作用：无；声明枚举不读取系统 reduced-motion 设置。
+    """
+
+    AUTO = "auto"
+    FULL = "full"
+    REDUCED = "reduced"
+
+
+class CodexPetConfig(BaseModel):
+    """配置 Agent Deck 对 Codex 全局宠物选择的只读展示。
+
+    入参：``enabled`` 控制 PETS 面板和宠物 Key 动态资源；
+    ``refresh_interval_seconds`` 是重新读取 Codex 选择与 manifest 的间隔；``panel_fps``
+    是 PETS 可见时背景的最高目标帧率；``motion`` 控制完整、减少或系统跟随动画。
+    返回：frozen Pydantic model；不包含独立 ``pet_id``，始终跟随 Codex 全局选择。
+    错误处理：非正刷新间隔、超出 1-20 的 FPS 或未知 motion 由 Pydantic 拒绝。
+    副作用：模型自身不读取 Codex 配置、不加载图片、不访问硬件。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = True
+    refresh_interval_seconds: float = Field(default=5.0, gt=0)
+    panel_fps: int = Field(default=8, ge=1, le=20)
+    motion: CodexPetMotion = CodexPetMotion.AUTO
+
+
 class CodexConfig(BaseModel):
     """配置 Agent Deck 对 Codex 专属能力的处理方式。
 
-    入参：`permission_request` 控制 sandbox/escalation 审批 hook 的响应策略。
+    入参：`permission_request` 控制 sandbox/escalation 审批 hook 的响应策略；`pet`
+    控制只读跟随 Codex 全局宠物选择的硬件展示。
     返回：frozen Pydantic model。
     错误处理：子配置非法时由 Pydantic 报告。
     副作用：模型自身不读写外部资源。
@@ -97,6 +131,7 @@ class CodexConfig(BaseModel):
     permission_request: CodexPermissionRequestConfig = Field(
         default_factory=CodexPermissionRequestConfig
     )
+    pet: CodexPetConfig = Field(default_factory=CodexPetConfig)
 
 
 class FocusActionConfig(BaseModel):

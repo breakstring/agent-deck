@@ -156,8 +156,9 @@ flowchart LR
     渲染到底部 N4 Pro touch-bar viewport，并默认交给真实硬件 renderer 下发。这个 viewport
     是 Agent Deck 的 logical panel，不是 quota 专用屏；第一批 panel kind 为 `quota`、
     `tokens`、`pets`、`message`，其中 `message` 承载审批详情、host context 或系统提示等复杂文字。
-    当前手动轮换顺序为 `brand -> quota -> tokens -> brand`；`pets` 和 `message` 仍不进入普通
-    轮换。daemon 默认启用 token usage poller，tokens 面板通过
+    Codex 宠物功能启用时，手动轮换顺序为 `brand -> quota -> tokens -> pets -> brand`；关闭
+    宠物功能时从顺序中移除 `pets`，`message` 始终不进入普通轮换。daemon 默认启用 token usage
+    poller，tokens 面板通过
     `ccusage codex daily --compact --json` 读取 Codex token usage，聚合 today/week/month/all。
     `/logical-panel/input` 提供归一化 panel 事件入口，`/hardware/input` 提供低层 `HardwareInput`
     入口。旋钮事件按用户保存的 per-control rotate binding 映射为 intent；按下静音语义从输出/输入
@@ -191,7 +192,8 @@ flowchart LR
     并立即尝试 focus 该 agent；缺少 `focus_target` 时记录 `missing_target` 诊断。
     approval action key 会把
     `approve_request` / `deny_request` 写入 decision broker，并在 pending decision 出现时
-    自动把 logical panel 切到 `message` 展示工具、Agent 和原因；没有 pending 后回到 `quota`。
+    以 transient override 方式显示 `message` 中的工具、Agent 和原因；pending 清空后恢复此前
+    人工选择的 logical panel，不把 PETS、Quota 等选择改写为 MESSAGE。
     state 会保存事件 payload 里的
     `focus_target`，默认对 `app:<AppName>` 目标调用 AppleScript 激活 App；
     `[actions.focus].enabled = false` 仅作为排障关闭开关。tmux pane/window、terminal client
@@ -407,24 +409,69 @@ P5 macOS 产品化边界：
 - `Agent Deck Privileged Installer` 只服务 managed-system 模式。管理员批准、后台运行批准和
   Accessibility 是彼此独立的系统授权，不用一个模糊的“执行权限”状态合并展示。
 
-## P6：宠物/环境反馈扩展
+## P6：宠物/环境反馈扩展（Codex 首版实施范围）
 
 目标：
 
-- 把 Codex/Claude 的宠物机制或类似 ambient feedback 接入硬件，但不污染核心状态机。
+- 只读跟随 Codex 的全局宠物选择，把同一套自定义宠物素材投影到独立的主按键和 N4 Pro PETS
+  虚拟面板，但不污染核心状态机、审批或任务执行。
+- 首版先完成 Codex 自定义宠物闭环；Claude、通用 ambient theme 和更多硬件留到后续。
 
-可拆任务：
+本轮冻结的实现范围：
+
+1. 新增 `[codex.pet]` 配置，提供启用开关、只读刷新间隔、PETS 最高 FPS，以及
+   `auto | full | reduced` 动效模式；不提供 Agent Deck 独立 `pet_id`。
+2. 按 `CODEX_HOME`、再 `~/.codex` 读取 Codex 全局 `selected-avatar-id`，兼容旧版顶层字段和当前
+   `[desktop]` 字段；`custom:<name>` 优先使用 `pets/<name>/pet.json`，兼容旧
+   `avatars/<name>/avatar.json`。
+3. 安全解析位于宠物目录内的 `spritesheetPath`，拒绝绝对路径、`..` 和符号链接逃逸；兼容
+   `1536×1872` 的 v1 8×9 与 `1536×2288` 的 v2 8×11 固定图集，但首版不使用 gaze 行。
+4. 同一选择 ID 短暂读取失败时保留 last-known-good；选择 ID 改变却解析失败时不冒充旧宠物。
+   Codex 内置宠物首版不解析 App 资源，按键回退静态 Codex 图，PETS 显示简短诊断。
+5. 新增 `codex_pet` ambient key 类型：完整 cell 缩放到 `112×112` 深色画布，按下无 intent、
+   不执行 action、不占 Agent slot，默认布局不自动占用键位。
+6. 宠物启用时将 PETS 加入 `brand -> quota -> tokens -> pets` 手动轮换；不因 Codex 状态自动
+   抢占面板。审批 MESSAGE 继续最高优先，但改为 transient override，结束后恢复人工选择。
+7. 按 `Needs input > Blocked > Ready > Running > Idle` 聚合顶层 Codex 状态并排除 child agent。
+   waiting、failed、review 各播放三轮后进入慢速 idle；`Ready` 首版以
+   `COMPLETED_RECENTLY` 近似。同一状态时间戳不重复触发。
+8. N4 Pro PETS 复用 `800×136` 虚拟面板与现有 persistent renderer：Running 约 15 秒完成一次
+   全宽左右往返；Idle 使用 45 秒确定周期（约 30 秒驻留、15 秒走向另一侧）；反应动作冻结当前
+   x 坐标。所有动画以 monotonic time 与累计帧时长采样，不另起 HID 会话、线程或刷新循环。
+9. `motion=auto` 尽力读取 macOS Reduce Motion；`reduced` 固定 idle 首帧、不横移。`/status`
+   增加 `codex_pet` 的选择、解析、版本、activity、motion、更新时间和短错误诊断，不返回素材。
+10. 配置页支持把任意按键设为“Codex 宠物”，完整保存/重载，并明确提示“仅展示、点击无动作”。
+
+首版明确不做：
+
+- 不解析或重新分发 Codex App 内置宠物资源，也不提交 Rick 或其他本机宠物及派生素材。
+- 不支持 Agent Deck 单独选择宠物、多宠物、按会话绑定、hover/jump/waving、v2 gaze、鼠标跟踪
+  或按指定 Codex App 键挂载。
+- 不替换现有 Agent 状态键，不让宠物按键打开 PETS，也不让宠物行为参与审批或执行。
+
+验收状态：
+
+- 自动化范围包括资产、活动/时间轴、像素、配置 round-trip、面板轮换、MESSAGE 恢复、动态
+  revision 与 fake hardware 单会话行为；以本轮最终测试记录为准，本节不预先标记通过。
+- 真机必须使用当前 Rick 做 60 秒状态 smoke 和 15 分钟 soak，重新测量全宽约 15 秒往返、
+  有效背景刷新不低于约 7 FPS、`open/init=1`、无非预期重连/HID 错误/CPU 或线程持续增长，并在
+  结束时显式关闭且不遗留 `agent-deckd`。历史约 9.56–9.57 FPS 只作为旧基线，不算本轮证据。
+
+后续可拆任务：
 
 1. `AmbientSurface` 抽象。
-2. 宠物状态 adapter。
-3. N4 Pro 触屏小动画。
-4. LED 动效规则。
-5. 用户可选 theme pack。
+2. Claude 或其他 Agent 的宠物/ambient 状态 adapter。
+3. Codex App 内置宠物的合法只读发现机制。
+4. v2 gaze、鼠标/指定按键跟踪和显式交互。
+5. LED 动效规则。
+6. 用户可选 theme pack 与更多硬件 profile。
 
 约束：
 
 - 宠物只是 presentation，不是核心状态来源。
 - 宠物动作不得影响审批和安全决策。
+- 素材坐标、动画时间轴和空间运动必须解耦；不得用逐 tick 累加造成掉帧后变慢。
+- 真实硬件继续复用唯一 persistent renderer；fake adapter 仍是自动化测试的默认路径。
 
 ## 长期模块清单
 
@@ -508,15 +555,13 @@ P5 macOS 产品化边界：
 
 ## 下一次工作建议
 
-下一次进入实现前，建议先做两件事：
+当前优先收口 P6 Codex 宠物首版：
 
-1. 确认 P2（Claude Code Adapter）在 N4 Pro 物理屏幕/按键上的槽位分配与交互策略。
-2. 收集 Claude Code hooks 样例数据以编写事件转换测试用例。
+1. 先完成定向测试与 `uv run pytest -q`，将实际结果回填到交付记录，不用旧测试结果代替。
+2. 在 fake hardware 通过后，按 P6 真机清单重新执行 Rick 的 60 秒 smoke 和 15 分钟 soak；若稳定
+   刷新上限低于目标，再把测量结果和降级策略写入硬件文档。
+3. 真实验证完成后再决定宠物是否取代 Agent 状态键；首版保持两个 Key 类型并存，避免提前锁定。
 
-建议第一个实现节点：
-
-- 收集并整理 Claude Code Hook Payload 样本（如 SessionStart, PreToolUse, Notification, Stop 等）。
-- 在 `src/agent_deck/adapters/` 下实现 `claude_code` adapter 基础转换逻辑，把 Claude 钩子事件转换为内部 `NormalizedEvent`。
-- 编写 Mock 测试跑通 Claude 事件到 state reducer 和 layout 的映射链路。
-
-这个节点不依赖真实 N4 Pro，也不修改 Codex 配置，风险最低。
+P6 收口后恢复 P2（Claude Code Adapter）：先确认 N4 Pro slot 分配与交互策略，收集
+SessionStart、PreToolUse、Notification、Stop 等 Hook Payload，再用 Mock 测试跑通 Claude 事件到
+state reducer 和 layout 的映射链路。

@@ -1003,6 +1003,12 @@ def test_daemon_callback_reads_hardware_renderer_config(
                 "",
                 "[actions.focus]",
                 "enabled = false",
+                "",
+                "[codex.pet]",
+                "enabled = true",
+                "refresh_interval_seconds = 2.5",
+                "panel_fps = 6",
+                'motion = "reduced"',
             ]
         ),
         encoding="utf-8",
@@ -1025,6 +1031,10 @@ def test_daemon_callback_reads_hardware_renderer_config(
     assert poller_config.streamdock_n4pro_renderer_fps == 8
     assert poller_config.streamdock_n4pro_frame_root == frame_root
     assert poller_config.focus_actions_enabled is False
+    assert poller_config.codex_pet_enabled is True
+    assert poller_config.codex_pet_refresh_interval_seconds == 2.5
+    assert poller_config.codex_pet_panel_fps == 6
+    assert poller_config.codex_pet_motion.value == "reduced"
 
 
 def test_daemon_rejects_out_of_range_port_before_uvicorn(monkeypatch: Any) -> None:

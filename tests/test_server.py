@@ -14,6 +14,7 @@ import plistlib
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
+from threading import Event, Thread
 from zoneinfo import ZoneInfo
 
 import agent_deck.server.app as server_app
@@ -2089,6 +2090,185 @@ def test_streamdock_n4pro_renderer_starts_with_placeholder_without_panel_data(
     assert status["streamdock_n4pro_renderer"]["last_result"]["ok"] is True
 
 
+def test_shutdown_waits_for_inflight_renderer_and_pet_workers(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    """daemon 退出必须等待已启动的 renderer/pet 线程后再关闭共享资源。
+
+    入参：``monkeypatch`` 注入可观测临时目录；``tmp_path`` 承载假缓存和帧目录。
+    返回：无；断言退出 splash、renderer close 与缓存 cleanup 都晚于两个同步 worker。
+    错误处理：Event 等待均有界，任一生命周期阶段未发生或顺序错误由 pytest 报告。
+    副作用：启动一个 TestClient 生命周期线程和两个 asyncio 默认线程池 worker；不访问真机。
+    """
+
+    order: list[str] = []
+    renderer_started = Event()
+    renderer_finished = Event()
+    pet_started = Event()
+    pet_finished = Event()
+    release_workers = Event()
+    client_ready = Event()
+    client_body_finished = Event()
+    renderer_closed = Event()
+    pet_cache_cleaned = Event()
+    lifecycle_errors: list[BaseException] = []
+
+    class TrackingTemporaryDirectory:
+        """记录宠物临时缓存 cleanup 的测试替身。"""
+
+        def __init__(self, *, prefix: str) -> None:
+            """创建隔离缓存目录并保留与 TemporaryDirectory 相同的 name 合同。
+
+            入参：``prefix`` 是生产代码传入的目录前缀。
+            返回：无。
+            错误处理：目录创建失败按原异常传播。
+            副作用：在 pytest 临时目录创建一个目录。
+            """
+
+            assert prefix == "agent-deck-codex-pet-"
+            self.name = str(tmp_path / "tracked-pet-cache")
+            Path(self.name).mkdir()
+
+        def cleanup(self) -> None:
+            """记录 cleanup，并要求两个共享资源使用者都已结束。
+
+            入参：无。
+            返回：无。
+            错误处理：若任一 worker 尚未结束则直接断言失败。
+            副作用：追加顺序记录并设置 cleanup Event；不删除 pytest 目录。
+            """
+
+            order.append("pet_cache_cleanup")
+            pet_cache_cleaned.set()
+            assert renderer_finished.is_set()
+            assert pet_finished.is_set()
+
+    class BlockingRenderer:
+        """模拟会跨越 lifespan cancel 时刻的 persistent renderer。"""
+
+        def __call__(self, **_: object) -> StreamDockN4ProAnimationResult:
+            """阻塞到测试放行，并记录真实同步工作结束时刻。
+
+            入参：忽略 renderer 背景、按键与帧率参数。
+            返回：固定成功结果。
+            错误处理：两秒内未放行时断言失败，避免测试挂死。
+            副作用：设置开始/结束 Event 并追加顺序记录。
+            """
+
+            renderer_started.set()
+            assert release_workers.wait(2.0)
+            order.append("renderer_finished")
+            renderer_finished.set()
+            return StreamDockN4ProAnimationResult(ok=True)
+
+        def close(self) -> None:
+            """记录 renderer close，并要求所有 in-flight worker 已结束。
+
+            入参：无。
+            返回：无。
+            错误处理：worker 未结束时断言失败。
+            副作用：追加顺序记录并设置 close Event。
+            """
+
+            order.append("renderer_close")
+            renderer_closed.set()
+            assert renderer_finished.is_set()
+            assert pet_finished.is_set()
+
+    splash_call_count = 0
+
+    def fake_visible_splash_sink(
+        _image: object,
+    ) -> StreamDockTouchscreenRenderResult:
+        """区分启动和退出 splash，并记录二者调用顺序。
+
+        入参：``_image`` 是品牌背景，本测试不读取像素。
+        返回：固定成功结果。
+        错误处理：无。
+        副作用：递增调用计数并追加顺序记录。
+        """
+
+        nonlocal splash_call_count
+        splash_call_count += 1
+        order.append("startup_splash" if splash_call_count == 1 else "exit_splash")
+        return StreamDockTouchscreenRenderResult(ok=True)
+
+    monkeypatch.setattr(server_app, "TemporaryDirectory", TrackingTemporaryDirectory)
+    renderer = BlockingRenderer()
+    app = create_app(
+        poller_config=DaemonPollerConfig(
+            codex_pet_enabled=True,
+            codex_pet_refresh_interval_seconds=0.01,
+            streamdock_n4pro_renderer_enabled=True,
+            streamdock_n4pro_render_interval_seconds=0.01,
+            streamdock_n4pro_frame_root=tmp_path,
+            poll_on_start=False,
+        ),
+        streamdock_n4pro_renderer_sink=renderer,
+        visible_splash_touchscreen_sink=fake_visible_splash_sink,
+    )
+
+    def blocking_pet_refresh(*, now: datetime) -> None:
+        """模拟会写 daemon 临时缓存的慢速宠物刷新。
+
+        入参：``now`` 是 poller 传入的 aware 时间，仅验证其类型。
+        返回：无。
+        错误处理：两秒内未放行时断言失败。
+        副作用：设置开始/结束 Event 并追加顺序记录。
+        """
+
+        assert now.tzinfo is not None
+        pet_started.set()
+        assert release_workers.wait(2.0)
+        order.append("pet_finished")
+        pet_finished.set()
+
+    monkeypatch.setattr(app.state.runtime.codex_pet, "refresh", blocking_pet_refresh)
+
+    def run_client_lifespan() -> None:
+        """在独立线程进入并主动退出 TestClient lifespan。
+
+        入参：无。
+        返回：无。
+        错误处理：捕获所有 lifecycle 异常交由主测试线程断言。
+        副作用：启动 FastAPI lifespan，并在两个 worker 开始后触发 shutdown。
+        """
+
+        try:
+            with TestClient(app):
+                client_ready.set()
+                assert renderer_started.wait(1.0)
+                assert pet_started.wait(1.0)
+                client_body_finished.set()
+        except BaseException as exc:  # noqa: BLE001 - 跨线程转交给 pytest 主线程。
+            lifecycle_errors.append(exc)
+
+    lifespan_thread = Thread(target=run_client_lifespan)
+    lifespan_thread.start()
+    assert client_ready.wait(1.0)
+    assert renderer_started.wait(1.0)
+    assert pet_started.wait(1.0)
+    assert client_body_finished.wait(1.0)
+
+    assert not renderer_closed.wait(0.2)
+    assert not pet_cache_cleaned.is_set()
+
+    release_workers.set()
+    lifespan_thread.join(timeout=3.0)
+
+    assert not lifespan_thread.is_alive()
+    assert lifecycle_errors == []
+    assert renderer_finished.is_set()
+    assert pet_finished.is_set()
+    assert renderer_closed.is_set()
+    assert pet_cache_cleaned.is_set()
+    assert splash_call_count == 2
+    assert order.index("renderer_finished") < order.index("exit_splash")
+    assert order.index("pet_finished") < order.index("exit_splash")
+    assert order[-3:] == ["exit_splash", "renderer_close", "pet_cache_cleanup"]
+
+
 def test_default_n4pro_renderer_input_callback_routes_sdk_events(
     monkeypatch: object,
     tmp_path: Path,
@@ -2394,16 +2574,17 @@ def test_decision_request_updates_pending_status_and_decision_layout() -> None:
     assert body["decisions"][0]["decision_id"] == decision["decision_id"]
     assert body["layout"]["mode"] == "decision"
     assert body["agents"][0]["pending_decision_count"] == 1
-    assert body["logical_panel"]["selection"]["active_kind"] == "message"
+    assert body["logical_panel"]["selection"]["active_kind"] == "brand"
+    assert body["logical_panel"]["effective_kind"] == "message"
     assert body["logical_panel"]["touchscreen_image_source"] == "decision_message"
 
 
-def test_hardware_approval_key_resolves_decision_and_restores_quota_panel() -> None:
-    """硬件 allow key 应 resolve 当前 decision 并把 message panel 收回。
+def test_hardware_approval_key_resolves_decision_and_restores_manual_panel() -> None:
+    """硬件 allow key 应 resolve 当前 decision 并恢复原人工面板。
 
     入参：无；测试内创建 agent 和 pending decision，再按 decision mode 的 ALLOW 键。
     返回：无返回值；断言通过代表硬件审批闭环能从 layout key intent 写入 broker result。
-    错误处理：decision 未 resolve、hook wait 结果错误或 panel 未回到 quota 时由 pytest 报告。
+    错误处理：decision 未 resolve、hook wait 结果错误或 panel 未回到原选择时由 pytest 报告。
     副作用：只修改测试 app 内存 broker/state，不访问真实硬件或 Codex。
     """
 
@@ -2444,7 +2625,8 @@ def test_hardware_approval_key_resolves_decision_and_restores_quota_panel() -> N
     }
     assert status["decisions"] == []
     assert status["agents"][0]["pending_decision_count"] == 0
-    assert status["logical_panel"]["selection"]["active_kind"] == "quota"
+    assert status["logical_panel"]["selection"]["active_kind"] == "brand"
+    assert status["logical_panel"]["effective_kind"] == "brand"
     assert status["logical_panel"]["touchscreen_image_source"] == "agent_deck:splash"
 
 

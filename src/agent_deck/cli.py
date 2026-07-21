@@ -273,6 +273,8 @@ def daemon_callback(
     quota 刷新周期；`codex_quota_timeout_seconds` 控制单次 quota app-server 读取超时；
     `disable_codex_token_usage_poller` 可关闭基于 ccusage 的 Codex token usage 读取；
     `codex_token_usage_poll_interval_seconds` 控制 token usage 刷新周期；
+    Codex 宠物不提供独立 CLI 选择，始终使用配置文件 `[codex.pet]` 的开关、刷新率、
+    面板 FPS 与 motion 并跟随 Codex 全局选择；
     `disable_streamdock_quota_touchscreen` 可关闭旧 quota-only 真实硬件触屏下发；
     `config_path` 指向 daemon 默认配置；`disable_hardware_renderer` 可关闭默认真实硬件渲染；
     `device_profile`、`render_interval_seconds` 和 `renderer_fps` 是面向临时调试的通用覆盖项，
@@ -319,6 +321,12 @@ def daemon_callback(
         codex_quota_timeout_seconds=codex_quota_timeout_seconds,
         codex_token_usage_enabled=not disable_codex_token_usage_poller,
         codex_token_usage_interval_seconds=codex_token_usage_poll_interval_seconds,
+        codex_pet_enabled=local_config.codex.pet.enabled,
+        codex_pet_refresh_interval_seconds=(
+            local_config.codex.pet.refresh_interval_seconds
+        ),
+        codex_pet_panel_fps=local_config.codex.pet.panel_fps,
+        codex_pet_motion=local_config.codex.pet.motion,
         streamdock_quota_touchscreen_enabled=(
             not disable_streamdock_quota_touchscreen
             and not hardware_renderer.enabled

@@ -46,11 +46,25 @@ ACTIVE_PANEL_KIND_ORDER: tuple[PanelKind, ...] = (
     PanelKind.QUOTA,
     PanelKind.TOKENS,
 )
-"""手动轮换真实 logical panel 时当前开放的稳定顺序。
+"""手动轮换真实 logical panel 时不启用宠物系统的稳定顺序。
 
-Brand 是正常待机与归位面板；`pets` 和 `message` 不进入手动轮换，后续只能由明确的上下文
-覆盖策略展示，避免用户切到空占位或审批内容。
+Brand 是正常待机与归位面板；`message` 始终只由上下文临时覆盖。启用 Codex 宠物时，
+调用方通过 `active_panel_kind_order(pets_enabled=True)` 在末尾加入 `pets`。
 """
+
+
+def active_panel_kind_order(*, pets_enabled: bool) -> tuple[PanelKind, ...]:
+    """返回当前配置下允许人工轮换的 logical panel 顺序。
+
+    入参：``pets_enabled`` 表示 Codex 宠物资产轮询与展示是否启用。
+    返回：关闭时为 Brand、Quota、Tokens；开启时追加 Pets。Message 不进入人工轮换。
+    错误处理：无；布尔值由配置模型保证。
+    副作用：无；只返回不可变枚举元组。
+    """
+
+    if pets_enabled:
+        return (*ACTIVE_PANEL_KIND_ORDER, PanelKind.PETS)
+    return ACTIVE_PANEL_KIND_ORDER
 
 
 class PanelContentDirection(StrEnum):
@@ -380,18 +394,24 @@ def apply_panel_input(
     event: PanelInputEvent,
     *,
     available_quota_windows: tuple[str, ...] | None = None,
+    pets_enabled: bool = False,
 ) -> PanelSelection:
     """把 logical panel 输入事件归约成新的选择状态。
 
     入参：`selection` 是当前选择状态；`event` 是已经由硬件层归一化的 panel 输入事件；
-    `available_quota_windows` 可由实时 quota 快照传入，以跳过当前订阅不存在的窗口。
+    `available_quota_windows` 可由实时 quota 快照传入，以跳过当前订阅不存在的窗口；
+    `pets_enabled` 控制 Pets 是否进入人工轮换。
     返回：新的 `PanelSelection`；无状态变化时返回原状态值。
     错误处理：非法事件由枚举/Pydantic 调用方约束处理；未知业务事件按无状态变化处理。
     副作用：无；不会执行 action、不会触发硬件输出。
     """
 
     if event == PanelInputEvent.TOUCH_TAP:
-        return cycle_virtual_panel(selection, direction=PanelContentDirection.NEXT)
+        return cycle_virtual_panel(
+            selection,
+            direction=PanelContentDirection.NEXT,
+            pets_enabled=pets_enabled,
+        )
 
     if event == PanelInputEvent.KNOB_4_ROTATE_RIGHT:
         return cycle_panel_content(
@@ -413,21 +433,24 @@ def cycle_virtual_panel(
     selection: PanelSelection,
     *,
     direction: PanelContentDirection,
+    pets_enabled: bool = False,
 ) -> PanelSelection:
-    """按固定 Brand、Quota、Usage 顺序切换手动 virtual panel。
+    """按配置后的 Brand、Quota、Usage、Pets 顺序切换手动 virtual panel。
 
-    入参：`selection` 是当前不可变选择状态；`direction` 指定上一个或下一个面板。
+    入参：`selection` 是当前不可变选择状态；`direction` 指定上一个或下一个面板；
+    `pets_enabled` 为 True 时把 Pets 追加到手动顺序。
     返回：active kind 更新后的新 selection；非手动 panel 会回到 Brand 再移动。
     错误处理：无；未知当前 kind 按安全归位规则处理。
     副作用：无；不渲染、不访问硬件。
     """
 
     step = 1 if direction == PanelContentDirection.NEXT else -1
+    order = active_panel_kind_order(pets_enabled=pets_enabled)
     current = selection.active_kind
-    if current not in ACTIVE_PANEL_KIND_ORDER:
+    if current not in order:
         current = PanelKind.BRAND
     return selection.model_copy(
-        update={"active_kind": _next_cyclic_value(ACTIVE_PANEL_KIND_ORDER, current, step=step)}
+        update={"active_kind": _next_cyclic_value(order, current, step=step)}
     )
 
 

@@ -131,12 +131,16 @@ scripts/agent-deckd-tmux.sh restart
 
 ### 4.3 Current N4 Pro Behavior
 
-- The ten main keys can open or switch applications, open URLs, send keyboard shortcuts, show agent status, show quota/usage status, or remain unassigned.
+- The ten main keys can open or switch applications, open URLs, send keyboard shortcuts, show agent status,
+  show quota/usage status, show the Codex pet, or remain unassigned. A Codex pet key is display-only and
+  pressing it performs no action.
 - A shortcut can be one physical key, a chord, or a sequence of up to 16 steps. Each released step may wait 0–2000 ms, and the full sequence is limited to 10 seconds.
 - Application, website, and custom shortcut icons are cached locally and shared by the configuration preview and hardware rendering. A shortcut without a custom image gets an auto-generated chord icon, and the Web preview uses the exact PNG emitted by the hardware renderer.
 - Each of the four knobs can have its own rotation action. For volume actions, pressing the knob implicitly toggles output mute or microphone mute; pressing is not separately configured.
 - Knob lighting is configured independently: off, or a base color with an optional breathing effect. When the device supports it, volume/brightness actions reflect state from the base color; muted states use red or turn off.
-- The bottom virtual panel rotates through the brand image, quota, and usage. Usage can switch among Day, Week, Month, and All.
+- With the Codex pet enabled, the bottom virtual panel manually rotates through Brand, Quota, Tokens, and
+  Pets; disabling the pet removes Pets from that rotation. A pending approval MESSAGE temporarily overrides
+  the display without changing the selected panel, which returns naturally when the approval ends.
 - If the N4 Pro is unplugged, loses power, or restarts, the background service waits for it to return and restores the display, lighting, and input. This normally takes a few seconds and does not require the official StreamDock application.
 
 ### 4.4 Keyboard Shortcuts and macOS Permission
@@ -206,6 +210,58 @@ uv run agent-deckctl codex-install --apply
 ```
 
 The installer creates backups before edits. Keep the default approval setting unless you understand the effect of changing it; by default, approvals stay in Codex's native interface.
+
+### 6.1 Codex Pet
+
+Agent Deck does not keep a separate pet selection. It reads Codex's global `selected-avatar-id` from either
+the legacy top level or the current `[desktop]` table, using `CODEX_HOME` and falling back to `~/.codex`.
+For `custom:rick`, it prefers `pets/rick/pet.json` and supports
+the legacy `avatars/rick/avatar.json` location. It never copies local pet assets into this repository.
+
+Configure pet display and polling in [`agent-deck.toml`](../../agent-deck.toml):
+
+```toml
+[codex.pet]
+enabled = true
+refresh_interval_seconds = 5.0
+panel_fps = 8
+motion = "auto" # auto | full | reduced
+```
+
+Disabling the feature removes PETS from the manual panel rotation without changing Codex. `auto` follows
+macOS Reduce Motion when it can be read; `reduced` pins the first idle frame and disables horizontal travel.
+Version 1 custom sheets must be 8×9 at `1536×1872`, version 2 sheets 8×11 at `1536×2288`, with fixed
+`192×208` cells. Version 2 gaze rows are not used in the first release. Absolute paths, `..`, and symlink
+escapes in `spritesheetPath` are rejected. Built-in Codex pets are not extracted from the app: the key uses
+the existing static Codex icon and PETS shows a short diagnostic. Rendering preserves each complete cell
+without trimming or per-frame recentering. RGB residue in fully transparent pixels is normalized and warned
+about, but does not reject an asset that Codex itself accepts.
+
+The pet is presentation-only and never changes approvals, task execution, or Agent slots. Top-level Codex
+tasks are aggregated with `Needs input > Blocked > Ready > Running > Idle` priority; child agents are ignored.
+Waiting, failed, and review reactions play three cycles and then return to slow idle. Running uses a fixed
+key animation and directional travel on the touch bar. `Ready` currently approximates
+`COMPLETED_RECENTLY`, because no reliable unread signal is available.
+
+The N4 Pro key uses a `112×112` dark canvas and does not travel. PETS uses the existing `800×136` virtual
+panel: running completes a full left/right round trip in about 15 seconds, while idle waits about 30 seconds
+and walks to the other side over 15 seconds in a deterministic 45-second cycle. Reactions freeze the current
+position. A pending approval MESSAGE remains the highest-priority transient override and never replaces the
+user's selected PETS, Quota, or other panel.
+
+`uv run agent-deckctl status` and `/status` expose a compact `codex_pet` diagnostic with the selected ID,
+resolution state, name, sprite version, global activity, motion mode, update time, asset error, and separate
+motion fallback diagnostic. They do
+not expose image bytes or a full sprite sheet. The first release does not support a separate Agent Deck pet
+picker, multiple or per-session pets, pet-key interactions, gaze/mouse tracking, or replacement of existing
+Agent status keys.
+
+Before release, validate the current Rick with one pet key and PETS selected: run a 60-second state smoke and
+a 15-minute soak; verify an approximately 15-second full-width round trip without clipping or ghosting and
+an effective background rate of roughly 7 FPS or better. Confirm `open/init=1` for the connection, no
+unexpected reconnects, HID errors, or sustained CPU/thread growth, then explicitly close the session and
+leave no `agent-deckd` process. These are required steps, not a claim that physical-hardware validation has
+already passed.
 
 ## 7. Token, Cost, and Quota
 
