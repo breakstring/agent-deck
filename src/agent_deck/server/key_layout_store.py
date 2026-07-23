@@ -19,8 +19,8 @@ _KEY_LAYOUT_ENV = "AGENT_DECK_N4PRO_KEY_LAYOUT"
 _USER_KEY_LAYOUT_PATH = (
     Path.home() / "Library/Application Support/AgentDeck/n4pro-key-layout.json"
 )
-_STORE_VERSION = 2
-_SUPPORTED_STORE_VERSIONS = frozenset({1, 2})
+_STORE_VERSION = 3
+_SUPPORTED_STORE_VERSIONS = frozenset({1, 2, 3})
 _DEVICE_PROFILE = "mirabox.n4pro"
 
 

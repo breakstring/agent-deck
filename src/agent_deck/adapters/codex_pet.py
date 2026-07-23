@@ -195,7 +195,8 @@ class PetActivity(StrEnum):
     """Codex 顶层任务归约后的全局宠物活动语义。
 
     入参：枚举值由 ``derive_pet_activity`` 产生并供场景控制器消费。
-    返回：稳定字符串枚举 ``idle/running/needs_input/blocked/ready``。
+    返回：稳定字符串枚举 ``idle/running/needs_input/blocked/review/ready``；review 只为未来
+    显式信号预留，当前状态聚合不会从普通完成状态推断它。
     错误处理：未知值由 Enum/Pydantic 拒绝。
     副作用：无。
     """
@@ -204,6 +205,7 @@ class PetActivity(StrEnum):
     RUNNING = "running"
     NEEDS_INPUT = "needs_input"
     BLOCKED = "blocked"
+    REVIEW = "review"
     READY = "ready"
 
 
@@ -265,8 +267,18 @@ _ACTIVITY_PRIORITY: Final[Mapping[PetActivity, int]] = {
     PetActivity.IDLE: 0,
     PetActivity.RUNNING: 1,
     PetActivity.READY: 2,
-    PetActivity.BLOCKED: 3,
-    PetActivity.NEEDS_INPUT: 4,
+    PetActivity.REVIEW: 3,
+    PetActivity.BLOCKED: 4,
+    PetActivity.NEEDS_INPUT: 5,
+}
+
+_CODEX_APP_ACTIVITY_PRIORITY: Final[Mapping[PetActivity, int]] = {
+    PetActivity.IDLE: 0,
+    PetActivity.READY: 1,
+    PetActivity.RUNNING: 2,
+    PetActivity.REVIEW: 3,
+    PetActivity.BLOCKED: 4,
+    PetActivity.NEEDS_INPUT: 5,
 }
 
 
@@ -594,6 +606,63 @@ def derive_pet_activity(
             continue
         candidates.append(
             (_ACTIVITY_PRIORITY[activity], state.status_since, state, activity)
+        )
+    if not candidates:
+        return PetActivitySnapshot(
+            activity=PetActivity.IDLE,
+            updated_at=observed_at,
+        )
+    _, _, winner, activity = max(
+        candidates,
+        key=lambda item: (item[0], item[1], item[2].agent_key),
+    )
+    return PetActivitySnapshot(
+        activity=activity,
+        status_since=winner.status_since,
+        agent_key=winner.agent_key,
+        updated_at=observed_at,
+    )
+
+
+def derive_codex_app_pet_activity(
+    states: Iterable[AgentState],
+    *,
+    updated_at: datetime | None = None,
+) -> PetActivitySnapshot:
+    """聚合只属于 Codex/ChatGPT Desktop 顶层任务的 Key 覆盖活动。
+
+    入参：``states`` 是完整 store 快照；仅消费 ``codex-app:*`` 或兼容的
+    ``app:Codex``/``app:ChatGPT`` focus target，并排除 CLI、child agent 与其他来源；
+    ``updated_at`` 可固定聚合时间。
+    返回：``Needs input > Error > Review > Running > Completed > Idle`` 活动；当前没有显式
+    review 状态来源，因此普通 ``COMPLETED_RECENTLY`` 只会返回 ``READY``。
+    错误处理：非法 ``updated_at`` 抛 ValueError；状态字段由 ``AgentState`` 预先校验。
+    副作用：无；不修改状态集合、不探测前台 App。
+    """
+
+    observed_at = _aware_now(updated_at)
+    candidates: list[tuple[int, datetime, AgentState, PetActivity]] = []
+    for state in states:
+        if state.source != AgentSource.CODEX:
+            continue
+        if state.is_child_agent or state.parent_agent_key is not None:
+            continue
+        focus_target = state.focus_target or ""
+        if not (
+            focus_target.startswith("codex-app:")
+            or focus_target in {"app:Codex", "app:ChatGPT"}
+        ):
+            continue
+        activity = _ACTIVITY_BY_STATUS.get(state.status)
+        if activity is None:
+            continue
+        candidates.append(
+            (
+                _CODEX_APP_ACTIVITY_PRIORITY[activity],
+                state.status_since,
+                state,
+                activity,
+            )
         )
     if not candidates:
         return PetActivitySnapshot(

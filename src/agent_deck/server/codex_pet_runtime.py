@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, Final
 
 from PIL import Image
 
@@ -23,11 +23,13 @@ from agent_deck.adapters.codex_pet import (
     CodexPetResolution,
     CodexPetResolver,
     PetActivitySnapshot,
+    derive_codex_app_pet_activity,
     derive_pet_activity,
 )
 from agent_deck.config import CodexPetMotion
 from agent_deck.core.state import AgentState
 from agent_deck.rendering.codex_pet import (
+    CodexAppPetOverlayController,
     PetSceneController,
     PetSceneSample,
     pet_key_frame_for_sample,
@@ -38,6 +40,12 @@ from agent_deck.rendering.n4pro_panel import compose_n4pro_background
 
 ReducedMotionReader = Callable[[], bool]
 """返回 macOS 当前是否启用 Reduce Motion 的可注入只读函数。"""
+
+CODEX_APP_PET_KEY_WRITE_BUDGET_PER_SECOND: Final[int] = 10
+"""所有关联 App Key 共享的默认图片写入预算。"""
+
+CODEX_APP_PET_KEY_MIN_DYNAMIC_FPS: Final[int] = 5
+"""一个被选为动态展示的 App Key 可接受的最低目标帧率。"""
 
 
 class CodexPetRuntime:
@@ -92,9 +100,14 @@ class CodexPetRuntime:
             reduced_motion=reduced_motion,
             started_at_monotonic=started_at_monotonic,
         )
+        self._app_overlay_controller = CodexAppPetOverlayController(
+            reduced_motion=reduced_motion,
+            started_at_monotonic=started_at_monotonic,
+        )
         self._lock = RLock()
         self._resolution: CodexPetResolution | None = None
         self._activity = derive_pet_activity(())
+        self._app_activity = derive_codex_app_pet_activity(())
         self._key_frames: dict[str, tuple[Path, ...]] = {}
         self._key_asset_fingerprint: str | None = None
         self._last_error: str | None = None
@@ -104,6 +117,19 @@ class CodexPetRuntime:
         self._panel_visual_key: tuple[object, ...] | None = None
         self._panel_semantic_key: tuple[object, ...] | None = None
         self._panel_render_bucket: int | None = None
+        self._app_overlay_key_last_pressed: dict[int, float] = {}
+        self._app_overlay_dynamic_cache_key: tuple[object, ...] | None = None
+        self._app_overlay_dynamic_source: Path | None = None
+        self._app_overlay_diagnostics: dict[str, Any] = {
+            "activity": self._app_activity.activity.value,
+            "linked_key_count": 0,
+            "visible_key_count": 0,
+            "animated_key_count": 0,
+            "static_fallback_key_count": 0,
+            "effective_fps": 0.0,
+            "write_budget_per_second": CODEX_APP_PET_KEY_WRITE_BUDGET_PER_SECOND,
+            "minimum_dynamic_fps": CODEX_APP_PET_KEY_MIN_DYNAMIC_FPS,
+        }
 
     @property
     def enabled(self) -> bool:
@@ -194,18 +220,174 @@ class CodexPetRuntime:
         *,
         updated_at: datetime | None = None,
     ) -> PetActivitySnapshot:
-        """按官方优先级更新顶层 Codex 全局活动。
+        """同时更新全局宠物活动和 Desktop App Key 专属活动。
 
         入参：``states`` 是 store 快照；``updated_at`` 可固定聚合时间。
-        返回：新的不可变活动快照。
+        返回：兼容现有调用方的全局不可变活动快照；App 专属快照保存在 runtime 内部。
         错误处理：时间非法由核心聚合器抛出。
-        副作用：原子替换内存活动；不会因相同 trigger 重播反应。
+        副作用：原子替换两类内存活动并更新 App 诊断 activity；相同 trigger 不会重播反应。
         """
 
-        snapshot = derive_pet_activity(states, updated_at=updated_at)
+        state_snapshot = tuple(states)
+        snapshot = derive_pet_activity(state_snapshot, updated_at=updated_at)
+        app_snapshot = derive_codex_app_pet_activity(
+            state_snapshot,
+            updated_at=updated_at,
+        )
         with self._lock:
             self._activity = snapshot
+            self._app_activity = app_snapshot
+            self._app_overlay_diagnostics = {
+                **self._app_overlay_diagnostics,
+                "activity": app_snapshot.activity.value,
+            }
         return snapshot
+
+    def record_app_overlay_key_press(
+        self,
+        key_index: int,
+        *,
+        monotonic_seconds: float | None = None,
+    ) -> None:
+        """记录关联 App Key 最近一次按下时间，供超预算动态槽排序。
+
+        入参：``key_index`` 是 1-based 物理主键编号；``monotonic_seconds`` 可固定测试时钟。
+        返回：无显式返回。
+        错误处理：非正键号、负时间或非有限时间抛 ValueError。
+        副作用：更新内存最近按下表；不改变按键动作、不确认任务提醒、不访问硬件。
+        """
+
+        if key_index <= 0:
+            raise ValueError("codex app overlay key index must be positive")
+        pressed_at = time.monotonic() if monotonic_seconds is None else monotonic_seconds
+        if not isinstance(pressed_at, (int, float)) or pressed_at < 0:
+            raise ValueError("codex app overlay key press time must be non-negative")
+        if pressed_at == float("inf") or pressed_at != pressed_at:
+            raise ValueError("codex app overlay key press time must be finite")
+        with self._lock:
+            self._app_overlay_key_last_pressed[key_index] = float(pressed_at)
+
+    def app_overlay_key_sources(
+        self,
+        key_indexes: Iterable[int],
+        *,
+        monotonic_seconds: float | None = None,
+    ) -> dict[int, Path]:
+        """按任务状态与共享写屏预算返回 App Key 宠物覆盖图来源。
+
+        入参：``key_indexes`` 是已通过 binding 校验的 1-based 关联键；可注入 monotonic 时间。
+        返回：应覆盖基础 App 图的 ``key -> 预渲染 Path`` 新映射；任务不可见、全局关闭或素材
+        不可用时返回空映射，使调用方保留原图标。
+        错误处理：显式时间倒退由覆盖控制器抛 ValueError；缺动作帧安全回退空映射。
+        副作用：推进一次覆盖采样，更新共享动态 bucket 缓存和 JSON-safe 调度诊断；不写图片或 HID。
+        """
+
+        indexes = tuple(sorted({index for index in key_indexes if index > 0}))
+        with self._lock:
+            sampled_at = time.monotonic() if monotonic_seconds is None else monotonic_seconds
+            sample = self._app_overlay_controller.sample(
+                self._app_activity,
+                monotonic_seconds=sampled_at,
+            )
+            paths = self._key_frames.get(str(sample.action), ()) if sample.action else ()
+            available = self._enabled and sample.visible and bool(paths)
+            if not indexes or not available:
+                self._app_overlay_dynamic_cache_key = None
+                self._app_overlay_dynamic_source = None
+                self._update_app_overlay_diagnostics(
+                    activity=sample.activity.value,
+                    linked_key_count=len(indexes),
+                )
+                return {}
+
+            dynamic_capacity = (
+                min(
+                    len(indexes),
+                    CODEX_APP_PET_KEY_WRITE_BUDGET_PER_SECOND
+                    // CODEX_APP_PET_KEY_MIN_DYNAMIC_FPS,
+                )
+                if sample.animated
+                else 0
+            )
+            ranked_indexes = sorted(
+                indexes,
+                key=lambda index: (
+                    -self._app_overlay_key_last_pressed.get(index, -1.0),
+                    index,
+                ),
+            )
+            dynamic_indexes = frozenset(ranked_indexes[:dynamic_capacity])
+            effective_fps = (
+                CODEX_APP_PET_KEY_WRITE_BUDGET_PER_SECOND / len(dynamic_indexes)
+                if dynamic_indexes
+                else 0.0
+            )
+            sources: dict[int, Path] = {}
+            if dynamic_indexes:
+                render_bucket = int(sampled_at * effective_fps)
+                cache_key = (
+                    self._key_asset_fingerprint,
+                    self._app_activity.trigger_key,
+                    sample.action,
+                    tuple(sorted(dynamic_indexes)),
+                    effective_fps,
+                    render_bucket,
+                )
+                if cache_key != self._app_overlay_dynamic_cache_key:
+                    self._app_overlay_dynamic_source = paths[
+                        (sample.frame_index or 0) % len(paths)
+                    ]
+                    self._app_overlay_dynamic_cache_key = cache_key
+                if self._app_overlay_dynamic_source is not None:
+                    for index in dynamic_indexes:
+                        sources[index] = self._app_overlay_dynamic_source
+
+            static_frame_index = (
+                sample.frame_index
+                if sample.completion_feedback and not sample.animated
+                else 0
+            ) or 0
+            static_source = paths[static_frame_index % len(paths)]
+            for index in indexes:
+                sources.setdefault(index, static_source)
+            self._update_app_overlay_diagnostics(
+                activity=sample.activity.value,
+                linked_key_count=len(indexes),
+                visible_key_count=len(sources),
+                animated_key_count=len(dynamic_indexes),
+                static_fallback_key_count=len(sources) - len(dynamic_indexes),
+                effective_fps=effective_fps,
+            )
+            return sources
+
+    def _update_app_overlay_diagnostics(
+        self,
+        *,
+        activity: str,
+        linked_key_count: int,
+        visible_key_count: int = 0,
+        animated_key_count: int = 0,
+        static_fallback_key_count: int = 0,
+        effective_fps: float = 0.0,
+    ) -> None:
+        """在持锁区内原子替换 App Key 覆盖层调度诊断。
+
+        入参：当前活动、关联/可见/动态/降级计数和单动态键有效目标 FPS。
+        返回：无显式返回。
+        错误处理：调用方负责提供非负计数，本方法不重复校验。
+        副作用：替换内存诊断 dict；不采样状态、不访问文件或硬件。
+        """
+
+        self._app_overlay_diagnostics = {
+            "activity": activity,
+            "linked_key_count": linked_key_count,
+            "visible_key_count": visible_key_count,
+            "animated_key_count": animated_key_count,
+            "static_fallback_key_count": static_fallback_key_count,
+            "effective_fps": effective_fps,
+            "write_budget_per_second": CODEX_APP_PET_KEY_WRITE_BUDGET_PER_SECOND,
+            "minimum_dynamic_fps": CODEX_APP_PET_KEY_MIN_DYNAMIC_FPS,
+        }
 
     def sample(self, *, monotonic_seconds: float | None = None) -> PetSceneSample:
         """线程安全地采样当前活动对应的绝对时间场景。
@@ -342,6 +524,7 @@ class CodexPetRuntime:
                     asset.sprite_version_number if asset is not None else None
                 ),
                 "activity": self._activity.activity.value,
+                "app_overlay": dict(self._app_overlay_diagnostics),
                 "motion": self._motion.value,
                 "effective_motion": self._effective_motion,
                 "updated_at": (

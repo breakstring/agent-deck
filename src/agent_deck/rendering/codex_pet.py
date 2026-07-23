@@ -70,6 +70,7 @@ PET_ANIMATION_ROWS: Final[
 _REACTION_BY_ACTIVITY: Final[Mapping[PetActivity, PetAnimationName]] = {
     PetActivity.NEEDS_INPUT: "waiting",
     PetActivity.BLOCKED: "failed",
+    PetActivity.REVIEW: "review",
     PetActivity.READY: "review",
 }
 
@@ -79,6 +80,8 @@ _IDLE_STATIONARY_SECONDS: Final[float] = 30.0
 _IDLE_WALK_SECONDS: Final[float] = 15.0
 _REACTION_CYCLES: Final[int] = 3
 _SLOW_IDLE_RATE: Final[float] = 0.5
+_APP_COMPLETION_CYCLES: Final[int] = 3
+_APP_COMPLETION_HOLD_SECONDS: Final[float] = 5.0
 
 
 class PetSceneSample(BaseModel):
@@ -334,6 +337,150 @@ class PetSceneController:
             direction=direction if walking else "none",
             sampled_at_monotonic=now,
             animation_elapsed_seconds=frame_time,
+        )
+
+
+class CodexAppPetOverlaySample(BaseModel):
+    """描述一个 Codex/ChatGPT App 启动键覆盖层的确定性视觉样本。
+
+    入参：``visible`` 决定是否覆盖基础 App 图；可见时 ``action`` 与 ``frame_index`` 定位
+    图集帧；``animated`` 表示调度器可按预算推进该键；``completion_feedback`` 区分完成反馈。
+    返回：frozen Pydantic model，供共享帧缓存和多 Key 调度器消费。
+    错误处理：负帧号或负 monotonic 时间由 Pydantic 拒绝。
+    副作用：无；只保存一次采样结果。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    activity: PetActivity
+    visible: bool
+    action: PetAnimationName | None = None
+    frame_index: int | None = Field(default=None, ge=0)
+    animated: bool = False
+    completion_feedback: bool = False
+    sampled_at_monotonic: float = Field(ge=0.0)
+
+
+class CodexAppPetOverlayController:
+    """按任务状态控制 App 启动键上的临时宠物覆盖层。
+
+    入参：构造时固定 reduced-motion 与 monotonic 锚点；``sample`` 接收只含 Desktop 顶层
+    task 的活动快照。
+    返回：运行/介入/错误/明确 review 持续可见；完成反馈三轮 waving 后保持末帧五秒；
+    idle 或完成窗口结束返回不可见样本。
+    错误处理：非有限或倒退 monotonic 时间抛 ValueError。
+    副作用：只维护当前 trigger、锚点与最近采样时间，不访问图片、文件或硬件。
+    """
+
+    def __init__(
+        self,
+        *,
+        reduced_motion: bool = False,
+        started_at_monotonic: float | None = None,
+    ) -> None:
+        """创建尚未绑定任务活动的覆盖层控制器。
+
+        入参：``reduced_motion`` 令每种状态固定在代表帧；``started_at_monotonic`` 可用于测试。
+        返回：无显式返回；实例可立即采样 idle。
+        错误处理：非法 monotonic 值抛 ValueError。
+        副作用：未注入时间时读取一次 ``time.monotonic``。
+        """
+
+        started_at = (
+            time.monotonic()
+            if started_at_monotonic is None
+            else started_at_monotonic
+        )
+        _validate_monotonic(started_at)
+        self._reduced_motion = bool(reduced_motion)
+        self._snapshot: PetActivitySnapshot | None = None
+        self._anchor_monotonic = started_at
+        self._last_sample_monotonic = started_at
+
+    def sample(
+        self,
+        snapshot: PetActivitySnapshot,
+        *,
+        monotonic_seconds: float | None = None,
+    ) -> CodexAppPetOverlaySample:
+        """采样任务态覆盖并在新状态 trigger 到来时立即重置反馈锚点。
+
+        入参：``snapshot`` 已限定为 Desktop 顶层 task；``monotonic_seconds`` 可固定绝对时钟。
+        返回：与调用频率无关的覆盖层动作、帧与可见性。
+        错误处理：时间倒退、非有限值抛 ValueError。
+        副作用：更新最近快照、trigger 锚点和最近采样时间；不渲染图片。
+        """
+
+        now = time.monotonic() if monotonic_seconds is None else monotonic_seconds
+        _validate_monotonic(now)
+        if now < self._last_sample_monotonic:
+            raise ValueError("codex app pet monotonic time must not move backwards")
+        if self._snapshot is None or snapshot.trigger_key != self._snapshot.trigger_key:
+            self._anchor_monotonic = now
+        self._snapshot = snapshot
+        self._last_sample_monotonic = now
+        return self._sample_current(now)
+
+    def _sample_current(self, now: float) -> CodexAppPetOverlaySample:
+        """根据当前活动与锚点生成一次不修改状态的覆盖样本。
+
+        入参：``now`` 已校验且不早于最近采样。
+        返回：当前业务规则对应的可见/不可见样本。
+        错误处理：动作表缺失时由 mapping KeyError 暴露为代码缺陷。
+        副作用：无。
+        """
+
+        activity = self._snapshot.activity if self._snapshot else PetActivity.IDLE
+        elapsed = max(0.0, now - self._anchor_monotonic)
+        if activity == PetActivity.IDLE:
+            return CodexAppPetOverlaySample(
+                activity=activity,
+                visible=False,
+                sampled_at_monotonic=now,
+            )
+        if activity == PetActivity.READY:
+            action: PetAnimationName = "waving"
+            animation_seconds = (
+                animation_duration_seconds(action) * _APP_COMPLETION_CYCLES
+            )
+            total_seconds = animation_seconds + _APP_COMPLETION_HOLD_SECONDS
+            if elapsed >= total_seconds:
+                return CodexAppPetOverlaySample(
+                    activity=activity,
+                    visible=False,
+                    completion_feedback=True,
+                    sampled_at_monotonic=now,
+                )
+            holding = self._reduced_motion or elapsed >= animation_seconds
+            frame_index = (
+                len(PET_ANIMATION_ROWS[action][1]) - 1
+                if holding
+                else animation_frame_index(action, elapsed)
+            )
+            return CodexAppPetOverlaySample(
+                activity=activity,
+                visible=True,
+                action=action,
+                frame_index=frame_index,
+                animated=not holding,
+                completion_feedback=True,
+                sampled_at_monotonic=now,
+            )
+        action_by_activity: Mapping[PetActivity, PetAnimationName] = {
+            PetActivity.RUNNING: "running",
+            PetActivity.NEEDS_INPUT: "waiting",
+            PetActivity.BLOCKED: "failed",
+            PetActivity.REVIEW: "review",
+        }
+        action = action_by_activity[activity]
+        frame_index = 0 if self._reduced_motion else animation_frame_index(action, elapsed)
+        return CodexAppPetOverlaySample(
+            activity=activity,
+            visible=True,
+            action=action,
+            frame_index=frame_index,
+            animated=not self._reduced_motion,
+            sampled_at_monotonic=now,
         )
 
 

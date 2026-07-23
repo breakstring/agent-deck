@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from pathlib import Path
+from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -16,11 +18,23 @@ from agent_deck.actions.keyboard import (
     ShortcutIconSpec,
 )
 from agent_deck.core.state import AgentState
-from agent_deck.rendering.layout import KeyPlan
+from agent_deck.rendering.layout import KeyAmbientOverlaySpec, KeyPlan
 from agent_deck.rendering.visuals import resolve_visual_icon_spec
 
 N4PRO_MAIN_KEY_COUNT = 10
 """第一版 GUI 配置覆盖的 N4 Pro 主按键数量。"""
+
+_CODEX_DESKTOP_APP_NAMES: Final[frozenset[str]] = frozenset({"codex", "chatgpt"})
+_CODEX_DESKTOP_APP_BUNDLE_IDS: Final[frozenset[str]] = frozenset(
+    {
+        "com.openai.chat",
+        "com.openai.chatgpt",
+        "com.openai.codex",
+    }
+)
+_CODEX_DESKTOP_APP_BASENAMES: Final[frozenset[str]] = frozenset(
+    {"codex.app", "chatgpt.app"}
+)
 
 
 class KeySurfaceKind(StrEnum):
@@ -48,7 +62,8 @@ class N4ProKeyBinding(BaseModel):
     """描述 N4 Pro 一个主按键的用户配置。
 
     入参：`index` 是 0-9 的主按键编号；`kind` 是 GUI 暴露的用途；App/URL/Folder
-    按用途携带各自参数；`icon_token` 和 `icon_color` 是当前 GUI 原型生成预览图标的轻量字段。
+    按用途携带各自参数；`icon_token` 和 `icon_color` 是当前 GUI 原型生成预览图标的轻量字段；
+    `ambient_overlay` 仅允许附加在已识别的 ChatGPT/Codex App 启动目标上。
     返回：frozen Pydantic model，可作为 runtime 内存布局的一部分。
     错误处理：key 越界、必需参数缺失或 kind/参数不匹配时抛 ValidationError。
     副作用：只保存内存数据，不读取应用、文件夹、favicon 或系统图标。
@@ -70,6 +85,7 @@ class N4ProKeyBinding(BaseModel):
     icon_color: str | None = None
     shortcut: KeyboardShortcutSpec | None = None
     icon: ShortcutIconSpec | None = None
+    ambient_overlay: KeyAmbientOverlaySpec | None = None
 
     @field_validator("label", mode="before")
     @classmethod
@@ -138,6 +154,17 @@ class N4ProKeyBinding(BaseModel):
             raise ValueError("shortcut is only valid for keyboard_shortcut keys")
         if self.kind != KeySurfaceKind.KEYBOARD_SHORTCUT and self.icon is not None:
             raise ValueError("shortcut icon is only valid for keyboard_shortcut keys")
+        if self.ambient_overlay is not None:
+            if self.kind != KeySurfaceKind.APP:
+                raise ValueError("ambient overlay is only valid for app keys")
+            if not is_codex_desktop_app_target(
+                app_name=self.app_name,
+                app_path=self.app_path,
+                bundle_id=self.bundle_id,
+            ):
+                raise ValueError(
+                    "codex pet ambient overlay requires a recognized ChatGPT or Codex app target"
+                )
         if (
             self.kind == KeySurfaceKind.QUOTA_STATUS
             and self.quota_window is not None
@@ -334,6 +361,7 @@ def _project_static_binding(binding: N4ProKeyBinding) -> KeyPlan:
                 icon_token=binding.icon_token,
                 icon_color=binding.icon_color,
             ),
+            ambient_overlay=binding.ambient_overlay,
         )
     if binding.kind == KeySurfaceKind.URL:
         return KeyPlan(
@@ -411,3 +439,27 @@ def _compact_payload(**items: str | None) -> dict[str, str]:
     """
 
     return {key: value for key, value in items.items() if value}
+
+
+def is_codex_desktop_app_target(
+    *,
+    app_name: str | None,
+    app_path: str | None,
+    bundle_id: str | None,
+) -> bool:
+    """识别可关联 Codex 任务状态的 OpenAI 桌面 App 启动目标。
+
+    入参：App catalog/binding 中的显示名、bundle 路径与 bundle id；支持当前
+    ``ChatGPT.app`` 以及历史 ``Codex.app`` 身份。
+    返回：命中已知 OpenAI bundle id，或命中已知 App basename 且名称也是已知别名时为 True。
+    错误处理：缺失或未知字段返回 False，不按显示名独立放行同名普通 App。
+    副作用：只规范化字符串和解析路径 basename，不访问文件系统。
+    """
+
+    normalized_name = (app_name or "").strip().casefold()
+    normalized_bundle_id = (bundle_id or "").strip().casefold()
+    if normalized_bundle_id in _CODEX_DESKTOP_APP_BUNDLE_IDS:
+        return True
+    if not app_path or normalized_name not in _CODEX_DESKTOP_APP_NAMES:
+        return False
+    return Path(app_path.strip()).name.casefold() in _CODEX_DESKTOP_APP_BASENAMES

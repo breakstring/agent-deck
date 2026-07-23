@@ -364,11 +364,28 @@ function appFromBinding(binding) {
   };
 }
 
+/** 识别可接收 Codex 任务状态的当前 ChatGPT.app 与历史 Codex.app 目标。 */
+function isCodexDesktopAppTarget(app) {
+  const bundleId = (app?.bundleId || "").trim().toLocaleLowerCase();
+  if (["com.openai.chat", "com.openai.chatgpt", "com.openai.codex"].includes(bundleId)) {
+    return true;
+  }
+  const name = (app?.name || "").trim().toLocaleLowerCase();
+  const basename = (app?.path || "").trim().split(/[\\/]/).pop().toLocaleLowerCase();
+  return ["chatgpt", "codex"].includes(name) && ["chatgpt.app", "codex.app"].includes(basename);
+}
+
 /** 把 daemon key binding 转为可编辑的 Web 草稿，并保留无动作宠物用途。 */
 function uiKeyFromBinding(binding) {
   const base = { index: binding.index, dirty: false };
   if (binding.kind === "app") {
-    return { ...base, role: "quick", kind: "app", app: appFromBinding(binding) };
+    return {
+      ...base,
+      role: "quick",
+      kind: "app",
+      app: appFromBinding(binding),
+      ambientOverlayEnabled: binding.ambient_overlay?.kind === "codex_pet",
+    };
   }
   if (binding.kind === "url") {
     return {
@@ -482,6 +499,9 @@ function bindingFromUiKey(key) {
       bundle_id: key.app.bundleId || null,
       icon_token: key.app.token,
       icon_color: key.app.color,
+      ambient_overlay: key.ambientOverlayEnabled
+        ? { kind: "codex_pet", scope: "launch_target", visibility: "task_active" }
+        : null,
     };
   }
   if (key.kind === "url") {
@@ -861,7 +881,10 @@ function renderKeyInspector() {
     details =
       detailRow("App", key.app.name) +
       detailRow("路径", key.app.path) +
-      detailRow("图标", "使用 App 图标");
+      detailRow("图标", "使用 App 图标") +
+      (isCodexDesktopAppTarget(key.app)
+        ? detailRow("任务态宠物", key.ambientOverlayEnabled ? "已开启" : "已关闭")
+        : "");
   } else if (key.kind === "agent") {
     const agent = agentForSlot(key.slot);
     details =
@@ -921,6 +944,17 @@ function renderKeyInspector() {
         : ""
     }
     ${key.kind === "keyboard_shortcut" ? renderShortcutControls(key) : ""}
+    ${
+      key.kind === "app" && isCodexDesktopAppTarget(key.app)
+        ? `<div class="field-group">
+            <div class="field-label">任务状态展示</div>
+            <label class="switch-field" for="codexPetAmbientOverlay">
+              <span><strong>任务活跃时显示宠物</strong><small>空闲时恢复 ${escapeHtml(key.app.name)} 原图标；按键动作不变。</small></span>
+              <input id="codexPetAmbientOverlay" type="checkbox"${key.ambientOverlayEnabled ? " checked" : ""}>
+            </label>
+          </div>`
+        : ""
+    }
     ${details ? `<div class="field-group"><div class="field-label">当前配置</div>${details}</div>` : ""}
     ${
       key.kind === "app"
@@ -939,6 +973,12 @@ function renderKeyInspector() {
   if (chooseApp) {
     chooseApp.addEventListener("click", openAppModal);
   }
+
+  document.getElementById("codexPetAmbientOverlay")?.addEventListener("change", (event) => {
+    key.ambientOverlayEnabled = event.target.checked;
+    markDirty(key);
+    render();
+  });
 
   const urlInput = document.getElementById("urlInput");
   if (urlInput) {
@@ -1564,6 +1604,9 @@ function renderAppList() {
       key.role = "quick";
       key.kind = "app";
       key.app = app;
+      key.ambientOverlayEnabled = isCodexDesktopAppTarget(app)
+        ? Boolean(key.ambientOverlayEnabled)
+        : false;
       renumberAgentSlots();
       markDirty(key);
       closeAppModal();

@@ -9,7 +9,7 @@ I/O; callers can pass the returned frozen models to any later renderer.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -36,13 +36,30 @@ _STATUS_SORT_PRIORITY = {
 }
 
 
+class KeyAmbientOverlaySpec(BaseModel):
+    """描述不改变按键动作的可选环境视觉覆盖层。
+
+    入参：首版仅接受 Codex 宠物、启动目标作用域和任务活跃可见性三个固定值。
+    返回：frozen Pydantic model，可随 binding 和 renderer-neutral plan JSON 往返。
+    错误处理：未知覆盖层类型、作用域或可见性由 Pydantic 拒绝。
+    副作用：仅保存声明，不读取任务状态、宠物素材或硬件。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["codex_pet"] = "codex_pet"
+    scope: Literal["launch_target"] = "launch_target"
+    visibility: Literal["task_active"] = "task_active"
+
+
 class KeyPlan(BaseModel):
     """Describe one physical key without renderer-specific image data.
 
     入参：`index` 是 0-14 的物理键位；`label` 是短文本标签；`status` 是绑定 agent
     的展示状态，可空；`visual` 是 renderer 可消费的按钮视觉规格，可空；
     `agent_key`、`intent` 和 `decision_id` 描述按键行为上下文；`role`、`kind`、`action`
-    与 `payload` 是 key surface 配置投影的可选诊断/执行上下文，旧布局可留空。
+    与 `payload` 是 key surface 配置投影的可选诊断/执行上下文；`ambient_overlay` 只声明
+    可覆盖视觉，不替代原按键动作，旧布局可留空。
     返回：frozen Pydantic model，后续 renderer 可只读消费。
     错误处理：字段类型非法由 Pydantic 校验异常报告；键位范围由调用方生成保证。
     副作用：仅保存内存数据；实例化不访问网络、硬件或文件系统。
@@ -63,6 +80,7 @@ class KeyPlan(BaseModel):
     payload: dict[str, str] = Field(default_factory=dict)
     shortcut: KeyboardShortcutSpec | None = None
     shortcut_icon: ShortcutIconSpec | None = None
+    ambient_overlay: KeyAmbientOverlaySpec | None = None
 
 
 class TouchscreenPlan(BaseModel):

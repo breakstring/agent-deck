@@ -390,7 +390,7 @@ def _layout_with_pet_key() -> N4ProKeyLayout:
 
 
 def _session_started_event() -> NormalizedEvent:
-    """构造固定顶层 Codex session.started 事件。
+    """构造不会被 store TTL 立即投影为 offline 的顶层 Codex session.started 事件。
 
     入参：无。
     返回：timezone-aware normalized event。
@@ -398,7 +398,7 @@ def _session_started_event() -> NormalizedEvent:
     副作用：无。
     """
 
-    occurred_at = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
+    occurred_at = datetime.now(UTC)
     return NormalizedEvent.build(
         source=AgentSource.CODEX,
         source_event_type="session.started",
@@ -411,7 +411,7 @@ def _session_started_event() -> NormalizedEvent:
 
 
 def _tool_started_event() -> NormalizedEvent:
-    """构造触发全局 Running 宠物活动的顶层工具事件。
+    """构造不会被 store TTL 立即投影为 offline 的顶层工具事件。
 
     入参：无。
     返回：timezone-aware normalized event。
@@ -419,7 +419,7 @@ def _tool_started_event() -> NormalizedEvent:
     副作用：无。
     """
 
-    occurred_at = datetime(2026, 7, 21, 12, 1, tzinfo=UTC)
+    occurred_at = datetime.now(UTC)
     return NormalizedEvent.build(
         source=AgentSource.CODEX,
         source_event_type="tool.started",

@@ -137,6 +137,8 @@ scripts/agent-deckd-tmux.sh restart
 
 - 10 个主按键可以配置为打开或切换应用、打开网址、发送键盘快捷键、显示 Agent 状态、订阅额度、
   用量状态或 Codex 宠物，也可以暂不设定。Codex 宠物按键只负责展示，按下不会执行动作。
+- 当 App 目标是当前 `ChatGPT.app` 或历史 `Codex.app` 时，配置页还会显示“任务活跃时显示宠物”。
+  这是 App 键原图标之上的可选覆盖层：按下仍只打开或切换 App，空闲后恢复原 App 图标。
 - 快捷键支持单个物理键、组合键和最多 16 步的序列；每步释放后可等待 0–2000ms，整条序列最长 10 秒。
 - 应用、网址与自定义快捷键图标会缓存到本机，供配置页预览和硬件下发共用；快捷键没有自定义图标时自动显示组合键，Web 自动预览直接使用硬件 renderer 输出的同一张 PNG。
 - 4 个旋钮可分别配置旋转动作；音量类动作按下时隐含切换静音/麦克静音，不单独配置按下行为。
@@ -264,6 +266,35 @@ child agent，并按以下优先级选择最新的触发源：
 `Ready` 暂时以 `COMPLETED_RECENTLY` 近似，因为现有状态源没有可靠的“未读”字段。相同状态不会
 反复触发三轮反应，只有新的状态时间戳才会重新播放。
 
+#### ChatGPT/Codex App 启动键的任务态覆盖
+
+App 启动键的覆盖规则独立于上面的常驻“Codex 宠物”键和 PETS 面板。配置页按 OpenAI bundle id
+或明确的 `ChatGPT.app`/`Codex.app` 路径识别目标，不会仅凭显示名把普通同名 App 绑定进来。
+开关保存后，App 动作、用户原图标和宠物覆盖声明一起写入 version 3 按键布局；version 1/2 布局
+读入时默认不开启覆盖。
+
+覆盖层只聚合带 `codex-app:*`（以及旧兼容 App target）的顶层 Codex Desktop task，排除 Codex CLI、
+child agent 和其他 App。多个任务按 `Needs input > Error > Review > Running > Completed` 聚合，
+同级选择最新状态。当前没有显式 `REVIEW_NEEDED` 信号，因此普通完成不会被推断为常驻 review。
+
+| App 任务状态 | App Key 覆盖行为 |
+| --- | --- |
+| 无匹配任务、`IDLE`、`OFFLINE` | 显示用户原 App 图标 |
+| `THINKING`、`RUNNING_TOOL` | 持续播放 `running` |
+| `WAITING_USER`、`APPROVAL_NEEDED` | 持续播放 `waiting`，直到状态解除 |
+| `ERROR` | 持续播放 `failed`，直到状态解除 |
+| `COMPLETED_RECENTLY` | 播放三轮 `waving`，末帧保持 5 秒，再恢复原 App 图标 |
+| 未来显式 `REVIEW_NEEDED` | 持续播放 `review`，直到状态解除 |
+
+任意多个 ChatGPT/Codex App 键可以同时开启关联，它们共享图集解析和预渲染帧缓存。默认总写屏预算
+是每秒 10 次，每个动态键至少 5 FPS，所以最多两个键同时动画；更多活跃键显示对应状态的静态帧。
+同级优先最近按下的键，再按物理索引排序。按下只改变后续动态槽排序，不确认或消除任务提醒。
+`motion=reduced` 时所有关联键使用对应状态的静态帧，但完成反馈仍按相同时间恢复。
+
+宠物全局关闭、未选择可解析的自定义宠物、图集加载失败或缓存缺帧时，覆盖层完全退出并保留原 App
+图标，App 按键动作仍可执行。`/status.codex_pet.app_overlay` 会报告关联、可见、动态、静态降级键数，
+有效目标 FPS 以及 10 次/秒预算。Codex CLI 启动不在本能力范围内；终端宿主与展示客户端会单独设计。
+
 N4 Pro 的宠物按键使用 `112×112` 深色画布，完整 cell 等比缩放且不会横向移动。PETS 使用现有
 `800×136` 虚拟面板：运行中约 15 秒完成一次全宽左右往返；idle 使用确定性的 45 秒周期，约
 30 秒驻留后用 15 秒走向另一端，下个周期反向。等待、失败和完成反应会冻结当前位置，切换状态
@@ -272,11 +303,11 @@ N4 Pro 的宠物按键使用 `112×112` 深色画布，完整 cell 等比缩放�
 
 运行 `uv run agent-deckctl status` 或读取 `/status` 时，可在 `codex_pet` 中查看启用状态、
 `selected-avatar-id`、解析结果、名称、图集版本、全局 activity、motion 模式、更新时间、素材错误
-和独立的 motion 降级诊断。
+和独立的 motion 降级诊断，以及 `app_overlay` 下的 App Key 调度诊断。
 诊断不会包含原始图片或完整图集。
 
-首版不支持 Agent Deck 单独选宠物、多宠物、按会话绑定、宠物按键交互、v2 gaze/鼠标跟踪，也不
-替换现有 Agent 状态按键。
+当前不支持 Agent Deck 单独选宠物、多宠物、按会话选择不同宠物、宠物按键交互、v2 gaze/鼠标
+跟踪，也不替换现有 Agent 状态按键。
 
 #### 真机验收清单
 
@@ -287,6 +318,8 @@ N4 Pro 的宠物按键使用 `112×112` 深色画布，完整 cell 等比缩放�
 3. 测量 PETS 背景有效刷新率，目标不低于约 7 FPS；历史约 9.56–9.57 FPS 只能作为旧基线。
 4. 确认单次连接期间 `open/init=1`，没有非预期重连、HID 错误、CPU 或线程数持续增长。
 5. 结束时显式关闭设备会话与后台服务，确认没有遗留 `agent-deckd` 进程。
+6. 另配置 1、2、3 个 ChatGPT/Codex App 关联键，分别测量动态键有效 FPS、静态降级、按键响应、
+   状态退出后的原图标恢复与 HID 错误；自动化测试通过不等于这项真机验收已完成。
 
 ## 7. Token、金额与订阅额度
 

@@ -723,7 +723,7 @@ def test_shortcut_auto_preview_api_uses_hardware_renderer(
 def test_key_layout_store_migrates_v1_and_rejects_unknown_future_version(
     tmp_path: Path,
 ) -> None:
-    """v1 布局应原样读入，保存升级 v2，未知未来版本必须 fail-closed。
+    """v1/v2 布局应无覆盖层读入，保存升级 v3，未知未来版本必须 fail-closed。
 
     入参：``tmp_path`` 提供隔离 JSON 文件。
     返回：无返回值；断言通过代表兼容旧配置且不会误读未来 schema。
@@ -743,13 +743,22 @@ def test_key_layout_store_migrates_v1_and_rejects_unknown_future_version(
         ),
         encoding="utf-8",
     )
-    assert load_n4pro_key_layout(path) == default_layout
+    loaded_v1 = load_n4pro_key_layout(path)
+    assert loaded_v1 == default_layout
+    assert all(binding.ambient_overlay is None for binding in loaded_v1.keys)
+
+    legacy_v2 = json.loads(path.read_text(encoding="utf-8"))
+    legacy_v2["version"] = 2
+    path.write_text(json.dumps(legacy_v2), encoding="utf-8")
+    loaded_v2 = load_n4pro_key_layout(path)
+    assert loaded_v2 == default_layout
+    assert all(binding.ambient_overlay is None for binding in loaded_v2.keys)
 
     save_n4pro_key_layout(default_layout, path)
-    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 2
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 3
 
     future = json.loads(path.read_text(encoding="utf-8"))
-    future["version"] = 3
+    future["version"] = 4
     path.write_text(json.dumps(future), encoding="utf-8")
     with pytest.raises(KeyLayoutStoreError, match="version 不支持"):
         load_n4pro_key_layout(path)

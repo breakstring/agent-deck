@@ -730,6 +730,7 @@ class _DaemonRuntime:
     logical_panel_last_render_duration_ms: float | None
     hardware_background_notifier: Callable[[], None] | None
     hardware_key_surface_revision: int
+    hardware_key_surface_base_images: dict[int, Any]
     hardware_key_surface_images: dict[int, Any]
     hardware_key_surface_pending_images: dict[int, Any]
     streamdock_touch_tap_last_handled_monotonic: float | None
@@ -1620,6 +1621,16 @@ class _DaemonRuntime:
         elif intent.intent in {"approve_request", "deny_request"}:
             action = self._apply_decision_intent(intent)
         elif intent.intent == "open_or_focus_app":
+            binding = next(
+                (
+                    candidate
+                    for candidate in self.current_key_layout_response().layout.keys
+                    if candidate.index == intent.key_index
+                ),
+                None,
+            )
+            if binding is not None and binding.ambient_overlay is not None:
+                self.codex_pet.record_app_overlay_key_press(intent.key_index + 1)
             if self.local_actions_enabled:
                 action = _execute_local_app_action(
                     intent,
@@ -1841,15 +1852,15 @@ class _DaemonRuntime:
 
         入参：`layout` 可复用本次业务路径已生成的 renderer-neutral layout；为空时重建当前
         layout。`notify` 仅在调用方即将同步执行 renderer 首帧时设为 False，避免无意义唤醒。
-        返回：当前完整静态/热更新键图映射，包含 App、URL、状态键和配置的 Codex 宠物 Key，
-        不含由 agent 动画帧序列控制的键。
+        返回：当前完整静态/热更新键图映射，先保存 App/URL/状态键基础图，再叠加独立 Codex
+        宠物键与 App 任务态覆盖；不含由 agent 动画帧序列控制的键。
         错误处理：图标或状态图渲染失败按原语义传播；本方法不访问 SDK。
         副作用：内容引用发生变化时替换待下发差异、递增 revision，并可唤醒持久硬件帧循环；
         多次快速调用只保留最新差异图，保证硬件侧 latest-wins。
         """
 
         resolved_layout = layout or self.render_current()
-        key_images = _key_images_from_layout(
+        base_images = _key_images_from_layout(
             resolved_layout,
             app_icon_cache=self.app_icon_cache,
             url_icon_cache=self.url_icon_cache,
@@ -1859,6 +1870,7 @@ class _DaemonRuntime:
             token_usage_snapshot=self.codex_token_usage_snapshot,
             status_key_cache=self.status_key_image_cache,
         )
+        key_images = dict(base_images)
         pet_key_indexes = {
             key.index + 1 for key in resolved_layout.keys[:10] if key.kind == "codex_pet"
         }
@@ -1868,10 +1880,19 @@ class _DaemonRuntime:
             if pet_source is not None:
                 for key_index in pet_key_indexes:
                     key_images[key_index] = pet_source
+        app_overlay_indexes = {
+            key.index + 1
+            for key in resolved_layout.keys[:10]
+            if key.ambient_overlay is not None
+        }
+        key_images.update(
+            self.codex_pet.app_overlay_key_sources(app_overlay_indexes)
+        )
         changed_images = _changed_hardware_key_image_sources(
             self.hardware_key_surface_images,
             key_images,
         )
+        self.hardware_key_surface_base_images = base_images
         self.hardware_key_surface_images = key_images
         self.codex_pet_key_indexes = pet_key_indexes
         self.codex_pet_key_visual_key = pet_visual_key
@@ -1889,8 +1910,8 @@ class _DaemonRuntime:
         入参：无；只读取 daemon 已缓存的完整静态键图与待下发差异。
         返回：单调递增 revision 和当前完整静态键图副本；空映射代表尚无首次静态键图。renderer
         在它自己的单一硬件线程中以图片引用与上次已写快照比较，确保只下发发生变化的键。
-        错误处理：无；不创建图片、不访问 SDK。
-        副作用：无；复制映射以避免硬件线程遍历时看到 handler 的后续替换。
+        错误处理：无；只从已预渲染宠物缓存选择 Path，不访问 SDK。
+        副作用：刷新动态宠物覆盖 revision，再复制映射，避免硬件线程遍历时看到后续替换。
         """
 
         self._refresh_dynamic_codex_pet_key_images()
@@ -1907,33 +1928,32 @@ class _DaemonRuntime:
         """
 
         layout = self.current_key_layout_response().layout
-        indexes = {
+        pet_indexes = {
             binding.index + 1
             for binding in layout.sorted_keys()
             if binding.kind.value == "codex_pet"
         }
-        if not indexes:
-            self.codex_pet_key_indexes = set()
-            self.codex_pet_key_visual_key = None
-            return
-        source, visual_key = self.codex_pet.key_image_source()
-        if (
-            indexes == self.codex_pet_key_indexes
-            and visual_key == self.codex_pet_key_visual_key
-        ):
-            return
-        images = dict(self.hardware_key_surface_images)
-        for old_index in self.codex_pet_key_indexes:
-            images.pop(old_index, None)
-        if source is not None:
-            for key_index in indexes:
-                images[key_index] = source
+        app_overlay_indexes = {
+            binding.index + 1
+            for binding in layout.sorted_keys()
+            if binding.ambient_overlay is not None
+        }
+        images = dict(self.hardware_key_surface_base_images)
+        visual_key: tuple[object, ...] | None = None
+        if pet_indexes:
+            source, visual_key = self.codex_pet.key_image_source()
+            if source is not None:
+                for key_index in pet_indexes:
+                    images[key_index] = source
+        images.update(
+            self.codex_pet.app_overlay_key_sources(app_overlay_indexes)
+        )
         changed = _changed_hardware_key_image_sources(
             self.hardware_key_surface_images,
             images,
         )
         self.hardware_key_surface_images = images
-        self.codex_pet_key_indexes = indexes
+        self.codex_pet_key_indexes = pet_indexes
         self.codex_pet_key_visual_key = visual_key
         if not changed:
             return
@@ -2944,6 +2964,7 @@ def create_app(
         logical_panel_last_render_duration_ms=None,
         hardware_background_notifier=None,
         hardware_key_surface_revision=0,
+        hardware_key_surface_base_images={},
         hardware_key_surface_images={},
         hardware_key_surface_pending_images={},
         streamdock_touch_tap_last_handled_monotonic=None,

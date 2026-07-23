@@ -210,7 +210,8 @@ flowchart LR
     配置页已支持连续录制与“停止并应用”、手动添加纯修饰键、重排/删除、0–2000ms 间隔、紧凑
     权限状态和悬停/点击详情，以及自动/自定义默认图标。Web 自动预览与硬件下发复用同一 renderer
     PNG；自定义图标以规范化 PNG SHA-256 内容寻址，限制 5 MiB 和 4096×4096，自定义资产缺失时
-    自动回退组合键图。key layout store 已升级 v2 并兼容 v1，未知未来版本 fail-closed；
+    自动回退组合键图。key layout store 已升级 v3 并兼容 v1/v2，旧布局默认没有任务态覆盖层，
+    未知未来版本 fail-closed；
     `/status.keyboard_shortcuts` 暴露 capability、active 和 recent job。
 
 16. installer / doctor
@@ -417,7 +418,7 @@ P5 macOS 产品化边界：
   虚拟面板，但不污染核心状态机、审批或任务执行。
 - 首版先完成 Codex 自定义宠物闭环；Claude、通用 ambient theme 和更多硬件留到后续。
 
-本轮冻结的实现范围：
+当前实现范围：
 
 1. 新增 `[codex.pet]` 配置，提供启用开关、只读刷新间隔、PETS 最高 FPS，以及
    `auto | full | reduced` 动效模式；不提供 Agent Deck 独立 `pet_id`。
@@ -441,13 +442,30 @@ P5 macOS 产品化边界：
 9. `motion=auto` 尽力读取 macOS Reduce Motion；`reduced` 固定 idle 首帧、不横移。`/status`
    增加 `codex_pet` 的选择、解析、版本、activity、motion、更新时间和短错误诊断，不返回素材。
 10. 配置页支持把任意按键设为“Codex 宠物”，完整保存/重载，并明确提示“仅展示、点击无动作”。
+11. App 启动键可附加 `KeyAmbientOverlaySpec`，其字段固定为 `kind=codex_pet`、
+    `scope=launch_target`、`visibility=task_active`，不改变 `open_or_focus_app` 动作或用户原图标。配置页只对当前
+    `ChatGPT.app` 与历史 `Codex.app` 身份展示开关，后端按 OpenAI bundle id 或明确 App 路径复验，
+    不按显示名独立放行。
+12. App 覆盖只消费 `codex-app:*` 和旧 App target 的顶层 Desktop task，排除 CLI、child agent
+    与其他 App；按 `Needs input > Error > Review > Running > Completed` 聚合。当前无显式 review
+    状态源，普通 `COMPLETED_RECENTLY` 只播放三轮 `waving`、末帧保持 5 秒后恢复原 App 图标。
+13. waiting/error/running（以及未来显式 review）持续播放直到状态解除；新高优先级状态立即打断完成
+    反馈。`motion=reduced` 显示各状态静态代表帧但使用相同恢复规则；按下 App 键只打开/聚焦并记录
+    调度排序，不确认提醒。
+14. 任意多个关联 App 键共享素材、状态采样和帧缓存。默认总预算 10 key writes/s、动态键最低
+    5 FPS，因而最多两个键动画；其余键静态降级。同级按最近按下时间、再按物理索引排序，只发布
+    图像来源发生变化的 dirty key。`/status.codex_pet.app_overlay` 暴露关联/可见/动态/静态数量、
+    有效 FPS 与预算。
+15. renderer 保存独立基础图映射，再叠加独立宠物键与 App 任务覆盖；覆盖退出时复用同一 App 图标
+    缓存对象，不清空或重绘 fallback。宠物关闭、素材缺失或图集失败时完整回退基础图且动作仍有效。
 
-首版明确不做：
+当前明确不做：
 
 - 不解析或重新分发 Codex App 内置宠物资源，也不提交 Rick 或其他本机宠物及派生素材。
-- 不支持 Agent Deck 单独选择宠物、多宠物、按会话绑定、hover/jump/waving、v2 gaze、鼠标跟踪
-  或按指定 Codex App 键挂载。
+- 不支持 Agent Deck 单独选择宠物、多宠物、按会话选择不同宠物、hover/jump、v2 gaze 或鼠标跟踪。
 - 不替换现有 Agent 状态键，不让宠物按键打开 PETS，也不让宠物行为参与审批或执行。
+- Codex CLI 启动联动不纳入本轮；后续必须单独建模 execution host 与 Terminal、iTerm2、Warp、
+  Ghostty、Tabby 等 presentation client，不能把它们压成一个直接执行 `codex` 的 App key。
 
 验收状态：
 
@@ -462,9 +480,10 @@ P5 macOS 产品化边界：
 1. `AmbientSurface` 抽象。
 2. Claude 或其他 Agent 的宠物/ambient 状态 adapter。
 3. Codex App 内置宠物的合法只读发现机制。
-4. v2 gaze、鼠标/指定按键跟踪和显式交互。
-5. LED 动效规则。
-6. 用户可选 theme pack 与更多硬件 profile。
+4. v2 gaze、鼠标跟踪和显式宠物交互。
+5. Codex CLI 的“执行宿主 + 终端展示客户端”复合启动/聚焦模型。
+6. LED 动效规则。
+7. 用户可选 theme pack 与更多硬件 profile。
 
 约束：
 
@@ -555,12 +574,13 @@ P5 macOS 产品化边界：
 
 ## 下一次工作建议
 
-当前优先收口 P6 Codex 宠物首版：
+当前优先收口 P6 Codex 宠物与 App Key 覆盖扩展：
 
 1. 先完成定向测试与 `uv run pytest -q`，将实际结果回填到交付记录，不用旧测试结果代替。
-2. 在 fake hardware 通过后，按 P6 真机清单重新执行 Rick 的 60 秒 smoke 和 15 分钟 soak；若稳定
-   刷新上限低于目标，再把测量结果和降级策略写入硬件文档。
-3. 真实验证完成后再决定宠物是否取代 Agent 状态键；首版保持两个 Key 类型并存，避免提前锁定。
+2. 在 fake hardware 通过后，按 P6 真机清单重新执行 Rick 的 60 秒 smoke 和 15 分钟 soak；另测
+   1、2、3 个关联 App Key 的有效 FPS、dirty-key 数、按键响应、HID 错误和原图标恢复。
+3. 保持独立宠物 Key、PETS 面板和 App Key 覆盖三种展示并存；真机数据不足前不让宠物取代 Agent
+   状态键，也不扩大到 Codex CLI 终端控制面。
 
 P6 收口后恢复 P2（Claude Code Adapter）：先确认 N4 Pro slot 分配与交互策略，收集
 SessionStart、PreToolUse、Notification、Stop 等 Hook Payload，再用 Mock 测试跑通 Claude 事件到
