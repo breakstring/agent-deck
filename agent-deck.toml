@@ -19,7 +19,7 @@ motion = "auto"
 [codex.remote_ssh]
 # 显式 opt-in；主机只来自 ChatGPT Settings -> Connections 中已启用自动连接的 SSH 项。
 # Agent Deck 不读取 ~/.ssh/config，也不会连接被 ChatGPT 标记为未启用的主机。
-enabled = false
+enabled = true
 poll_interval_seconds = 5.0
 timeout_seconds = 10.0
 thread_limit = 80
