@@ -57,6 +57,10 @@ from agent_deck.rendering.codex_pet_colony import (
     PetColonyRenderActor,
     render_pet_colony_panel,
 )
+from agent_deck.rendering.appearance import (
+    DeckAppearanceSettings,
+    appearance_cache_key,
+)
 from agent_deck.rendering.n4pro_panel import compose_n4pro_background
 from agent_deck.server.pets_panel_settings_store import N4ProPetsPanelSettings
 
@@ -70,12 +74,64 @@ CODEX_APP_PET_KEY_MIN_DYNAMIC_FPS: Final[int] = 5
 """一个被选为动态展示的 App Key 可接受的最低目标帧率。"""
 
 
+def _render_pet_panel_for_appearance(
+    asset: CodexPetAsset,
+    sample: PetSceneSample,
+    appearance: DeckAppearanceSettings,
+) -> Image.Image:
+    """按外观渲染单宠物面板，并保留默认模式的旧调用合同。
+
+    入参：宠物资产、场景样本和当前外观。
+    返回：800x136 RGBA 面板图。
+    错误处理：底层 Pillow/素材错误按原异常传播。
+    副作用：仅分配图片；默认模式不传新增关键字，兼容既有注入 renderer。
+    """
+
+    if appearance.background_color is None:
+        return render_pet_panel_image(asset, sample)
+    return render_pet_panel_image(asset, sample, appearance=appearance)
+
+
+def _render_pet_colony_for_appearance(
+    actors: tuple[PetColonyRenderActor, ...],
+    appearance: DeckAppearanceSettings,
+) -> Image.Image:
+    """按外观渲染宠物群体面板，同时兼容默认模式的旧注入签名。
+
+    入参：已解析 actor 元组和当前外观。
+    返回：800x136 RGBA 面板图。
+    错误处理：底层渲染异常按原语义传播。
+    副作用：仅创建内存图片。
+    """
+
+    if appearance.background_color is None:
+        return render_pet_colony_panel(actors)
+    return render_pet_colony_panel(actors, appearance=appearance)
+
+
+def _compose_pet_background_for_appearance(
+    panel: Image.Image,
+    appearance: DeckAppearanceSettings,
+) -> Image.Image:
+    """把 PETS viewport 合成完整背景，并兼容默认模式的旧注入签名。
+
+    入参：面板图和当前外观。
+    返回：800x480 N4 Pro 完整背景。
+    错误处理：尺寸或 Pillow 错误按底层语义传播。
+    副作用：仅创建内存图片。
+    """
+
+    if appearance.background_color is None:
+        return compose_n4pro_background(panel)
+    return compose_n4pro_background(panel, appearance=appearance)
+
+
 class CodexPetRuntime:
     """协调 daemon 中的宠物解析、活动、缓存、采样和诊断。
 
     入参：``enabled``、``panel_fps`` 与 ``motion`` 来自 ``[codex.pet]``；
     ``cache_root`` 是 daemon 生命周期临时目录；``fallback_key_path`` 是内置 Codex 静态图；
-    resolver 与 reduced-motion reader 可在测试中替换。
+    resolver 与 reduced-motion reader 可在测试中替换；``appearance`` 控制可合成背景。
     返回：实例方法提供线程安全的 Key Path、PETS 背景和 JSON-safe 诊断。
     错误处理：可预期的解析失败保存在 resolution；预渲染或系统偏好读取失败进入短诊断，
     不中断 daemon。
@@ -91,6 +147,7 @@ class CodexPetRuntime:
         cache_root: Path,
         fallback_key_path: Path | None,
         panel_settings: N4ProPetsPanelSettings | None = None,
+        appearance: DeckAppearanceSettings | None = None,
         resolver: CodexPetResolver | None = None,
         builtin_catalog: CodexBuiltinPetCatalog | None = None,
         reduced_motion_reader: ReducedMotionReader | None = None,
@@ -115,6 +172,7 @@ class CodexPetRuntime:
         self._resolver = resolver or CodexPetResolver()
         self._builtin_catalog = builtin_catalog or CodexBuiltinPetCatalog()
         self._panel_settings = panel_settings or N4ProPetsPanelSettings()
+        self._appearance = appearance or DeckAppearanceSettings()
         reduced_motion, effective_motion, motion_error = resolve_codex_pet_motion(
             motion,
             reader=reduced_motion_reader,
@@ -152,6 +210,7 @@ class CodexPetRuntime:
         self._panel_collision_count = 0
         self._key_frames: dict[str, tuple[Path, ...]] = {}
         self._key_asset_fingerprint: str | None = None
+        self._key_appearance_cache_key = appearance_cache_key(self._appearance)
         self._last_error: str | None = None
         self._updated_at: datetime | None = None
         self._panel_revision = 0
@@ -229,11 +288,22 @@ class CodexPetRuntime:
         asset = resolution.asset
         with self._lock:
             cached_fingerprint = self._key_asset_fingerprint
-        if asset is not None and asset.source_fingerprint != cached_fingerprint:
+            cached_appearance_key = self._key_appearance_cache_key
+            current_appearance = self._appearance
+        current_appearance_key = appearance_cache_key(current_appearance)
+        if asset is not None and (
+            asset.source_fingerprint,
+            current_appearance_key,
+        ) != (cached_fingerprint, cached_appearance_key):
             try:
                 rendered = pre_render_pet_key_frames(
                     asset,
-                    cache_dir=self._cache_root / asset.source_fingerprint[:20],
+                    cache_dir=(
+                        self._cache_root
+                        / asset.source_fingerprint[:20]
+                        / current_appearance_key.removeprefix("#").lower()
+                    ),
+                    appearance=current_appearance,
                 )
                 new_frames = {str(action): paths for action, paths in rendered.items()}
             except Exception as exc:  # noqa: BLE001 - Key 可安全回退静态图。
@@ -258,11 +328,55 @@ class CodexPetRuntime:
             elif new_frames is not None:
                 self._key_frames = new_frames
                 self._key_asset_fingerprint = asset.source_fingerprint
+                self._key_appearance_cache_key = current_appearance_key
             elif cache_error is not None and (selection_changed or fingerprint_changed):
                 self._key_frames = {}
                 self._key_asset_fingerprint = None
         self._refresh_panel_actor_assets()
         return resolution
+
+    def update_display_appearance(
+        self,
+        appearance: DeckAppearanceSettings,
+    ) -> None:
+        """更新宠物 Key 与 PETS panel 使用的全局显示外观。
+
+        入参：``appearance`` 是已经持久化并校验的完整外观设置。
+        返回：无显式返回。
+        错误处理：现有宠物帧重建失败时抛原异常，让配置 API 保留旧 applied 外观。
+        副作用：可能在 daemon 临时缓存目录写新的外观派生帧；成功后清空 panel 内存缓存。
+        """
+
+        with self._lock:
+            if appearance == self._appearance:
+                return
+            resolution = self._resolution
+            asset = resolution.asset if resolution is not None else None
+        appearance_key = appearance_cache_key(appearance)
+        new_frames: dict[str, tuple[Path, ...]] | None = None
+        if asset is not None:
+            rendered = pre_render_pet_key_frames(
+                asset,
+                cache_dir=(
+                    self._cache_root
+                    / asset.source_fingerprint[:20]
+                    / appearance_key.removeprefix("#").lower()
+                ),
+                appearance=appearance,
+            )
+            new_frames = {str(action): paths for action, paths in rendered.items()}
+        with self._lock:
+            self._appearance = appearance
+            if asset is not None and new_frames is not None:
+                self._key_frames = new_frames
+                self._key_asset_fingerprint = asset.source_fingerprint
+                self._key_appearance_cache_key = appearance_key
+            self._panel_image = None
+            self._panel_visual_key = None
+            self._panel_semantic_key = None
+            self._panel_render_bucket = None
+            self._app_overlay_dynamic_cache_key = None
+            self._app_overlay_dynamic_source = None
 
     def mark_refresh_error(self, error: Exception, *, updated_at: datetime) -> None:
         """记录 resolver 未建模异常但不清除同选择的最近成功画面。
@@ -753,6 +867,7 @@ class CodexPetRuntime:
                         colony_sample.visual_key,
                         self._effective_motion,
                         self._panel_settings.patrol_speed.value,
+                        appearance_cache_key(self._appearance),
                     )
                     semantic_key = (
                         "colony",
@@ -778,8 +893,14 @@ class CodexPetRuntime:
                     )
                     if rate_limited and self._panel_image is not None:
                         return self._panel_revision, self._panel_image
-                    panel = render_pet_colony_panel(render_actors)
-                    self._panel_image = compose_n4pro_background(panel)
+                    panel = _render_pet_colony_for_appearance(
+                        render_actors,
+                        self._appearance,
+                    )
+                    self._panel_image = _compose_pet_background_for_appearance(
+                        panel,
+                        self._appearance,
+                    )
                     self._panel_visual_key = visual_key
                     self._panel_semantic_key = semantic_key
                     self._panel_render_bucket = render_bucket
@@ -791,10 +912,12 @@ class CodexPetRuntime:
                 visual_key = (
                     "colony-empty",
                     tuple(actor.agent_key for actor in self._panel_actors),
+                    appearance_cache_key(self._appearance),
                 )
                 if visual_key != self._panel_visual_key or self._panel_image is None:
-                    self._panel_image = compose_n4pro_background(
-                        render_pet_colony_panel(())
+                    self._panel_image = _compose_pet_background_for_appearance(
+                        _render_pet_colony_for_appearance((), self._appearance),
+                        self._appearance,
                     )
                     self._panel_visual_key = visual_key
                     self._panel_semantic_key = visual_key
@@ -816,6 +939,7 @@ class CodexPetRuntime:
                 sample.frame_index,
                 sample.x_bucket(800),
                 self._effective_motion,
+                appearance_cache_key(self._appearance),
             )
             semantic_key = (
                 asset.source_fingerprint,
@@ -831,8 +955,15 @@ class CodexPetRuntime:
             )
             if rate_limited and self._panel_image is not None:
                 return self._panel_revision, self._panel_image
-            panel = render_pet_panel_image(asset, sample)
-            self._panel_image = compose_n4pro_background(panel)
+            panel = _render_pet_panel_for_appearance(
+                asset,
+                sample,
+                self._appearance,
+            )
+            self._panel_image = _compose_pet_background_for_appearance(
+                panel,
+                self._appearance,
+            )
             self._panel_visual_key = visual_key
             self._panel_semantic_key = semantic_key
             self._panel_render_bucket = render_bucket

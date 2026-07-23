@@ -23,6 +23,7 @@ from agent_deck.actions.apps import (
     load_local_app_icon,
     resolve_local_app_icon_path,
 )
+from agent_deck.rendering.appearance import DeckAppearanceSettings, appearance_cache_key
 from agent_deck.rendering.app_key import render_app_key_image
 
 _APP_ICON_CACHE_ENV = "AGENT_DECK_APP_ICON_CACHE_DIR"
@@ -80,7 +81,7 @@ class AppIconCache:
 
         self.root = root.expanduser()
         self.url_prefix = url_prefix.rstrip("/")
-        self._key_images: dict[str, Image.Image] = {}
+        self._key_images: dict[tuple[str, str], Image.Image] = {}
 
     def ensure_for_app(
         self,
@@ -169,7 +170,7 @@ class AppIconCache:
                 "updated_at": datetime.now(UTC).isoformat(),
             },
         )
-        self._key_images.pop(cache_key, None)
+        self._drop_key_images(cache_key)
         return self._entry(cache_key, status="ready", updated=True)
 
     def key_image_for_binding(
@@ -180,10 +181,11 @@ class AppIconCache:
         bundle_id: str | None,
         icon_token: str | None,
         icon_color: str | None = None,
+        appearance: DeckAppearanceSettings | None = None,
     ) -> Image.Image | None:
         """读取适合硬件下发的缓存 key 图。
 
-        入参：App binding identity 来自 `KeyPlan.payload`。
+        入参：App binding identity 来自 `KeyPlan.payload`；``appearance`` 可覆盖基础画布。
         返回：RGB `Image`；同一缓存版本会复用同一个进程内图片对象，缓存或读取失败时返回 None，
         让调用方 fallback。
         错误处理：坏缓存图片返回 None；写缓存失败向上传播。
@@ -200,17 +202,41 @@ class AppIconCache:
         )
         if entry.key_icon_path is None:
             return None
-        cached = self._key_images.get(entry.cache_key)
+        cache_key = (entry.cache_key, appearance_cache_key(appearance))
+        cached = self._key_images.get(cache_key)
         if cached is not None:
             return cached
+        if appearance is not None and appearance.background_color is not None:
+            key_image = render_app_key_image(
+                app_name=app_name,
+                app_path=app_path,
+                icon_token=icon_token,
+                icon_color=icon_color,
+                appearance=appearance,
+            )
+            self._key_images[cache_key] = key_image
+            return key_image
         try:
             with Image.open(entry.key_icon_path) as image:
                 image.load()
                 key_image = image.convert("RGB")
-                self._key_images[entry.cache_key] = key_image
+                self._key_images[cache_key] = key_image
                 return key_image
         except Exception:
             return None
+
+    def _drop_key_images(self, cache_key: str) -> None:
+        """移除一个 App identity 的全部外观派生内存图。
+
+        入参：``cache_key`` 是 App 缓存目录名。
+        返回：无。
+        错误处理：未知 key 是幂等 no-op。
+        副作用：修改进程内 Pillow image 缓存，不删除磁盘文件。
+        """
+
+        for image_key in tuple(self._key_images):
+            if image_key[0] == cache_key:
+                self._key_images.pop(image_key, None)
 
     def resolve_file(self, cache_key: str, asset_name: str) -> Path | None:
         """把 Web icon URL 参数解析为缓存文件路径。

@@ -23,6 +23,7 @@ from agent_deck.adapters.codex_pet import (
     PetActivity,
     PetActivitySnapshot,
 )
+from agent_deck.rendering.appearance import DeckAppearanceSettings, resolve_render_palette
 
 PetAnimationName = Literal[
     "idle",
@@ -48,9 +49,6 @@ PANEL_CANVAS_SIZE: Final[tuple[int, int]] = (800, 136)
 
 PET_BACKGROUND: Final[tuple[int, int, int]] = (11, 15, 22)
 """宠物 Key 与面板共享的 ``#0B0F16`` 背景色。"""
-
-PET_GROUND: Final[tuple[int, int, int]] = (27, 42, 54)
-"""PETS 面板的 ``#1B2A36`` 地面线颜色。"""
 
 PET_ANIMATION_ROWS: Final[
     Mapping[PetAnimationName, tuple[int, tuple[int, ...]]]
@@ -571,11 +569,13 @@ def render_pet_key_image(
     size: tuple[int, int] = KEY_CANVAS_SIZE,
     pet_height: int = 96,
     baseline_y: int = 104,
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
     """把一个宠物样本渲染为静止于中央的 112x112 Key 图像。
 
     入参：``asset`` 和 ``sample`` 定位帧；``size`` 是画布；``pet_height`` 是完整 cell
-    缩放高度上限；``baseline_y`` 是缩放后 cell 的底线。running-left/right 会改用
+    缩放高度上限；``baseline_y`` 是缩放后 cell 的底线；``appearance`` 可覆盖基础画布。
+    running-left/right 会改用
     非方向性的 ``running`` 行，且忽略 ``sample.x``。
     返回：RGB Pillow 图像，默认严格 112x112。
     错误处理：画布/基线无法容纳完整 cell 时抛 ValueError；Pillow 错误按原异常传播。
@@ -588,7 +588,11 @@ def render_pet_key_image(
     fitted = _resize_full_cell(frame, pet_height=pet_height)
     x = (size[0] - fitted.width) // 2
     y = baseline_y - fitted.height
-    canvas = Image.new("RGBA", size, (*PET_BACKGROUND, 255))
+    palette = resolve_render_palette(
+        appearance,
+        default_background=PET_BACKGROUND,
+    )
+    canvas = Image.new("RGBA", size, (*palette.background, 255))
     canvas.alpha_composite(fitted, (x, y))
     return canvas.convert("RGB")
 
@@ -601,12 +605,13 @@ def render_pet_panel_image(
     pet_height: int = 96,
     baseline_y: int = 124,
     horizontal_margin: int = 8,
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
     """把宠物样本渲染到完整 800x136 touchbar 运动空间。
 
     入参：``asset``/``sample`` 定位帧与归一化 x；``size``、``pet_height``、底线和
-    左右 margin 定义空间几何。
-    返回：RGB Pillow 图像；角色不越界，背景仅含极简地面线，不在轨迹叠文字。
+    左右 margin 定义空间几何；``appearance`` 可覆盖背景。
+    返回：RGB Pillow 图像；角色不越界，背景不额外绘制地平线或轨迹装饰。
     错误处理：尺寸、边距或底线无法容纳完整 cell 时抛 ValueError。
     副作用：只创建内存图像，不写文件或访问硬件。
     """
@@ -625,13 +630,11 @@ def render_pet_panel_image(
         raise ValueError("pet panel is too narrow for the full sprite cell")
     x = horizontal_margin + round(travel * sample.x)
     y = baseline_y - fitted.height
-    canvas = Image.new("RGBA", size, (*PET_BACKGROUND, 255))
-    draw = ImageDraw.Draw(canvas)
-    draw.line(
-        (horizontal_margin, baseline_y, size[0] - horizontal_margin - 1, baseline_y),
-        fill=(*PET_GROUND, 255),
-        width=1,
+    palette = resolve_render_palette(
+        appearance,
+        default_background=PET_BACKGROUND,
     )
+    canvas = Image.new("RGBA", size, (*palette.background, 255))
     canvas.alpha_composite(fitted, (x, y))
     return canvas.convert("RGB")
 
@@ -640,10 +643,12 @@ def pre_render_pet_key_frames(
     asset: CodexPetAsset,
     *,
     cache_dir: Path,
+    appearance: DeckAppearanceSettings | None = None,
 ) -> dict[PetAnimationName, tuple[Path, ...]]:
     """一次性把全部公共动作行预渲染为 112x112 PNG 缓存。
 
-    入参：``asset`` 是已加载图集；``cache_dir`` 必须由 daemon 指向其临时生命周期目录。
+    入参：``asset`` 是已加载图集；``cache_dir`` 必须由 daemon 指向其临时生命周期目录；
+    ``appearance`` 决定派生帧基础背景。
     返回：动作名到有序 PNG Path 元组的映射；所有帧均为完整 Key 输出。
     错误处理：目录创建、PNG 编码或 Pillow 渲染失败时原异常传播。
     副作用：创建缓存目录并覆盖同名派生 PNG；不修改原宠物包。
@@ -664,7 +669,10 @@ def pre_render_pet_key_frames(
                 sampled_at_monotonic=0.0,
             )
             output_path = resolved_cache / f"{action}-{frame_index:02d}.png"
-            render_pet_key_image(asset, sample).save(output_path, format="PNG")
+            render_pet_key_image(asset, sample, appearance=appearance).save(
+                output_path,
+                format="PNG",
+            )
             paths.append(output_path)
         rendered[action] = tuple(paths)
     return rendered

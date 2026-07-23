@@ -25,6 +25,11 @@ from agent_deck.adapters.codex_tokens import (
     format_token_count,
 )
 from agent_deck.rendering.reset_credit import draw_reset_credit_key_icon
+from agent_deck.rendering.appearance import (
+    DeckAppearanceSettings,
+    RenderPalette,
+    resolve_render_palette,
+)
 
 N4PRO_STATUS_KEY_SIZE: Final[tuple[int, int]] = (112, 112)
 """N4 Pro 主按键状态图标默认尺寸。"""
@@ -69,11 +74,13 @@ def render_quota_status_key_image(
     window: QuotaStatusWindow = "auto",
     size: tuple[int, int] = N4PRO_STATUS_KEY_SIZE,
     now: datetime | None = None,
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
     """把 Codex quota 快照渲染成单个订阅/限额状态按键。
 
     入参：`snapshot` 是 quota adapter 输出；`window` 控制展示最紧张窗口或指定 API 窗口；
-    `size` 是输出尺寸；`now` 用于测试或预览中稳定“今天/其他日期”判断。
+    `size` 是输出尺寸；`now` 用于测试或预览中稳定“今天/其他日期”判断；
+    ``appearance`` 可覆盖基础背景及中性层级。
     返回：RGB `Image`，默认 112x112。
     错误处理：尺寸过小时抛 `ValueError`；未知窗口由类型约束或显式分支抛出。
     副作用：只创建内存图片，不访问文件、网络或硬件。
@@ -84,10 +91,18 @@ def render_quota_status_key_image(
     remaining = _remaining_percent(selected_window.used_percent)
     reset_label = _quota_reset_label(selected_window, now=now)
 
-    canvas = _new_canvas(size)
+    palette = _status_palette(appearance)
+    canvas = _new_canvas(size, palette=palette)
     draw = ImageDraw.Draw(canvas)
-    _draw_key_surface(draw, size)
-    _draw_badge(draw, (size[0] / 2, 8), label, accent)
+    _draw_key_surface(draw, size, palette=palette)
+    _draw_badge(
+        draw,
+        (size[0] / 2, 8),
+        label,
+        accent,
+        text_fill=palette.foreground,
+        surface=palette.surface,
+    )
 
     plan_label = _quota_identity_label(selected_window, snapshot=snapshot)
     _draw_text(
@@ -95,7 +110,7 @@ def render_quota_status_key_image(
         (size[0] / 2, 31),
         plan_label,
         size=11,
-        fill=_MUTED,
+        fill=palette.muted_foreground,
         bold=True,
         anchor="mm",
     )
@@ -105,7 +120,7 @@ def render_quota_status_key_image(
         bounds=(8, 38, 104, 72),
         max_size=34,
         min_size=24,
-        fill=_TEXT,
+        fill=palette.foreground,
         bold=True,
         anchor="mm",
     )
@@ -114,11 +129,13 @@ def render_quota_status_key_image(
         bounds=(10, 76, 102, 82),
         percent=remaining,
         fill=accent,
+        track=palette.divider if palette.custom else _TRACK,
     )
     _draw_reset_footer(
         draw,
         available_count=snapshot.reset_credits_available,
         reset_label=reset_label,
+        muted=palette.muted_foreground,
     )
     return _downsample(canvas, size)
 
@@ -129,11 +146,12 @@ def render_usage_summary_key_image(
     period: CodexTokenPeriod = CodexTokenPeriod.TODAY,
     size: tuple[int, int] = N4PRO_STATUS_KEY_SIZE,
     sparkline_metric: UsageSparklineMetric = "total_tokens",
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
     """把 Codex token/cost 快照渲染成单个用量状态按键。
 
     入参：`snapshot` 是 token usage adapter 输出；`period` 是展示周期；`size` 是输出尺寸；
-    `sparkline_metric` 控制底部趋势使用 token 总量还是金额。
+    `sparkline_metric` 控制底部趋势使用 token 总量还是金额；``appearance`` 可覆盖中性背景。
     返回：RGB `Image`，默认 112x112。
     错误处理：缺少周期时抛 `KeyError`；尺寸过小时抛 `ValueError`。
     副作用：只创建内存图片，不执行 ccusage、不访问硬件。
@@ -146,15 +164,17 @@ def render_usage_summary_key_image(
     values = usage_sparkline_values(snapshot, period=period, metric=sparkline_metric)
     period_color = _period_color(period)
 
-    canvas = _new_canvas(size)
+    palette = _status_palette(appearance)
+    canvas = _new_canvas(size, palette=palette)
     draw = ImageDraw.Draw(canvas)
-    _draw_key_surface(draw, size)
+    _draw_key_surface(draw, size, palette=palette)
     _draw_badge(
         draw,
         (size[0] / 2, 8),
         _period_badge(period),
         period_color,
         text_fill=period_color,
+        surface=palette.surface,
     )
     _draw_fitted_text(
         draw,
@@ -162,7 +182,7 @@ def render_usage_summary_key_image(
         bounds=(8, 30, 104, 59),
         max_size=28,
         min_size=21,
-        fill=_TEXT,
+        fill=palette.foreground,
         bold=True,
         anchor="mm",
     )
@@ -475,17 +495,42 @@ def _date_range(start: date, end: date) -> tuple[date, ...]:
     return tuple(start + timedelta(days=offset) for offset in range(days + 1))
 
 
-def _new_canvas(size: tuple[int, int]) -> Image.Image:
+def _status_palette(
+    appearance: DeckAppearanceSettings | None,
+) -> RenderPalette:
+    """解析状态 Key 使用的默认或自定义中性色。
+
+    入参：可选全局显示外观。
+    返回：未设置时保持原常量，设置时返回对比度感知调色板。
+    错误处理：外观模型已校验。
+    副作用：无。
+    """
+
+    return resolve_render_palette(
+        appearance,
+        default_background=_BACKGROUND,
+        default_foreground=_TEXT,
+        default_muted_foreground=_MUTED,
+        default_surface=_SURFACE,
+        default_divider=_SURFACE_EDGE,
+    )
+
+
+def _new_canvas(
+    size: tuple[int, int],
+    *,
+    palette: RenderPalette,
+) -> Image.Image:
     """创建抗锯齿绘制用的放大画布。
 
-    入参：`size` 是最终输出尺寸。
+    入参：`size` 是最终输出尺寸；``palette`` 提供基础背景。
     返回：放大 `_SCALE` 倍的 RGB 图像。
     错误处理：Pillow 创建失败时异常传播。
     副作用：只分配内存。
     """
 
     width, height = size
-    return Image.new("RGB", (width * _SCALE, height * _SCALE), _BACKGROUND)
+    return Image.new("RGB", (width * _SCALE, height * _SCALE), palette.background)
 
 
 def _downsample(canvas: Image.Image, size: tuple[int, int]) -> Image.Image:
@@ -503,10 +548,12 @@ def _downsample(canvas: Image.Image, size: tuple[int, int]) -> Image.Image:
 def _draw_key_surface(
     draw: ImageDraw.ImageDraw,
     size: tuple[int, int],
+    *,
+    palette: RenderPalette,
 ) -> None:
     """绘制状态按键的底色和轻量边界。
 
-    入参：`draw` 是放大画布的绘图对象；`size` 是最终输出尺寸。
+    入参：`draw` 是放大画布的绘图对象；`size` 是最终输出尺寸；``palette`` 提供表面层级。
     返回：无返回值。
     错误处理：Pillow 绘制失败时异常传播。
     副作用：修改内存图像。
@@ -514,8 +561,13 @@ def _draw_key_surface(
 
     width, height = size
     bounds = _scaled_box((3, 3, width - 3, height - 3))
-    draw.rounded_rectangle(bounds, radius=10 * _SCALE, fill=_SURFACE)
-    draw.rounded_rectangle(bounds, radius=10 * _SCALE, outline=_SURFACE_EDGE, width=1 * _SCALE)
+    draw.rounded_rectangle(bounds, radius=10 * _SCALE, fill=palette.surface)
+    draw.rounded_rectangle(
+        bounds,
+        radius=10 * _SCALE,
+        outline=palette.divider,
+        width=1 * _SCALE,
+    )
 
 
 def _draw_badge(
@@ -525,11 +577,12 @@ def _draw_badge(
     color: tuple[int, int, int],
     *,
     text_fill: tuple[int, int, int] = _TEXT,
+    surface: tuple[int, int, int] = _SURFACE,
 ) -> None:
     """绘制左上角周期角标。
 
     入参：`draw` 是绘图对象；`origin` 是最终坐标；`label` 是短角标；`color` 是强调色；
-    `text_fill` 是标签文字色。
+    `text_fill` 是标签文字色；``surface`` 是 tint 混合底色。
     返回：无返回值。
     错误处理：Pillow 绘制失败时异常传播。
     副作用：修改内存图像。
@@ -544,7 +597,7 @@ def _draw_badge(
     draw.rounded_rectangle(
         _scaled_box((x, y, x + badge_w, y + badge_h)),
         radius=5 * _SCALE,
-        fill=_tinted(color, 0.18),
+        fill=_tinted(color, 0.18, surface=surface),
         outline=color,
         width=1 * _SCALE,
     )
@@ -565,10 +618,12 @@ def _draw_progress_bar(
     bounds: tuple[int, int, int, int],
     percent: int,
     fill: tuple[int, int, int],
+    track: tuple[int, int, int] = _TRACK,
 ) -> None:
     """绘制 quota 剩余比例细进度条。
 
-    入参：`draw` 是绘图对象；`bounds` 是最终坐标；`percent` 是 0-100；`fill` 是进度色。
+    入参：`draw` 是绘图对象；`bounds` 是最终坐标；`percent` 是 0-100；`fill` 是进度色；
+    ``track`` 是未使用部分的中性色。
     返回：无返回值。
     错误处理：Pillow 绘制失败时异常传播。
     副作用：修改内存图像。
@@ -576,7 +631,7 @@ def _draw_progress_bar(
 
     left, top, right, bottom = bounds
     clamped = max(0, min(100, percent))
-    draw.rounded_rectangle(_scaled_box(bounds), radius=3 * _SCALE, fill=_TRACK)
+    draw.rounded_rectangle(_scaled_box(bounds), radius=3 * _SCALE, fill=track)
     if clamped <= 0:
         return
     fill_right = left + round((right - left) * clamped / 100)
@@ -592,10 +647,12 @@ def _draw_reset_footer(
     *,
     available_count: int | None,
     reset_label: str,
+    muted: tuple[int, int, int] = _MUTED,
 ) -> None:
     """绘制 quota 按键底部 reset credit 与 reset time。
 
-    入参：`draw` 是绘图对象；`available_count` 是可用重置次数；`reset_label` 是右下角时间。
+    入参：`draw` 是绘图对象；`available_count` 是可用重置次数；`reset_label` 是右下角时间；
+    ``muted`` 是次要文字色。
     返回：无返回值。
     错误处理：Pillow 绘制失败时异常传播。
     副作用：修改内存图像。
@@ -622,7 +679,7 @@ def _draw_reset_footer(
         (102, 98),
         reset_label,
         size=12,
-        fill=_MUTED,
+        fill=muted,
         bold=True,
         anchor="rm",
     )
@@ -801,10 +858,15 @@ def _scaled_points(points: tuple[tuple[float, float], ...] | list[tuple[float, f
     return [(round(x * _SCALE), round(y * _SCALE)) for x, y in points]
 
 
-def _tinted(color: tuple[int, int, int], alpha: float) -> tuple[int, int, int]:
+def _tinted(
+    color: tuple[int, int, int],
+    alpha: float,
+    *,
+    surface: tuple[int, int, int] = _SURFACE,
+) -> tuple[int, int, int]:
     """把颜色与状态按键背景混合成暗色 tint。
 
-    入参：`color` 是 RGB；`alpha` 是目标色权重。
+    入参：`color` 是 RGB；`alpha` 是目标色权重；``surface`` 是混合底色。
     返回：混合后的 RGB。
     错误处理：alpha 会夹紧到 0-1。
     副作用：无。
@@ -812,6 +874,6 @@ def _tinted(color: tuple[int, int, int], alpha: float) -> tuple[int, int, int]:
 
     weight = max(0.0, min(1.0, alpha))
     return tuple(
-        round(_SURFACE[channel] * (1 - weight) + color[channel] * weight)
+        round(surface[channel] * (1 - weight) + color[channel] * weight)
         for channel in range(3)
     )

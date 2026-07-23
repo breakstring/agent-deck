@@ -68,6 +68,9 @@ from agent_deck.rendering.codex_key_frames import (
 from agent_deck.rendering.quota_touchscreen import render_quota_touchscreen
 from agent_deck.rendering.visuals import resolve_visual_icon_spec
 from agent_deck.server.app import DaemonPollerConfig, create_app
+from agent_deck.server.display_appearance_store import (
+    resolve_display_appearance_path,
+)
 from agent_deck.server.key_layout_store import resolve_n4pro_key_layout_path
 from agent_deck.server.pets_panel_settings_store import (
     resolve_n4pro_pets_panel_settings_path,
@@ -371,6 +374,7 @@ def daemon_callback(
             key_layout_path=resolve_n4pro_key_layout_path(),
             rotary_layout_path=resolve_n4pro_rotary_layout_path(),
             pets_panel_settings_path=resolve_n4pro_pets_panel_settings_path(),
+            display_appearance_path=resolve_display_appearance_path(),
             quota_presentation_path=resolve_quota_presentation_path(),
         ),
         host=host,

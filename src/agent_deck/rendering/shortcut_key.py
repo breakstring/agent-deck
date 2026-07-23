@@ -11,6 +11,11 @@ import json
 from PIL import Image, ImageDraw, ImageFont
 
 from agent_deck.actions.keyboard import KeyboardModifier, KeyboardShortcutSpec
+from agent_deck.rendering.appearance import (
+    DeckAppearanceSettings,
+    appearance_cache_key,
+    resolve_render_palette,
+)
 
 N4PRO_SHORTCUT_KEY_IMAGE_SIZE = (112, 112)
 """N4 Pro 快捷键自动图标默认尺寸。"""
@@ -81,31 +86,37 @@ class ShortcutKeyImageCache:
         if max_entries <= 0:
             raise ValueError("max_entries must be positive")
         self._max_entries = max_entries
-        self._images: dict[str, Image.Image] = {}
+        self._images: dict[tuple[str, str], Image.Image] = {}
         self._hits = 0
         self._misses = 0
 
-    def image(self, shortcut: KeyboardShortcutSpec) -> Image.Image:
+    def image(
+        self,
+        shortcut: KeyboardShortcutSpec,
+        *,
+        appearance: DeckAppearanceSettings | None = None,
+    ) -> Image.Image:
         """读取或渲染一个快捷键自动图标。
 
-        入参：已校验 shortcut。
+        入参：已校验 shortcut；``appearance`` 是可选全局显示外观。
         返回：缓存命中或新创建的 RGB image。
         错误处理：渲染异常按原样传播。
         副作用：更新命中计数；miss 时写入缓存并按容量裁剪。
         """
 
-        key = json.dumps(
+        shortcut_key = json.dumps(
             shortcut.model_dump(mode="json"),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         )
+        key = (shortcut_key, appearance_cache_key(appearance))
         cached = self._images.get(key)
         if cached is not None:
             self._hits += 1
             return cached
         self._misses += 1
-        image = render_shortcut_key_image(shortcut)
+        image = render_shortcut_key_image(shortcut, appearance=appearance)
         self._images[key] = image
         while len(self._images) > self._max_entries:
             self._images.pop(next(iter(self._images)))
@@ -149,38 +160,52 @@ def render_shortcut_key_image(
     shortcut: KeyboardShortcutSpec,
     *,
     size: tuple[int, int] = N4PRO_SHORTCUT_KEY_IMAGE_SIZE,
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
-    """为快捷键规格绘制默认 N4 Pro 图标。
+    """为快捷键规格绘制无内层底板的默认 N4 Pro 图标。
 
-    入参：已校验 shortcut 和至少 64x64 的目标尺寸。
-    返回：RGB Pillow image。
+    入参：已校验 shortcut、至少 64x64 的目标尺寸和可选显示外观。
+    返回：RGB Pillow image；快捷键标签直接绘制在 Key 基础背景上。
     错误处理：尺寸太小抛 ValueError；字体缺失时使用 Pillow 默认字体。
     副作用：只创建内存图片，字体读取是只读文件访问。
     """
 
     if size[0] < 64 or size[1] < 64:
         raise ValueError("shortcut key image size is too small")
-    canvas = Image.new("RGB", size, (11, 14, 18))
-    draw = ImageDraw.Draw(canvas)
-    draw.rounded_rectangle(
-        (7, 7, size[0] - 8, size[1] - 8),
-        radius=18,
-        fill=(21, 27, 34),
-        outline=(75, 97, 115),
-        width=2,
+    palette = resolve_render_palette(
+        appearance,
+        default_background=(11, 14, 18),
+        default_foreground=(239, 244, 247),
     )
+    canvas = Image.new("RGB", size, palette.background)
+    draw = ImageDraw.Draw(canvas)
 
     labels = [shortcut_step_label(shortcut, index) for index in range(len(shortcut.steps))]
     if len(labels) == 1:
-        _draw_centered_text(draw, canvas, labels[0], center_y=size[1] / 2, max_size=34)
+        _draw_centered_text(
+            draw,
+            canvas,
+            labels[0],
+            center_y=size[1] / 2,
+            max_size=34,
+            fill=palette.foreground,
+        )
         return canvas
     if len(labels) == 2:
-        _draw_centered_text(draw, canvas, labels[0], center_y=39, max_size=25)
-        _draw_centered_text(draw, canvas, labels[1], center_y=75, max_size=25)
+        _draw_centered_text(
+            draw, canvas, labels[0], center_y=39, max_size=25, fill=palette.foreground
+        )
+        _draw_centered_text(
+            draw, canvas, labels[1], center_y=75, max_size=25, fill=palette.foreground
+        )
         return canvas
 
-    _draw_centered_text(draw, canvas, labels[0], center_y=30, max_size=21)
-    _draw_centered_text(draw, canvas, labels[1], center_y=58, max_size=21)
+    _draw_centered_text(
+        draw, canvas, labels[0], center_y=30, max_size=21, fill=palette.foreground
+    )
+    _draw_centered_text(
+        draw, canvas, labels[1], center_y=58, max_size=21, fill=palette.foreground
+    )
     _draw_centered_text(
         draw,
         canvas,

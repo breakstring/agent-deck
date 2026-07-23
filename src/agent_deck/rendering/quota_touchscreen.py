@@ -13,6 +13,11 @@ from typing import Final
 from PIL import Image, ImageDraw, ImageFont
 
 from agent_deck.adapters.codex_quota import CodexQuotaSnapshot, CodexQuotaWindow
+from agent_deck.rendering.appearance import (
+    DeckAppearanceSettings,
+    RenderPalette,
+    resolve_render_palette,
+)
 from agent_deck.rendering.n4pro_panel import (
     N4PRO_BACKGROUND_COLOR,
     N4PRO_BACKGROUND_SIZE,
@@ -55,13 +60,14 @@ def render_quota_touchscreen(
     window: str = "all",
     size: tuple[int, int] = N4PRO_BACKGROUND_SIZE,
     touch_bar_rect: tuple[int, int, int, int] = N4PRO_TOUCH_BAR_RECT,
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
     """把 Codex quota 快照渲染为 N4 Pro 背景图。
 
     入参：`snapshot` 是 Codex quota adapter 解析出的快照；`window` 控制展示指定 API 窗口或
     全部实际可用窗口；`size` 是 SDK 背景图尺寸，
     默认 N4 Pro 的 800x480；`touch_bar_rect` 是背景图中真实底部触摸条的安全绘制区域，
-    格式为 `(left, top, right, bottom)`。
+    格式为 `(left, top, right, bottom)`；``appearance`` 可覆盖背景和中性层级。
     返回：RGB `Image`，可保存为 JPEG 后通过 SDK `set_touchscreen_image` 下发；信息只绘制
     在 `touch_bar_rect` 内，其余区域保持背景色，避免内容透到按键窗口。
     错误处理：Pillow 字体加载失败时自动退回默认字体；非法尺寸或非法矩形会抛异常。
@@ -69,8 +75,18 @@ def render_quota_touchscreen(
     """
 
     viewport = VirtualPanelViewport(*touch_bar_rect)
-    panel = render_quota_panel(snapshot, window=window, size=viewport.size)
-    return compose_n4pro_background(panel, viewport=viewport, background_size=size)
+    panel = render_quota_panel(
+        snapshot,
+        window=window,
+        size=viewport.size,
+        appearance=appearance,
+    )
+    return compose_n4pro_background(
+        panel,
+        viewport=viewport,
+        background_size=size,
+        appearance=appearance,
+    )
 
 
 def render_quota_panel(
@@ -78,19 +94,21 @@ def render_quota_panel(
     *,
     window: str = "all",
     size: tuple[int, int] = N4PRO_LOGICAL_PANEL_VIEWPORT.size,
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
     """把 Codex quota 快照渲染为底部虚拟 panel 图像。
 
     入参：`snapshot` 是 Codex quota adapter 解析出的快照；`window` 控制当前内容维度；`size`
     是 panel 自身尺寸，
-    默认使用 N4 Pro touch-bar viewport 尺寸。
+    默认使用 N4 Pro touch-bar viewport 尺寸；``appearance`` 可覆盖背景和中性层级。
     返回：RGB `Image`，只包含 panel 内容，不包含 N4 Pro 整屏背景。
     错误处理：Pillow 字体加载失败时自动退回默认字体；尺寸过小时抛 `ValueError`。
     副作用：只创建内存图像，不访问文件、网络或硬件。
     """
 
     _validate_panel_size(size)
-    image = Image.new("RGB", size, _BACKGROUND)
+    palette = _quota_palette(appearance)
+    image = Image.new("RGB", size, palette.background)
     draw = ImageDraw.Draw(image)
     width, height = size
     left, top, right, bottom = 0, 0, width, height
@@ -103,9 +121,6 @@ def render_quota_panel(
     content_right = right - inset_x
     content_bottom = bottom - inset_y
 
-    _draw_panel(draw, (left + 18, top + 8, right - 18, bottom - 8))
-    draw.line((left + 28, top + 10, right - 28, top + 10), fill=(34, 44, 64), width=1)
-
     title_font = _load_font(52, bold=True)
     label_font = _load_font(22, bold=True)
     value_font = _load_font(17, bold=False)
@@ -114,7 +129,12 @@ def render_quota_panel(
 
     title_y = top + max(18, (bar_height - 62) // 2)
     plan_label = snapshot.plan_short_label or snapshot.plan_display_name
-    draw.text((content_left, title_y), plan_label, fill=_TEXT, font=title_font)
+    draw.text(
+        (content_left, title_y),
+        plan_label,
+        fill=palette.foreground,
+        font=title_font,
+    )
     _draw_reset_credit_marker(
         draw,
         available_count=snapshot.reset_credits_available,
@@ -141,6 +161,7 @@ def render_quota_panel(
             label_font=label_font,
             value_font=value_font,
             percent_font=percent_font,
+            palette=palette,
         )
     return image
 
@@ -219,18 +240,6 @@ def _validate_panel_size(size: tuple[int, int]) -> None:
         raise ValueError("panel size is too small for the quota layout")
 
 
-def _draw_panel(draw: ImageDraw.ImageDraw, bounds: tuple[int, int, int, int]) -> None:
-    """绘制触屏信息面板背景。
-
-    入参：`draw` 是目标绘图对象；`bounds` 是 `(left, top, right, bottom)`。
-    返回：无返回值。
-    错误处理：Pillow 绘制失败时异常传播。
-    副作用：修改 `draw` 绑定的内存图像。
-    """
-
-    draw.rounded_rectangle(bounds, radius=24, fill=_PANEL)
-
-
 def _draw_quota_row(
     draw: ImageDraw.ImageDraw,
     *,
@@ -243,12 +252,14 @@ def _draw_quota_row(
     label_font: ImageFont.ImageFont,
     value_font: ImageFont.ImageFont,
     percent_font: ImageFont.ImageFont,
+    palette: RenderPalette,
 ) -> None:
     """绘制一行 quota 进度信息。
 
     入参：`draw` 是绘图对象；`label` 是行标题；`remaining_percent` 是 0-100 剩余配额百分比；
     `reset_label` 是重置时间文本；`origin` 是行左上角；`max_right` 是本行可绘制右边界；
-    `bar_color` 是进度条颜色；`label_font`/`value_font`/`percent_font` 是对应字体。
+    `bar_color` 是进度条颜色；`label_font`/`value_font`/`percent_font` 是对应字体；
+    ``palette`` 提供中性文字和轨道色。
     返回：无返回值。
     错误处理：Pillow 绘制失败时异常传播。
     副作用：修改 `draw` 绑定的内存图像。
@@ -277,11 +288,17 @@ def _draw_quota_row(
     icon_center = (icon_x + icon_size // 2, bar_center_y)
     reset_x = icon_x + icon_size + icon_text_gap
 
-    draw.text((x, bar_center_y), label, fill=_TEXT, font=label_font, anchor="lm")
+    draw.text(
+        (x, bar_center_y),
+        label,
+        fill=palette.foreground,
+        font=label_font,
+        anchor="lm",
+    )
     draw.rounded_rectangle(
         (bar_x, bar_y, bar_x + bar_w, bar_y + bar_h),
         radius=bar_h // 2,
-        fill=_TRACK,
+        fill=palette.divider if palette.custom else _TRACK,
     )
     fill_w = round(bar_w * percent / 100)
     if fill_w > 0:
@@ -290,9 +307,20 @@ def _draw_quota_row(
             radius=bar_h // 2,
             fill=bar_color,
         )
-    _draw_reset_icon(draw, icon_center, icon_size)
+    _draw_reset_icon(
+        draw,
+        icon_center,
+        icon_size,
+        color=palette.muted_foreground,
+    )
     draw.text((bar_x, y + 29), f"{percent}%", fill=bar_color, font=percent_font)
-    draw.text((reset_x, bar_center_y), reset_label, fill=_MUTED, font=value_font, anchor="lm")
+    draw.text(
+        (reset_x, bar_center_y),
+        reset_label,
+        fill=palette.muted_foreground,
+        font=value_font,
+        anchor="lm",
+    )
 
 
 def _text_right(
@@ -347,10 +375,13 @@ def _draw_reset_icon(
     draw: ImageDraw.ImageDraw,
     center: tuple[int, int],
     size: int,
+    *,
+    color: tuple[int, int, int] = _MUTED,
 ) -> None:
     """绘制 reset 时间前的小钟表图标。
 
-    入参：`draw` 是绘图对象；`center` 是图标中心点；`size` 是图标外径像素。
+    入参：`draw` 是绘图对象；`center` 是图标中心点；`size` 是图标外径像素；
+    ``color`` 是中性线条色。
     返回：无返回值。
     错误处理：Pillow 绘制失败时异常传播。
     副作用：修改 `draw` 绑定的内存图像。
@@ -362,9 +393,30 @@ def _draw_reset_icon(
     top = cy - radius
     right = cx + radius
     bottom = cy + radius
-    draw.ellipse((left, top, right, bottom), outline=_MUTED, width=2)
-    draw.line((cx, cy, cx, cy - radius + 3), fill=_MUTED, width=2)
-    draw.line((cx, cy, cx + radius - 3, cy), fill=_MUTED, width=2)
+    draw.ellipse((left, top, right, bottom), outline=color, width=2)
+    draw.line((cx, cy, cx, cy - radius + 3), fill=color, width=2)
+    draw.line((cx, cy, cx + radius - 3, cy), fill=color, width=2)
+
+
+def _quota_palette(
+    appearance: DeckAppearanceSettings | None,
+) -> RenderPalette:
+    """解析 quota panel 使用的默认或自定义中性色。
+
+    入参：可选全局显示外观。
+    返回：未设置时保持既有常量，设置时返回对比度感知调色板。
+    错误处理：外观模型已校验。
+    副作用：无。
+    """
+
+    return resolve_render_palette(
+        appearance,
+        default_background=_BACKGROUND,
+        default_foreground=_TEXT,
+        default_muted_foreground=_MUTED,
+        default_surface=_PANEL,
+        default_divider=_TRACK,
+    )
 
 
 def _draw_reset_credit_marker(

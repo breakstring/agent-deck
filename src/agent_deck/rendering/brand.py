@@ -13,6 +13,10 @@ from typing import Final
 
 from PIL import Image, ImageDraw, ImageFont
 
+from agent_deck.rendering.appearance import (
+    DeckAppearanceSettings,
+    resolve_render_palette,
+)
 from agent_deck.rendering.n4pro_panel import (
     N4PRO_BACKGROUND_COLOR,
     N4PRO_BACKGROUND_SIZE,
@@ -23,7 +27,6 @@ from agent_deck.rendering.n4pro_panel import (
 
 _ASSET_PACKAGE: Final[str] = "agent_deck.assets"
 _LOGO_ASSET_NAME: Final[str] = "logo_command_core.png"
-_SPLASH_PANEL_ASSET_NAME: Final[str] = "n4pro_splash_command_core.png"
 _BACKGROUND: Final[tuple[int, int, int]] = N4PRO_BACKGROUND_COLOR
 _PANEL: Final[tuple[int, int, int]] = (17, 22, 30)
 _PANEL_INNER: Final[tuple[int, int, int]] = (28, 32, 38)
@@ -89,68 +92,74 @@ def render_agent_deck_splash_touchscreen(
     *,
     size: tuple[int, int] = N4PRO_BACKGROUND_SIZE,
     viewport: VirtualPanelViewport = N4PRO_LOGICAL_PANEL_VIEWPORT,
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
     """渲染可直接下发到 N4 Pro 背景层的 Agent Deck 默认 splash。
 
-    入参：`size` 是 N4 Pro SDK 背景图尺寸；`viewport` 是底部 logical panel 投影区域。
+    入参：`size` 是 N4 Pro SDK 背景图尺寸；`viewport` 是底部 logical panel 投影区域；
+    ``appearance`` 可覆盖基础背景和品牌面板中性色。
     返回：RGB `Image`，尺寸为 `size`，品牌 splash 只绘制在 `viewport` 内。
     错误处理：viewport 越界或 panel 尺寸过小时抛出 `ValueError`。
     副作用：只创建内存图像，不访问真实硬件。
     """
 
-    panel = render_agent_deck_splash_panel(size=viewport.size)
-    return compose_n4pro_background(panel, viewport=viewport, background_size=size)
+    panel = render_agent_deck_splash_panel(
+        size=viewport.size,
+        appearance=appearance,
+    )
+    return compose_n4pro_background(
+        panel,
+        viewport=viewport,
+        background_size=size,
+        appearance=appearance,
+    )
 
 
 def render_agent_deck_splash_panel(
     *,
     size: tuple[int, int] = N4PRO_LOGICAL_PANEL_VIEWPORT.size,
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
     """渲染底部 logical panel 尺寸的 Agent Deck 默认 splash。
 
-    入参：`size` 是独立 panel 尺寸，默认匹配 N4 Pro 底部 touch bar viewport。
+    入参：`size` 是独立 panel 尺寸，默认匹配 N4 Pro 底部 touch bar viewport；
+    ``appearance`` 可覆盖基础背景和中性色。
     返回：RGB `Image`，包含 logo、产品名、默认状态和短状态文案。
     错误处理：尺寸不足时抛出 `ValueError`；字体加载失败会回退到 Pillow 默认字体。
     副作用：只创建内存图像。
     """
 
     _validate_splash_panel_size(size)
-    asset = _load_packaged_image(_SPLASH_PANEL_ASSET_NAME, mode="RGB")
-    if asset is not None:
-        return asset.resize(size, Image.Resampling.LANCZOS)
-
-    return _render_agent_deck_splash_panel_fallback(size=size)
+    return _render_agent_deck_splash_panel_fallback(
+        size=size,
+        appearance=appearance,
+    )
 
 
 def _render_agent_deck_splash_panel_fallback(
     *,
     size: tuple[int, int],
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
     """在 bitmap splash 资产不可用时渲染程序化默认 panel。
 
-    入参：`size` 是独立 panel 尺寸。
+    入参：`size` 是独立 panel 尺寸；``appearance`` 可覆盖背景和中性色。
     返回：RGB `Image`，包含 Command Core 风格的基础品牌信息。
     错误处理：Pillow 字体或绘制异常按原异常传播。
     副作用：只创建内存图像。
     """
 
-    image = Image.new("RGB", size, _BACKGROUND)
+    palette = resolve_render_palette(
+        appearance,
+        default_background=_BACKGROUND,
+        default_foreground=_TEXT,
+        default_muted_foreground=_MUTED,
+        default_surface=_PANEL,
+        default_divider=_LINE,
+    )
+    image = Image.new("RGB", size, palette.background)
     draw = ImageDraw.Draw(image)
     width, height = size
-
-    panel_bounds = (18, 8, width - 18, height - 8)
-    draw.rounded_rectangle(panel_bounds, radius=24, fill=_PANEL)
-    draw.rounded_rectangle(
-        (
-            panel_bounds[0] + 2,
-            panel_bounds[1] + 2,
-            panel_bounds[2] - 2,
-            panel_bounds[3] - 2,
-        ),
-        radius=22,
-        outline=_LINE,
-        width=1,
-    )
 
     logo_size = min(92, height - 38)
     logo_left = 42
@@ -167,11 +176,16 @@ def _render_agent_deck_splash_panel_fallback(
 
     text_left = logo_left + logo_size + 30
     title_y = 28
-    draw.text((text_left, title_y), "AGENT DECK", fill=_TEXT, font=title_font)
+    draw.text(
+        (text_left, title_y),
+        "AGENT DECK",
+        fill=palette.foreground,
+        font=title_font,
+    )
     draw.text(
         (text_left + 2, title_y + 47),
         "LOCAL AI CONTROL SURFACE",
-        fill=_MUTED,
+        fill=palette.muted_foreground,
         font=subtitle_font,
     )
 
@@ -213,7 +227,7 @@ def _render_agent_deck_splash_panel_fallback(
     draw.text(
         (text_left, height - 23),
         "Command surface standing by",
-        fill=_MUTED,
+        fill=palette.muted_foreground,
         font=small_font,
     )
     return image

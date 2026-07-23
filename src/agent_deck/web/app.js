@@ -67,6 +67,11 @@ const state = {
     patrol_speed: "medium",
   },
   petsPanelSettingsSource: "default",
+  displayAppearance: {
+    background_color: null,
+  },
+  displayAppearanceSource: "default",
+  displayAppearanceRevision: 0,
   controlCapabilities: null,
   appQuery: "",
   dirty: false,
@@ -90,6 +95,8 @@ const el = {
   knobStrip: document.getElementById("knobStrip"),
   lightingControl: document.getElementById("lightingControl"),
   petsPanelControl: document.getElementById("petsPanelControl"),
+  appearanceControl: document.getElementById("appearanceControl"),
+  devicePreview: document.querySelector(".n4-pro"),
   selectedEyebrow: document.getElementById("selectedEyebrow"),
   selectedTitle: document.getElementById("selectedTitle"),
   selectedSubtitle: document.getElementById("selectedSubtitle"),
@@ -325,7 +332,8 @@ function shortcutSummary(shortcut) {
 /** 把快捷键草稿编码成由硬件 renderer 生成的同源 PNG 地址。 */
 function shortcutAutoPreviewUrl(shortcut) {
   const spec = JSON.stringify(shortcut || { steps: [] });
-  return `/ui/shortcut-icons/auto-preview.png?spec=${encodeURIComponent(spec)}`;
+  const draftBackground = normalizeDisplayBackgroundColor(state.displayAppearance.background_color) || "default";
+  return `/ui/shortcut-icons/auto-preview.png?spec=${encodeURIComponent(spec)}&background_color=${encodeURIComponent(draftBackground)}`;
 }
 
 /** 使用硬件 renderer 的 PNG；空序列只显示尚未配置占位。 */
@@ -676,6 +684,8 @@ function renderKnobs() {
   el.lightingControl.setAttribute("aria-pressed", String(state.selectedSurface === "lighting"));
   el.petsPanelControl?.classList.toggle("selected", state.selectedSurface === "pets");
   el.petsPanelControl?.setAttribute("aria-pressed", String(state.selectedSurface === "pets"));
+  el.appearanceControl?.classList.toggle("selected", state.selectedSurface === "appearance");
+  el.appearanceControl?.setAttribute("aria-pressed", String(state.selectedSurface === "appearance"));
 }
 
 function choiceButton(kind, title, meta) {
@@ -1403,9 +1413,9 @@ function renderLightingInspector() {
 function renderPetsPanelInspector() {
   const settings = state.petsPanelSettings;
   const colony = state.status?.codex_pet?.panel_colony || {};
-  el.selectedEyebrow.textContent = "PETS 虚拟面板";
-  el.selectedTitle.textContent = "宠物巡游设置";
-  el.selectedSubtitle.textContent = "统一控制远端任务的宠物来源和整组宠物的巡游节奏；后续 PETS 设置也会放在这里。";
+  el.selectedEyebrow.textContent = "Touch bar 设置";
+  el.selectedTitle.textContent = "宠物巡游";
+  el.selectedSubtitle.textContent = "这里配置 Touch bar 当前承载的 PETS 内容；背景属于独立的“显示外观”设置。";
   el.inspectorBody.innerHTML = `
     <div class="field-group">
       <label class="text-field" for="remotePetSource"><span>远端 Agent 宠物</span>
@@ -1450,10 +1460,122 @@ function renderPetsPanelInspector() {
   });
 }
 
+/** 把用户输入规范化为后端接受的 #RRGGBB；非法值返回 null。 */
+function normalizeDisplayBackgroundColor(value) {
+  const candidate = String(value || "").trim().toUpperCase();
+  return /^#[0-9A-F]{6}$/.test(candidate) ? candidate : null;
+}
+
+/** 由背景亮度推导预览前景色，模拟硬件 renderer 的自动对比度策略。 */
+function displayPreviewForeground(background) {
+  const hex = normalizeDisplayBackgroundColor(background) || "#0B0E12";
+  const channels = [1, 3, 5].map((offset) => Number.parseInt(hex.slice(offset, offset + 2), 16));
+  const luminance = (0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]) / 255;
+  return luminance > 0.56 ? "#111820" : "#F2F7FA";
+}
+
+/** 更新设备总览中的 Key 与 Touch bar 草稿色；不写 daemon、不触发硬件下发。 */
+function renderDisplayAppearancePreview() {
+  const custom = normalizeDisplayBackgroundColor(state.displayAppearance.background_color);
+  const background = custom || "#0B0E12";
+  const foreground = displayPreviewForeground(background);
+  el.devicePreview?.style.setProperty("--display-preview-background", background);
+  el.devicePreview?.style.setProperty("--display-preview-foreground", foreground);
+  el.devicePreview?.classList.toggle("custom-display-background", custom !== null);
+}
+
+/** 标记独立显示外观草稿有变化，并仅刷新本地双表面预览。 */
+function markDisplayAppearanceDirty(backgroundColor) {
+  state.displayAppearance.background_color = backgroundColor;
+  state.dirty = true;
+  renderDisplayAppearancePreview();
+  renderSyncState();
+}
+
+/** 渲染不隶属于 PETS、Key 或旋钮的全局显示外观设置。 */
+function renderDisplayAppearanceInspector() {
+  const customColor = normalizeDisplayBackgroundColor(state.displayAppearance.background_color);
+  const isCustom = customColor !== null;
+  const previewColor = customColor || "#0B0E12";
+  const previewForeground = displayPreviewForeground(previewColor);
+  el.selectedEyebrow.textContent = "显示外观";
+  el.selectedTitle.textContent = "硬件内容背景";
+  el.selectedSubtitle.textContent = "统一影响常规 App、自定义按键、状态、宠物和 Touch bar；修改先停留在预览，保存后才应用。";
+  el.inspectorBody.innerHTML = `
+    <div class="field-group">
+      <div class="field-label">背景模式</div>
+      <div class="appearance-mode-grid" role="radiogroup" aria-label="背景模式">
+        <button class="choice-button${isCustom ? "" : " active"}" type="button" data-appearance-mode="default" role="radio" aria-checked="${String(!isCustom)}">
+          <span class="choice-title">不设定</span><span class="choice-meta">沿用各内容原效果</span>
+        </button>
+        <button class="choice-button${isCustom ? " active" : ""}" type="button" data-appearance-mode="custom" role="radio" aria-checked="${String(isCustom)}">
+          <span class="choice-title">自定义颜色</span><span class="choice-meta">跨表面统一</span>
+        </button>
+      </div>
+      <p class="control-note">“不设定”不是黑色，而是不覆盖 renderer 现有背景，因此默认画面保持完全兼容。</p>
+    </div>
+    ${isCustom ? `
+      <div class="field-group">
+        <div class="field-label">背景颜色</div>
+        <div class="color-setting">
+          <input id="displayBackgroundPicker" class="color-input" type="color" value="${escapeAttr(customColor)}" aria-label="选择显示背景色">
+          <input id="displayBackgroundText" class="text-input" type="text" value="${escapeAttr(customColor)}" maxlength="7" pattern="#[0-9A-Fa-f]{6}" aria-label="显示背景色十六进制值">
+        </div>
+      </div>
+    ` : ""}
+    <div class="field-group">
+      <div class="field-label">双表面预览</div>
+      <div class="appearance-preview-pair" style="--appearance-preview-bg:${escapeAttr(previewColor)};--appearance-preview-fg:${escapeAttr(previewForeground)}">
+        <div class="appearance-key-preview"><span>A</span><small>App</small></div>
+        <div class="appearance-panel-preview"><strong>AGENT DECK</strong><span>Touch bar</span></div>
+      </div>
+      <p class="control-note">${isCustom ? `预览 ${escapeHtml(customColor)}；文字与辅助色会自动选择可读对比度。` : "当前不覆盖背景，Key 与 Touch bar 分别沿用已有默认画面。"}</p>
+    </div>
+    <div class="field-group">
+      ${detailRow("作用范围", "所有 Key 内容 + Touch bar")}
+      ${detailRow("设置状态", state.displayAppearanceSource === "persisted" ? "已保存" : "使用默认")}
+      ${detailRow("应用 revision", String(state.displayAppearanceRevision))}
+    </div>
+  `;
+  el.inspectorBody.querySelectorAll("[data-appearance-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const nextColor = button.dataset.appearanceMode === "custom"
+        ? customColor || "#203040"
+        : null;
+      markDisplayAppearanceDirty(nextColor);
+      render();
+    });
+  });
+  document.getElementById("displayBackgroundPicker")?.addEventListener("input", (event) => {
+    const nextColor = normalizeDisplayBackgroundColor(event.target.value);
+    if (nextColor === null) return;
+    markDisplayAppearanceDirty(nextColor);
+    const textInput = document.getElementById("displayBackgroundText");
+    if (textInput) textInput.value = nextColor;
+    const pair = el.inspectorBody.querySelector(".appearance-preview-pair");
+    pair?.style.setProperty("--appearance-preview-bg", nextColor);
+    pair?.style.setProperty("--appearance-preview-fg", displayPreviewForeground(nextColor));
+  });
+  document.getElementById("displayBackgroundText")?.addEventListener("change", (event) => {
+    const nextColor = normalizeDisplayBackgroundColor(event.target.value);
+    if (nextColor === null) {
+      el.toast.textContent = "背景颜色必须是 #RRGGBB";
+      event.target.focus();
+      return;
+    }
+    markDisplayAppearanceDirty(nextColor);
+    render();
+  });
+}
+
 /**
  * 根据当前设备预览选中的表面渲染 key、旋钮或独立灯光设置检查器。
  */
 function renderInspector() {
+  if (state.selectedSurface === "appearance") {
+    renderDisplayAppearanceInspector();
+    return;
+  }
   if (state.selectedSurface === "pets") {
     renderPetsPanelInspector();
     return;
@@ -1739,6 +1861,7 @@ function renderSyncState() {
 }
 
 function render() {
+  renderDisplayAppearancePreview();
   renderKeys();
   renderKnobs();
   renderInspector();
@@ -1819,6 +1942,21 @@ async function loadPetsPanelSettings() {
     render();
   } catch (error) {
     el.toast.textContent = `PETS 设置读取失败：${error.message}`;
+  }
+}
+
+/** 从独立端点读取已应用显示外观，初始化本地草稿与 revision。 */
+async function loadDisplayAppearance() {
+  try {
+    const response = await fetch("/ui/display-appearance", { cache: "no-store" });
+    if (!response.ok) throw new Error(`display appearance ${response.status}`);
+    const body = await response.json();
+    state.displayAppearance = structuredClone(body.settings || { background_color: null });
+    state.displayAppearanceSource = body.source || "default";
+    state.displayAppearanceRevision = Number(body.revision || 0);
+    render();
+  } catch (error) {
+    el.toast.textContent = `显示外观读取失败：${error.message}`;
   }
 }
 
@@ -2081,6 +2219,7 @@ async function saveAndApply() {
         },
         rotary_layout: state.rotaryLayout,
         pets_panel_settings: state.petsPanelSettings,
+        display_appearance: state.displayAppearance,
       }),
     });
     if (!response.ok) throw new Error(`save ${response.status}`);
@@ -2090,6 +2229,11 @@ async function saveAndApply() {
     if (body.pets_panel_settings?.settings) {
       state.petsPanelSettings = structuredClone(body.pets_panel_settings.settings);
       state.petsPanelSettingsSource = body.pets_panel_settings.source || "runtime";
+    }
+    if (body.display_appearance?.settings) {
+      state.displayAppearance = structuredClone(body.display_appearance.settings);
+      state.displayAppearanceSource = body.display_appearance.source || "runtime";
+      state.displayAppearanceRevision = Number(body.display_appearance.revision || 0);
     }
     state.keys.forEach((key) => {
       key.dirty = false;
@@ -2186,6 +2330,10 @@ el.petsPanelControl?.addEventListener("click", () => {
   state.selectedSurface = "pets";
   render();
 });
+el.appearanceControl?.addEventListener("click", () => {
+  state.selectedSurface = "appearance";
+  render();
+});
 el.closeAppModal.addEventListener("click", closeAppModal);
 el.appModal.addEventListener("click", (event) => {
   if (event.target === el.appModal) closeAppModal();
@@ -2201,6 +2349,7 @@ async function boot() {
   await loadKeyLayout();
   await loadRotaryLayout();
   await loadPetsPanelSettings();
+  await loadDisplayAppearance();
   await loadControlCapabilities();
   await refreshStatus();
   render();

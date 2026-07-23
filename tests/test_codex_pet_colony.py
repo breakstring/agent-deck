@@ -10,9 +10,12 @@ from agent_deck.adapters.codex_pet import CodexAppPetActorSnapshot, PetActivity
 from agent_deck.config import CodexPetPatrolSpeed
 from agent_deck.rendering.codex_pet_colony import (
     PetColonyController,
+    _remote_mat,
     _reflected_position,
+    render_pet_colony_panel,
     remote_host_color,
 )
+from agent_deck.rendering.codex_pet import PET_BACKGROUND
 
 
 def _actor(
@@ -71,6 +74,22 @@ def test_remote_host_color_is_stable_and_host_specific() -> None:
     assert remote_host_color("ssh-a") == remote_host_color("ssh-a")
     colors = {remote_host_color(f"ssh-{index}") for index in range(8)}
     assert len(colors) > 1
+
+
+def test_pet_colony_has_no_horizon_and_uses_compact_remote_halo() -> None:
+    """群体面板不应绘制地平线，远端光圈应只略宽于宠物本体。
+
+    入参：空群体和一个稳定远端颜色。
+    返回：无；断言基线像素仍为背景且光圈模板缩为 96x16。
+    错误处理：渲染或模板尺寸回归时由 pytest 报告。
+    副作用：只创建并缓存内存图片。
+    """
+
+    panel = render_pet_colony_panel(())
+    halo = _remote_mat(remote_host_color("ssh-a"))
+
+    assert panel.getpixel((400, 124)) == (*PET_BACKGROUND, 255)
+    assert halo.size == (96, 16)
 
 
 def test_reflected_position_preserves_direction_before_boundary() -> None:

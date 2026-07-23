@@ -19,6 +19,12 @@ from typing import Any
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent_deck.rendering.appearance import (
+    DeckAppearanceSettings,
+    appearance_cache_key,
+    resolve_render_palette,
+)
+
 MAX_SHORTCUT_ICON_BYTES = 5 * 1024 * 1024
 """单个快捷键自定义图标允许的最大上传字节数。"""
 
@@ -93,7 +99,7 @@ class ShortcutIconStore:
         """
 
         self.root = root
-        self._key_images: dict[str, Image.Image] = {}
+        self._key_images: dict[tuple[str, str], Image.Image] = {}
 
     def store(
         self,
@@ -230,41 +236,68 @@ class ShortcutIconStore:
         path = self.root / asset_id / asset_name
         return path if path.is_file() else None
 
-    def key_image(self, asset_id: str) -> Image.Image | None:
+    def key_image(
+        self,
+        asset_id: str,
+        *,
+        appearance: DeckAppearanceSettings | None = None,
+    ) -> Image.Image | None:
         """读取一个资产的 N4 Pro 112px RGB 图像。
 
-        入参：内容 hash id。
+        入参：内容 hash id；``appearance`` 可覆盖透明区和 contain 留白的基础背景。
         返回：独立加载的 RGB Pillow image；缺失或坏文件返回 None。
         错误处理：解码失败降级 None，便于渲染器使用自动图标 fallback。
         副作用：只读 key PNG 文件。
         """
 
-        cached = self._key_images.get(asset_id)
+        cache_key = (asset_id, appearance_cache_key(appearance))
+        cached = self._key_images.get(cache_key)
         if cached is not None:
             return cached
-        path = self.resolve_file(asset_id, _KEY_IMAGE)
+        asset_dir = self.root / asset_id
+        path = (
+            asset_dir / _NORMALIZED_IMAGE
+            if appearance is not None and appearance.background_color is not None
+            else self.resolve_file(asset_id, _KEY_IMAGE)
+        )
         if path is None:
             return None
         try:
             with Image.open(path) as image:
                 image.load()
-                loaded = image.convert("RGB")
-                self._key_images[asset_id] = loaded
+                if appearance is not None and appearance.background_color is not None:
+                    loaded = _fit_custom_icon(
+                        image.convert("RGBA"),
+                        size=(112, 112),
+                        appearance=appearance,
+                    ).convert("RGB")
+                else:
+                    loaded = image.convert("RGB")
+                self._key_images[cache_key] = loaded
                 return loaded
         except (OSError, UnidentifiedImageError):
             return None
 
 
-def _fit_custom_icon(image: Image.Image, *, size: tuple[int, int]) -> Image.Image:
+def _fit_custom_icon(
+    image: Image.Image,
+    *,
+    size: tuple[int, int],
+    appearance: DeckAppearanceSettings | None = None,
+) -> Image.Image:
     """把用户图片等比居中到深色正方形画布。
 
-    入参：已规范化 RGBA 图片和目标尺寸。
+    入参：已规范化 RGBA 图片、目标尺寸和可选显示外观。
     返回：RGBA 画布。
     错误处理：非法尺寸由 Pillow 抛出。
     副作用：只处理内存图片。
     """
 
-    canvas = Image.new("RGBA", size, (11, 14, 18, 255))
+    palette = resolve_render_palette(
+        appearance,
+        default_background=(11, 14, 18),
+    )
+    canvas = Image.new("RGBA", size, (*palette.background, 255))
     contained = ImageOps.contain(image, size, Image.Resampling.LANCZOS)
     x = (size[0] - contained.width) // 2
     y = (size[1] - contained.height) // 2

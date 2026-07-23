@@ -442,9 +442,10 @@ def test_daemon_overlay_restores_exact_cached_app_icon_object(tmp_path: Path) ->
     入参：pytest 临时目录承载 daemon 缓存和虚拟宠物帧 Path。
     返回：无；断言 running 使用 Path，idle 后恢复原 Pillow 对象且 revision 只含脏键。
     错误处理：FastAPI 或模型异常由测试失败暴露。
-    副作用：只修改 TestClient runtime 内存，不启动 App 或硬件。
+    副作用：读取当前 UTC 时间并只修改 TestClient runtime 内存，不启动 App 或硬件。
     """
 
+    observed_at = datetime.now(UTC)
     app = create_app(
         poller_config=DaemonPollerConfig(
             codex_pet_enabled=True,
@@ -465,7 +466,7 @@ def test_daemon_overlay_restores_exact_cached_app_icon_object(tmp_path: Path) ->
         runtime.store.upsert_observed_state(
             source=AgentSource.CODEX,
             session_id="running",
-            observed_at=_BASE_TIME,
+            observed_at=observed_at,
             status=AgentStatus.RUNNING_TOOL,
             focus_target="codex-app:thread-1",
         )
@@ -476,7 +477,7 @@ def test_daemon_overlay_restores_exact_cached_app_icon_object(tmp_path: Path) ->
         runtime.store.upsert_observed_state(
             source=AgentSource.CODEX,
             session_id="running",
-            observed_at=_BASE_TIME + timedelta(seconds=1),
+            observed_at=observed_at + timedelta(seconds=1),
             status=AgentStatus.OFFLINE,
             focus_target="codex-app:thread-1",
         )

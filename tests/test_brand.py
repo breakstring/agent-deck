@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from agent_deck.rendering.appearance import DeckAppearanceSettings
 from agent_deck.rendering.brand import (
     render_agent_deck_logo,
     render_agent_deck_splash_panel,
@@ -46,7 +47,7 @@ def test_render_agent_deck_splash_panel_contains_branded_content() -> None:
     image = render_agent_deck_splash_panel()
 
     assert image.size == N4PRO_LOGICAL_PANEL_VIEWPORT.size
-    assert image.getpixel((60, 20)) != N4PRO_BACKGROUND_COLOR
+    assert image.getpixel((170, 45)) != N4PRO_BACKGROUND_COLOR
     assert image.getpixel((82, 68)) != N4PRO_BACKGROUND_COLOR
     assert image.getpixel((650, 50)) != N4PRO_BACKGROUND_COLOR
 
@@ -67,3 +68,19 @@ def test_render_agent_deck_splash_touchscreen_uses_bottom_viewport() -> None:
     probe_x = N4PRO_LOGICAL_PANEL_VIEWPORT.left + 82
     probe_y = N4PRO_LOGICAL_PANEL_VIEWPORT.top + 68
     assert image.getpixel((probe_x, probe_y)) != N4PRO_BACKGROUND_COLOR
+
+
+def test_render_agent_deck_splash_panel_has_no_outer_rounded_backplate() -> None:
+    """品牌内容应直接落在用户背景上，不再叠加整块圆角底板。
+
+    入参：固定浅色显示外观。
+    返回：无；断言旧底板内部的空白探针保持用户背景色。
+    错误处理：渲染异常或底板回归时由 pytest 报告。
+    副作用：只创建内存图片。
+    """
+
+    image = render_agent_deck_splash_panel(
+        appearance=DeckAppearanceSettings(background_color="#F0D8B0")
+    )
+
+    assert image.getpixel((24, 68)) == (240, 216, 176)

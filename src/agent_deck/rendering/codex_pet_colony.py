@@ -23,11 +23,11 @@ from agent_deck.adapters.codex_pet import (
     PetActivity,
 )
 from agent_deck.config import CodexPetPatrolSpeed
+from agent_deck.rendering.appearance import DeckAppearanceSettings, resolve_render_palette
 from agent_deck.rendering.codex_pet import (
     PANEL_CANVAS_SIZE,
     PET_ANIMATION_ROWS,
     PET_BACKGROUND,
-    PET_GROUND,
     PetAnimationName,
     animation_duration_seconds,
     animation_frame_index,
@@ -390,21 +390,21 @@ def render_pet_colony_panel(
     actors: tuple[PetColonyRenderActor, ...],
     *,
     size: tuple[int, int] = PANEL_CANVAS_SIZE,
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
     """把多个角色绘制到同一 800x136 PETS viewport。
 
     先绘制全部远端光环，再按稳定 agent key 绘制完整 cell，角色重叠时不会因 x 顺序变化闪烁。
-    本地角色 ``remote_color=None``，因此没有任何地垫。
+    本地角色 ``remote_color=None``，因此没有脚下光圈；``appearance`` 可覆盖背景。
     """
 
     if size != PANEL_CANVAS_SIZE:
         raise ValueError("pet colony renderer currently requires an 800x136 panel")
-    canvas = Image.new("RGBA", size, (*PET_BACKGROUND, 255))
-    ImageDraw.Draw(canvas).line(
-        (8, _BASELINE_Y, size[0] - 8, _BASELINE_Y),
-        fill=(*PET_GROUND, 255),
-        width=1,
+    palette = resolve_render_palette(
+        appearance,
+        default_background=PET_BACKGROUND,
     )
+    canvas = Image.new("RGBA", size, (*palette.background, 255))
     positioned: list[tuple[PetColonyRenderActor, int]] = []
     travel_width = size[0] - 2 * _PET_HALF_WIDTH
     for actor in actors:
@@ -414,7 +414,7 @@ def render_pet_colony_panel(
             mat = _remote_mat(actor.sample.remote_color)
             canvas.alpha_composite(
                 mat,
-                (center_x - mat.width // 2, _BASELINE_Y - 12),
+                (center_x - mat.width // 2, _BASELINE_Y - 10),
             )
 
     for actor, center_x in sorted(positioned, key=lambda item: item[0].sample.agent_key):
@@ -541,17 +541,17 @@ def _action_for_activity(
 
 @lru_cache(maxsize=len(REMOTE_HOST_COLORS))
 def _remote_mat(color: tuple[int, int, int]) -> Image.Image:
-    """预渲染一个 128x20 细光环模板，供同 host 的角色复用。"""
+    """预渲染一个 96x16 紧凑光环模板，供同 host 的角色复用。"""
 
-    width, height = 128, 20
+    width, height = 96, 16
     halo = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     halo_draw = ImageDraw.Draw(halo)
-    halo_draw.ellipse((0, 0, width - 1, 17), outline=(*color, 82), width=3)
-    blurred = halo.filter(ImageFilter.GaussianBlur(5))
+    halo_draw.ellipse((0, 0, width - 1, 13), outline=(*color, 82), width=3)
+    blurred = halo.filter(ImageFilter.GaussianBlur(4))
     draw = ImageDraw.Draw(blurred)
-    draw.ellipse((5, 3, width - 6, 15), outline=(*color, 235), width=1)
-    draw.arc((11, 5, width - 12, 13), 194, 330, fill=(*color, 175), width=1)
-    draw.arc((16, 6, width - 17, 12), 12, 138, fill=(*color, 125), width=1)
+    draw.ellipse((5, 2, width - 6, 13), outline=(*color, 235), width=1)
+    draw.arc((10, 4, width - 11, 11), 194, 330, fill=(*color, 175), width=1)
+    draw.arc((15, 5, width - 16, 10), 12, 138, fill=(*color, 125), width=1)
     return blurred
 
 

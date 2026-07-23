@@ -13,6 +13,8 @@ from typing import Final
 
 from PIL import Image
 
+from agent_deck.rendering.appearance import DeckAppearanceSettings, resolve_render_palette
+
 N4PRO_BACKGROUND_SIZE: Final[tuple[int, int]] = (800, 480)
 N4PRO_BACKGROUND_COLOR: Final[tuple[int, int, int]] = (14, 18, 28)
 
@@ -82,18 +84,24 @@ def compose_n4pro_background(
     viewport: VirtualPanelViewport = N4PRO_TOUCH_BAR_VIEWPORT,
     background_size: tuple[int, int] = N4PRO_BACKGROUND_SIZE,
     background_color: tuple[int, int, int] = N4PRO_BACKGROUND_COLOR,
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
     """把 panel 图像合成到 N4 Pro 背景图的底部 viewport。
 
     入参：`panel` 是上层 panel renderer 输出的图像；`viewport` 是目标区域；
-    `background_size` 是 SDK 背景图尺寸；`background_color` 是非 panel 区域底色。
+    `background_size` 是 SDK 背景图尺寸；`background_color` 是未覆盖时的非 panel 区域底色；
+    ``appearance`` 可提供跨表面的用户背景色。
     返回：RGB `Image`，尺寸为 `background_size`，可保存后交给 `set_touchscreen_image`。
     错误处理：viewport 非法时抛 `ValueError`；Pillow 缩放或转换异常按原异常传播。
     副作用：只创建内存图像，不访问文件、网络或硬件。
     """
 
     viewport.validate_inside(background_size)
-    background = Image.new("RGB", background_size, background_color)
+    palette = resolve_render_palette(
+        appearance,
+        default_background=background_color,
+    )
+    background = Image.new("RGB", background_size, palette.background)
     panel_rgb = panel.convert("RGB")
     if panel_rgb.size != viewport.size:
         panel_rgb = panel_rgb.resize(viewport.size, Image.Resampling.LANCZOS)

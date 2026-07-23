@@ -3,7 +3,8 @@
 This module wires the MVP in-memory runtime for normalized events, approval
 decisions, layout planning, optional Codex pollers, a fake hardware surface, and
 optional real N4 Pro render sinks. It deliberately does not bind sockets or install
-hooks. 当调用方提供用户级路径时，配置路由可持久化 N4 Pro key、rotary 和 PETS 设置；
+hooks. 当调用方提供用户级路径时，配置路由可持久化 N4 Pro key、rotary、Touch bar 和
+独立显示外观设置；
 CLI entry point 负责 hosting，并决定是否启用 Codex local-state/quota polling、
 ChatGPT Settings-gated read-only SSH Remote observation 与真实 StreamDock rendering。
 """
@@ -134,7 +135,14 @@ from agent_deck.input.interactions import (
 )
 from agent_deck.rendering.brand import render_agent_deck_splash_touchscreen
 from agent_deck.rendering.app_key import render_app_key_image
+from agent_deck.rendering.appearance import (
+    DeckAppearanceSettings,
+    appearance_cache_key,
+)
 from agent_deck.rendering.codex_key_frames import codex_key_frame_paths_for_key_variants
+from agent_deck.rendering.codex_key_frame_compositor import (
+    composite_codex_key_frame_paths,
+)
 from agent_deck.rendering.key_surface import (
     N4ProKeyLayout,
     default_n4pro_key_layout,
@@ -198,6 +206,11 @@ from agent_deck.server.pets_panel_settings_store import (
     PetsPanelSettingsStoreError,
     load_n4pro_pets_panel_settings,
     save_n4pro_pets_panel_settings,
+)
+from agent_deck.server.display_appearance_store import (
+    DisplayAppearanceStoreError,
+    load_display_appearance,
+    save_display_appearance,
 )
 
 CodexAppStateEventReader = Callable[[], tuple[NormalizedEvent, ...]]
@@ -507,7 +520,8 @@ class ConsoleConfigurationApplyRequest(BaseModel):
     """描述一次“保存并应用”提交的主按键、旋钮与 PETS 设置草稿。
 
     入参：`key_layout` 是完整 10 键主表面配置；`rotary_layout` 是四旋钮、灯圈组和整体亮度；
-    ``pets_panel_settings`` 可选是兼容旧客户端的完整 PETS 设置。
+    ``pets_panel_settings`` 可选是兼容旧客户端的完整 PETS 设置；``display_appearance`` 可选
+    是兼容旧客户端的独立全局显示外观。
     返回：frozen Pydantic model，确保任一子布局非法时在写入前返回 422。
     错误处理：子模型字段非法由 FastAPI/Pydantic 报告。
     副作用：模型本身不写文件、不访问硬件。
@@ -518,6 +532,7 @@ class ConsoleConfigurationApplyRequest(BaseModel):
     key_layout: N4ProKeyLayout
     rotary_layout: N4ProRotaryLayout
     pets_panel_settings: N4ProPetsPanelSettings | None = None
+    display_appearance: DeckAppearanceSettings | None = None
 
 
 class PetsPanelSettingsResponse(BaseModel):
@@ -536,6 +551,25 @@ class PetsPanelSettingsResponse(BaseModel):
     source: str
     path: str | None = None
     settings: N4ProPetsPanelSettings
+    last_error: str | None = None
+
+
+class DisplayAppearanceResponse(BaseModel):
+    """向 GUI 返回当前独立显示外观及其持久化来源。
+
+    入参：``source`` 是 default/runtime/persisted；``path`` 仅用于本机诊断；
+    ``settings`` 是完整外观；``revision`` 在每次生效变化后递增；``last_error`` 是启动错误。
+    返回：冻结响应模型。
+    错误处理：字段非法由 Pydantic 拒绝。
+    副作用：模型本身不读写文件或硬件。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    source: str
+    path: str | None = None
+    settings: DeckAppearanceSettings
+    revision: int = Field(ge=0)
     last_error: str | None = None
 
 
@@ -590,10 +624,12 @@ class StatusKeyImageCache:
         snapshot: CodexQuotaSnapshot,
         *,
         window: str | None,
+        appearance: DeckAppearanceSettings | None = None,
     ) -> Any:
         """返回 quota status 按键图片，优先命中缓存。
 
-        入参：`snapshot` 是 daemon 当前共享 quota 快照；`window` 是 key 配置中的窗口。
+        入参：`snapshot` 是 daemon 当前共享 quota 快照；`window` 是 key 配置中的窗口；
+        ``appearance`` 是当前全局显示外观。
         返回：112x112 Pillow image。
         错误处理：渲染失败按原异常传播。
         副作用：缓存 miss 时创建一张新图片并保存到内存。
@@ -609,6 +645,7 @@ class StatusKeyImageCache:
             _quota_windows_fingerprint(snapshot),
             snapshot.credits_balance,
             snapshot.reset_credits_available,
+            appearance_cache_key(appearance),
         )
         image = self._images.get(key)
         if image is None:
@@ -616,6 +653,7 @@ class StatusKeyImageCache:
             image = render_quota_status_key_image(
                 snapshot,
                 window=normalized_window,
+                appearance=appearance,
             )
             self._store(key, image)
         else:
@@ -627,10 +665,12 @@ class StatusKeyImageCache:
         snapshot: CodexTokenUsageSnapshot,
         *,
         period: str | None,
+        appearance: DeckAppearanceSettings | None = None,
     ) -> Any:
         """返回 token/cost usage 按键图片，优先命中缓存。
 
-        入参：`snapshot` 是 daemon 当前共享 token usage 快照；`period` 是 key 配置周期。
+        入参：`snapshot` 是 daemon 当前共享 token usage 快照；`period` 是 key 配置周期；
+        ``appearance`` 是当前全局显示外观。
         返回：112x112 Pillow image。
         错误处理：渲染失败按原异常传播。
         副作用：缓存 miss 时创建一张新图片并保存到内存。
@@ -643,6 +683,7 @@ class StatusKeyImageCache:
             snapshot.updated_at.isoformat(),
             _token_usage_period_fingerprint(snapshot),
             _token_usage_daily_fingerprint(snapshot),
+            appearance_cache_key(appearance),
         )
         image = self._images.get(key)
         if image is None:
@@ -650,6 +691,7 @@ class StatusKeyImageCache:
             image = render_usage_summary_key_image(
                 snapshot,
                 period=normalized_period,
+                appearance=appearance,
             )
             self._store(key, image)
         else:
@@ -698,33 +740,64 @@ class LogicalPanelImageCache:
         self._misses = 0
         self._prewarm_count = 0
 
-    def brand_image(self) -> Any:
-        """返回 Agent Deck 品牌基础面板，优先命中缓存。
+    def clear(self) -> None:
+        """清空所有已渲染 logical panel 图片。
 
         入参：无。
+        返回：无。
+        错误处理：无。
+        副作用：释放本对象持有的 Pillow image 引用，保留累计诊断计数。
+        """
+
+        self._images.clear()
+
+    def brand_image(
+        self,
+        *,
+        appearance: DeckAppearanceSettings | None = None,
+    ) -> Any:
+        """返回 Agent Deck 品牌基础面板，优先命中缓存。
+
+        入参：``appearance`` 是当前全局显示外观。
         返回：800x480 品牌背景图。
         错误处理：品牌图生成异常按原样传播。
         副作用：首次调用会创建并缓存品牌图。
         """
 
         return self._get_or_render(
-            ("brand",),
-            render_agent_deck_splash_touchscreen,
+            ("brand", appearance_cache_key(appearance)),
+            lambda: render_agent_deck_splash_touchscreen(appearance=appearance),
         )
 
-    def quota_image(self, snapshot: CodexQuotaSnapshot, *, window: str) -> Any:
+    def quota_image(
+        self,
+        snapshot: CodexQuotaSnapshot,
+        *,
+        window: str,
+        appearance: DeckAppearanceSettings | None = None,
+    ) -> Any:
         """返回指定 quota 窗口的基础面板，优先命中内容指纹缓存。
 
-        入参：`snapshot` 是 daemon 已确认的 quota 快照；`window` 是 `auto` 或稳定 window_id。
+        入参：`snapshot` 是 daemon 已确认的 quota 快照；`window` 是 `auto` 或稳定 window_id；
+        ``appearance`` 是当前全局显示外观。
         返回：800x480 quota 背景图。
         错误处理：未知窗口或渲染异常按原语义传播。
         副作用：缓存未命中时生成并保存一张新图。
         """
 
-        key = ("quota", window, *_quota_panel_fingerprint(snapshot))
+        key = (
+            "quota",
+            window,
+            appearance_cache_key(appearance),
+            *_quota_panel_fingerprint(snapshot),
+        )
         return self._get_or_render(
             key,
-            lambda: render_quota_touchscreen(snapshot, window=window),
+            lambda: render_quota_touchscreen(
+                snapshot,
+                window=window,
+                appearance=appearance,
+            ),
         )
 
     def token_image(
@@ -732,10 +805,12 @@ class LogicalPanelImageCache:
         snapshot: CodexTokenUsageSnapshot,
         *,
         period: CodexTokenPeriod,
+        appearance: DeckAppearanceSettings | None = None,
     ) -> Any:
         """返回指定 Token 周期的趋势基础面板，优先命中内容指纹缓存。
 
-        入参：`snapshot` 是 daemon 已确认的 ccusage 快照；`period` 是展示周期。
+        入参：`snapshot` 是 daemon 已确认的 ccusage 快照；`period` 是展示周期；
+        ``appearance`` 是当前全局显示外观。
         返回：带主指标、趋势和四项细则的 800x480 背景图。
         错误处理：缺少周期或渲染异常按原语义传播。
         副作用：缓存未命中时聚合现有 raw daily 并保存一张新图，不执行 ccusage。
@@ -744,38 +819,57 @@ class LogicalPanelImageCache:
         key = (
             "tokens",
             period.value,
+            appearance_cache_key(appearance),
             _token_usage_period_fingerprint(snapshot),
             _token_usage_daily_fingerprint(snapshot),
         )
         return self._get_or_render(
             key,
-            lambda: render_token_usage_touchscreen(snapshot, period=period),
+            lambda: render_token_usage_touchscreen(
+                snapshot,
+                period=period,
+                appearance=appearance,
+            ),
         )
 
-    def prewarm_quota(self, snapshot: CodexQuotaSnapshot) -> None:
+    def prewarm_quota(
+        self,
+        snapshot: CodexQuotaSnapshot,
+        *,
+        appearance: DeckAppearanceSettings | None = None,
+    ) -> None:
         """预渲染当前实际可用 quota 窗口，消除后续内容切换的首次绘制。
 
-        入参：`snapshot` 是刚刷新成功的 quota 快照。
+        入参：`snapshot` 是刚刷新成功的 quota 快照；``appearance`` 是当前显示外观。
         返回：无。
         错误处理：任一实际窗口渲染失败时按原样传播给 poller。
         副作用：可能为任意数量的实际窗口新增进程内背景图并递增预热计数。
         """
 
         for quota_window in snapshot.available_windows():
-            self.quota_image(snapshot, window=quota_window.window_id)
+            self.quota_image(
+                snapshot,
+                window=quota_window.window_id,
+                appearance=appearance,
+            )
             self._prewarm_count += 1
 
-    def prewarm_tokens(self, snapshot: CodexTokenUsageSnapshot) -> None:
+    def prewarm_tokens(
+        self,
+        snapshot: CodexTokenUsageSnapshot,
+        *,
+        appearance: DeckAppearanceSettings | None = None,
+    ) -> None:
         """预渲染四个 Token 周期，令旋钮切换只做缓存图选择。
 
-        入参：`snapshot` 是刚刷新成功的 ccusage 快照。
+        入参：`snapshot` 是刚刷新成功的 ccusage 快照；``appearance`` 是当前显示外观。
         返回：无。
         错误处理：任一周期缺失或渲染失败时按原样传播给 poller。
         副作用：可能新增四张进程内背景图并递增预热计数。
         """
 
         for period in CodexTokenPeriod:
-            self.token_image(snapshot, period=period)
+            self.token_image(snapshot, period=period, appearance=appearance)
             self._prewarm_count += 1
 
     def diagnostics(self) -> dict[str, int]:
@@ -909,6 +1003,12 @@ class _DaemonRuntime:
     pets_panel_settings_source: str
     pets_panel_settings_path: Path | None
     pets_panel_settings_last_error: str | None
+    display_appearance: DeckAppearanceSettings
+    display_appearance_source: str
+    display_appearance_path: Path | None
+    display_appearance_revision: int
+    display_appearance_last_error: str | None
+    display_appearance_frame_cache_path: Path
     n4pro_last_applied_brightness_percent: int | None
     n4pro_last_applied_lighting: tuple[str, str | None, bool] | None
     n4pro_last_applied_led_brightness_percent: int | None
@@ -1077,6 +1177,73 @@ class _DaemonRuntime:
             "codex_pet": self.codex_pet.diagnostics(),
         }
 
+    def current_display_appearance_response(self) -> DisplayAppearanceResponse:
+        """返回当前已应用的跨表面显示外观。
+
+        入参：无。
+        返回：来源、可选路径、完整设置、revision 和启动读取错误。
+        错误处理：无。
+        副作用：只读 runtime 内存，不重新读取磁盘或硬件。
+        """
+
+        return DisplayAppearanceResponse(
+            source=self.display_appearance_source,
+            path=(
+                str(self.display_appearance_path)
+                if self.display_appearance_path is not None
+                else None
+            ),
+            settings=self.display_appearance,
+            revision=self.display_appearance_revision,
+            last_error=self.display_appearance_last_error,
+        )
+
+    def update_display_appearance(
+        self,
+        settings: DeckAppearanceSettings,
+    ) -> dict[str, Any]:
+        """保存并应用跨 Key 与 virtual panel 的显示外观。
+
+        入参：``settings`` 已由 API/Pydantic 完整校验。
+        返回：当前外观响应、layout、logical panel 与 render 计数。
+        错误处理：持久化失败抛 ``DisplayAppearanceStoreError``；宠物派生帧失败向上传播，
+        调用方保留旧 runtime 外观。
+        副作用：可写独立用户级 JSON、重建宠物派生帧、失效内存图并统一刷新 Key/面板 revision。
+        """
+
+        if settings == self.display_appearance:
+            return {
+                "display_appearance": _dump_model(
+                    self.current_display_appearance_response()
+                ),
+                "layout": _dump_model(self.render_current()),
+                "logical_panel": _dump_model(self.logical_panel_selection),
+                "render_count": self.surface.render_count,
+            }
+        if self.display_appearance_path is not None:
+            save_display_appearance(settings, self.display_appearance_path)
+        self.codex_pet.update_display_appearance(settings)
+        self.display_appearance = settings
+        self.display_appearance_source = (
+            "persisted" if self.display_appearance_path is not None else "runtime"
+        )
+        self.display_appearance_revision += 1
+        self.display_appearance_last_error = None
+        self.status_key_image_cache.clear()
+        self.logical_panel_image_cache.clear()
+        rendered_layout = self.render_current()
+        self.prewarm_status_key_images(rendered_layout)
+        self.publish_hardware_key_surface_images(rendered_layout)
+        self.render_current_logical_panel_image()
+        return {
+            "display_appearance": _dump_model(
+                self.current_display_appearance_response()
+            ),
+            "layout": _dump_model(rendered_layout),
+            "logical_panel": _dump_model(self.logical_panel_selection),
+            "render_count": self.surface.render_count,
+        }
+
     def set_hardware_background_notifier(
         self,
         notifier: Callable[[], None] | None,
@@ -1114,12 +1281,12 @@ class _DaemonRuntime:
         self,
         request: ConsoleConfigurationApplyRequest,
     ) -> dict[str, Any]:
-        """以一次 GUI 保存请求更新主按键、旋钮和可选 PETS 配置域。
+        """以一次 GUI 保存请求更新主按键、旋钮、可选 PETS 与显示外观配置域。
 
         入参：`request` 的 layout 与可选 PETS 设置已在进入前完成 Pydantic 校验。
-        返回：三个配置 response、当前 renderer-neutral layout 和 render 计数。
+        返回：四个配置 response、当前 renderer-neutral layout 和 render 计数。
         错误处理：任一持久化写入失败时向 handler 抛出，runtime applied state 保留旧值。
-        副作用：可选地写三个用户级 JSON 文件；成功后统一刷新 key/panel 预览，真机在下个
+        副作用：可选地写四个用户级 JSON 文件；成功后统一刷新 key/panel 预览，真机在下个
         persistent renderer tick 的同一设备会话中接收新状态。
         """
 
@@ -1134,6 +1301,14 @@ class _DaemonRuntime:
             save_n4pro_pets_panel_settings(
                 request.pets_panel_settings,
                 self.pets_panel_settings_path,
+            )
+        if (
+            request.display_appearance is not None
+            and self.display_appearance_path is not None
+        ):
+            save_display_appearance(
+                request.display_appearance,
+                self.display_appearance_path,
             )
         self.key_layout = request.key_layout
         self.key_layout_source = "persisted" if self.key_layout_path is not None else "runtime"
@@ -1152,6 +1327,21 @@ class _DaemonRuntime:
             )
             self.pets_panel_settings_last_error = None
             self.codex_pet.update_panel_settings(request.pets_panel_settings)
+        if (
+            request.display_appearance is not None
+            and request.display_appearance != self.display_appearance
+        ):
+            self.codex_pet.update_display_appearance(request.display_appearance)
+            self.display_appearance = request.display_appearance
+            self.display_appearance_source = (
+                "persisted"
+                if self.display_appearance_path is not None
+                else "runtime"
+            )
+            self.display_appearance_revision += 1
+            self.display_appearance_last_error = None
+            self.status_key_image_cache.clear()
+            self.logical_panel_image_cache.clear()
         rendered_layout = self.render_current()
         self.prewarm_status_key_images(rendered_layout)
         self.publish_hardware_key_surface_images(rendered_layout)
@@ -1161,6 +1351,9 @@ class _DaemonRuntime:
             "rotary_layout": _dump_model(self.current_rotary_layout_response()),
             "pets_panel_settings": _dump_model(
                 self.current_pets_panel_settings_response()
+            ),
+            "display_appearance": _dump_model(
+                self.current_display_appearance_response()
             ),
             "layout": _dump_model(rendered_layout),
             "render_count": self.surface.render_count,
@@ -1441,7 +1634,10 @@ class _DaemonRuntime:
                 self.logical_panel_selection,
                 displayed_snapshot,
             )
-            self.logical_panel_image_cache.prewarm_quota(displayed_snapshot)
+            self.logical_panel_image_cache.prewarm_quota(
+                displayed_snapshot,
+                appearance=self.display_appearance,
+            )
         image = self.render_current_logical_panel_image()
         self.prewarm_status_key_images()
         self.publish_hardware_key_surface_images()
@@ -1479,7 +1675,10 @@ class _DaemonRuntime:
         self.codex_token_usage_snapshot = snapshot
         self.codex_token_usage_updated_at = updated_at
         self.codex_token_usage_last_error = None
-        self.logical_panel_image_cache.prewarm_tokens(snapshot)
+        self.logical_panel_image_cache.prewarm_tokens(
+            snapshot,
+            appearance=self.display_appearance,
+        )
         self.prewarm_status_key_images()
         self.publish_hardware_key_surface_images()
         return self.render_current_logical_panel_image()
@@ -2215,6 +2414,7 @@ class _DaemonRuntime:
             quota_snapshot=quota_snapshot,
             token_usage_snapshot=self.codex_token_usage_snapshot,
             status_key_cache=self.status_key_image_cache,
+            appearance=self.display_appearance,
         )
 
     def publish_hardware_key_surface_images(
@@ -2244,6 +2444,7 @@ class _DaemonRuntime:
             quota_snapshot=self.displayed_codex_quota_snapshot(),
             token_usage_snapshot=self.codex_token_usage_snapshot,
             status_key_cache=self.status_key_image_cache,
+            appearance=self.display_appearance,
         )
         key_images = dict(base_images)
         pet_key_indexes = {
@@ -2503,12 +2704,17 @@ class _DaemonRuntime:
         if decision is not None:
             plan = _decision_message_panel_plan(decision)
             base_image, base_source = (
-                render_logical_panel_touchscreen(plan),
+                render_logical_panel_touchscreen(
+                    plan,
+                    appearance=self.display_appearance,
+                ),
                 "decision_message",
             )
         elif self._is_brand_feedback_active():
             base_image, base_source = (
-                self.logical_panel_image_cache.brand_image(),
+                self.logical_panel_image_cache.brand_image(
+                    appearance=self.display_appearance,
+                ),
                 "agent_deck:brand_feedback",
             )
         else:
@@ -2518,6 +2724,7 @@ class _DaemonRuntime:
                     self.logical_panel_image_cache.quota_image(
                         quota_snapshot,
                         window=self.logical_panel_selection.quota_window,
+                        appearance=self.display_appearance,
                     ),
                     "codex_quota",
                 )
@@ -2529,6 +2736,7 @@ class _DaemonRuntime:
                     self.logical_panel_image_cache.token_image(
                         self.codex_token_usage_snapshot,
                         period=self.logical_panel_selection.token_period,
+                        appearance=self.display_appearance,
                     ),
                     "codex_tokens",
                 )
@@ -2540,13 +2748,16 @@ class _DaemonRuntime:
                     title, mood, lines = self.codex_pet.diagnostic_panel_content()
                     base_image, base_source = (
                         render_logical_panel_touchscreen(
-                            pets_panel_plan(name=title, mood=mood, lines=lines)
+                            pets_panel_plan(name=title, mood=mood, lines=lines),
+                            appearance=self.display_appearance,
                         ),
                         "codex_pet_diagnostic",
                     )
             else:
                 base_image, base_source = (
-                    self.logical_panel_image_cache.brand_image(),
+                    self.logical_panel_image_cache.brand_image(
+                        appearance=self.display_appearance,
+                    ),
                     "agent_deck:splash",
                 )
 
@@ -2892,6 +3103,9 @@ class _DaemonRuntime:
             "key_layout_last_error": self.key_layout_last_error,
             "rotary_layout": _dump_model(self.current_rotary_layout_response()),
             "rotary_layout_last_error": self.rotary_layout_last_error,
+            "display_appearance": _dump_model(
+                self.current_display_appearance_response()
+            ),
             "hardware_capabilities": _dump_model(get_device_profile("mirabox.n4pro")),
             "keyboard_shortcuts": self.keyboard_shortcut_diagnostics(),
             "render_count": self.surface.render_count,
@@ -3233,6 +3447,7 @@ def create_app(
     key_layout_path: Path | None = None,
     rotary_layout_path: Path | None = None,
     pets_panel_settings_path: Path | None = None,
+    display_appearance_path: Path | None = None,
     quota_presentation_path: Path | None = None,
 ) -> FastAPI:
     """Create the local daemon FastAPI app without binding sockets.
@@ -3262,8 +3477,9 @@ def create_app(
     默认使用用户级 Application Support；`url_icon_fetcher` 供测试替换网络请求；
     `codex_pet_resolver`、reduced-motion reader 与 cache path 供宠物解析/可访问性/临时缓存测试
     注入，生产默认只读跟随 Codex 并使用 daemon 生命周期临时目录；
-    `key_layout_path`、`rotary_layout_path` 与 ``pets_panel_settings_path`` 为 None 时相应 GUI
-    设置只保存在进程内，传入路径时启动会读各自 JSON，保存会写回；
+    `key_layout_path`、`rotary_layout_path`、``pets_panel_settings_path`` 与
+    ``display_appearance_path`` 为 None 时相应 GUI 设置只保存在进程内，传入路径时启动会读
+    各自 JSON，保存会写回；
     `quota_presentation_path` 可选加载独立 quota 展示策略，
     只影响硬件显示而不改原始采集数据；`system_control_executor` 可注入 fake，默认按平台构造
     保守 executor。
@@ -3302,6 +3518,16 @@ def create_app(
         codex_pet_temp_directory = TemporaryDirectory(
             prefix="agent-deck-codex-pet-"
         )
+    display_appearance_temp_directory: TemporaryDirectory[str] | None = None
+    if codex_pet_temp_directory is None:
+        display_appearance_temp_directory = TemporaryDirectory(
+            prefix="agent-deck-display-appearance-"
+        )
+    display_appearance_frame_cache_path = (
+        Path(codex_pet_temp_directory.name) / "display-appearance-frames"
+        if codex_pet_temp_directory is not None
+        else Path(display_appearance_temp_directory.name)
+    )
     resolved_codex_pet_cache_path = (
         codex_pet_cache_path
         if codex_pet_cache_path is not None
@@ -3327,6 +3553,19 @@ def create_app(
                 initial_pets_panel_settings_source = "persisted"
         except PetsPanelSettingsStoreError as exc:
             pets_panel_settings_last_error = str(exc)
+    initial_display_appearance = DeckAppearanceSettings()
+    initial_display_appearance_source = "default"
+    display_appearance_last_error: str | None = None
+    if display_appearance_path is not None:
+        try:
+            persisted_appearance = load_display_appearance(
+                display_appearance_path
+            )
+            if persisted_appearance is not None:
+                initial_display_appearance = persisted_appearance
+                initial_display_appearance_source = "persisted"
+        except DisplayAppearanceStoreError as exc:
+            display_appearance_last_error = str(exc)
     codex_pet_runtime = CodexPetRuntime(
         enabled=resolved_poller_config.codex_pet_enabled,
         panel_fps=resolved_poller_config.codex_pet_panel_fps,
@@ -3336,6 +3575,7 @@ def create_app(
             resolved_poller_config.streamdock_n4pro_frame_root / "offline.png"
         ),
         panel_settings=initial_pets_panel_settings,
+        appearance=initial_display_appearance,
         resolver=codex_pet_resolver,
         reduced_motion_reader=codex_pet_reduced_motion_reader,
     )
@@ -3469,6 +3709,12 @@ def create_app(
         pets_panel_settings_source=initial_pets_panel_settings_source,
         pets_panel_settings_path=pets_panel_settings_path,
         pets_panel_settings_last_error=pets_panel_settings_last_error,
+        display_appearance=initial_display_appearance,
+        display_appearance_source=initial_display_appearance_source,
+        display_appearance_path=display_appearance_path,
+        display_appearance_revision=0,
+        display_appearance_last_error=display_appearance_last_error,
+        display_appearance_frame_cache_path=display_appearance_frame_cache_path,
         n4pro_last_applied_brightness_percent=None,
         n4pro_last_applied_lighting=None,
         n4pro_last_applied_led_brightness_percent=None,
@@ -3631,8 +3877,12 @@ def create_app(
                             ):
                                 observer.close()
                         finally:
-                            if codex_pet_temp_directory is not None:
-                                codex_pet_temp_directory.cleanup()
+                            try:
+                                if codex_pet_temp_directory is not None:
+                                    codex_pet_temp_directory.cleanup()
+                            finally:
+                                if display_appearance_temp_directory is not None:
+                                    display_appearance_temp_directory.cleanup()
 
     app = FastAPI(title="Agent Deck Daemon API", lifespan=lifespan)
     app.state.runtime = runtime
@@ -3913,20 +4163,34 @@ def create_app(
     @app.get("/ui/shortcut-icons/auto-preview.png")
     async def get_shortcut_auto_icon_preview(
         spec: str = Query(min_length=1, max_length=12_000),
+        background_color: str | None = Query(default=None, max_length=7),
     ) -> Response:
         """返回与 N4 Pro 硬件下发共用 renderer 的快捷键自动图标。
 
-        入参：``spec`` 是 URL 编码后的 ``KeyboardShortcutSpec`` JSON。
+        入参：``spec`` 是 URL 编码后的 ``KeyboardShortcutSpec`` JSON；``background_color``
+        可选传草稿 ``#RRGGBB`` 或 ``default``，空值使用当前已应用外观。
         返回：112px RGB PNG；Web 预览可直接把本路由用作 ``img.src``。
-        错误处理：JSON 或快捷键模型非法返回 422；PNG 编码异常按 500 传播。
+        错误处理：JSON、快捷键模型或颜色非法返回 422；PNG 编码异常按 500 传播。
         副作用：只读取进程内自动图标缓存，并把图片编码到内存 buffer。
         """
 
         try:
             shortcut = KeyboardShortcutSpec.model_validate_json(spec)
+            preview_appearance = (
+                runtime.display_appearance
+                if background_color is None
+                else DeckAppearanceSettings(
+                    background_color=(
+                        None if background_color == "default" else background_color
+                    )
+                )
+            )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        image = runtime.shortcut_key_image_cache.image(shortcut)
+        image = runtime.shortcut_key_image_cache.image(
+            shortcut,
+            appearance=preview_appearance,
+        )
         buffer = BytesIO()
         image.save(buffer, format="PNG")
         return Response(
@@ -3990,6 +4254,7 @@ def create_app(
             KeyLayoutStoreError,
             RotaryLayoutStoreError,
             PetsPanelSettingsStoreError,
+            DisplayAppearanceStoreError,
         ) as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -4020,6 +4285,35 @@ def create_app(
         try:
             return runtime.update_pets_panel_settings(settings)
         except PetsPanelSettingsStoreError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.get("/ui/display-appearance")
+    async def get_display_appearance() -> dict[str, Any]:
+        """返回跨 Key 与 Touch bar 的当前已应用显示外观。
+
+        入参：无。
+        返回：独立配置来源、路径、完整设置、revision 与可选启动错误。
+        错误处理：无。
+        副作用：只读 runtime 快照，不访问磁盘或硬件。
+        """
+
+        return _dump_model(runtime.current_display_appearance_response())
+
+    @app.put("/ui/display-appearance")
+    async def put_display_appearance(
+        settings: DeckAppearanceSettings,
+    ) -> dict[str, Any]:
+        """保存并统一应用跨 Key 与 Touch bar 的显示外观。
+
+        入参：可选 ``background_color``；null 表示保持各 renderer 既有默认背景。
+        返回：最新显示外观、layout、logical panel 与 render 计数。
+        错误处理：请求非法返回 422，独立配置持久化失败返回 500 并保留旧 applied state。
+        副作用：成功时写可选用户级 JSON、失效相关缓存并刷新 Key/Touch bar。
+        """
+
+        try:
+            return runtime.update_display_appearance(settings)
+        except DisplayAppearanceStoreError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.put("/ui/key-layout")
@@ -4449,6 +4743,8 @@ async def _render_streamdock_n4pro_once(
         key_frame_paths = _key_frame_paths_from_layout(
             layout,
             frame_root=frame_root,
+            appearance=runtime.display_appearance,
+            appearance_cache_root=runtime.display_appearance_frame_cache_path,
         )
         key_images = runtime.publish_hardware_key_surface_images(
             layout,
@@ -4511,10 +4807,14 @@ def _key_frame_paths_from_layout(
     layout: LayoutPlan,
     *,
     frame_root: Path,
+    appearance: DeckAppearanceSettings | None = None,
+    appearance_cache_root: Path | None = None,
 ) -> dict[int, tuple[Path, ...]]:
     """从 renderer-neutral layout 提取 N4 Pro 物理按钮动画帧路径。
 
-    入参：`layout` 是当前 daemon layout；`frame_root` 是 generated Codex key frame 根目录。
+    入参：`layout` 是当前 daemon layout；`frame_root` 是 generated Codex key frame 根目录；
+    ``appearance`` 是当前显示外观；``appearance_cache_root`` 是自定义背景派生帧的 daemon
+    生命周期缓存目录。
     返回：物理按钮编号到 PNG 帧路径元组的映射；只包含带 visual 的前 10 个 agent slot。
     错误处理：帧目录缺失、按钮编号非法或变体缺帧时抛出异常，由调用方记录。
     副作用：只读取文件系统元数据；不打开图片、不访问硬件。
@@ -4525,9 +4825,18 @@ def _key_frame_paths_from_layout(
         for key in layout.keys[:10]
         if key.visual is not None
     }
-    return codex_key_frame_paths_for_key_variants(
+    source_paths = codex_key_frame_paths_for_key_variants(
         frame_root=frame_root,
         key_variants=key_variants,
+    )
+    if appearance is None or appearance.background_color is None:
+        return source_paths
+    if appearance_cache_root is None:
+        raise ValueError("appearance_cache_root is required for custom background")
+    return composite_codex_key_frame_paths(
+        source_paths,
+        background_color=appearance.background_color,
+        cache_root=appearance_cache_root,
     )
 
 
@@ -4541,13 +4850,15 @@ def _key_images_from_layout(
     quota_snapshot: CodexQuotaSnapshot | None = None,
     token_usage_snapshot: CodexTokenUsageSnapshot | None = None,
     status_key_cache: StatusKeyImageCache | None = None,
+    appearance: DeckAppearanceSettings | None = None,
 ) -> dict[int, Any]:
     """从 layout 提取 N4 Pro 静态主键图片。
 
     入参：`layout` 是当前 daemon layout；`app_icon_cache` 是可选 App 图标缓存；
     `url_icon_cache` 是可选 URL favicon 缓存；`shortcut_icon_store` 只读自定义图标；
     `shortcut_key_cache` 缓存自动快捷键图；`quota_snapshot` 和 `token_usage_snapshot` 是 touchbar
-    面板已经复用的状态数据；`status_key_cache` 缓存状态按键渲染结果。
+    面板已经复用的状态数据；`status_key_cache` 缓存状态按键渲染结果；
+    ``appearance`` 是跨内容的当前显示外观。
     返回：物理按钮编号到 Pillow 图像的映射；包含 App、URL、快捷键和状态型主键。
     错误处理：单个图标读取失败会 fallback 成 token 图，不影响整轮渲染。
     副作用：可能只读 `.app` bundle 图标资源或访问 favicon 缓存；状态图缓存 miss 时会创建
@@ -4572,20 +4883,26 @@ def _key_images_from_layout(
                     bundle_id=bundle_id,
                     icon_token=icon_token,
                     icon_color=icon_color,
+                    appearance=appearance,
                 )
             key_images[key.index + 1] = cached_image or render_app_key_image(
                 app_name=app_name,
                 app_path=app_path,
                 icon_token=icon_token,
                 icon_color=icon_color,
+                appearance=appearance,
             )
         if key.kind == "url":
             url = key.payload.get("url") or key.label
             cached_url_image = None
             if url_icon_cache is not None:
-                cached_url_image = url_icon_cache.key_image_for_url(url)
+                cached_url_image = url_icon_cache.key_image_for_url(
+                    url,
+                    appearance=appearance,
+                )
             key_images[key.index + 1] = cached_url_image or render_url_key_image(
                 url=url,
+                appearance=appearance,
             )
         if key.kind == "keyboard_shortcut" and key.shortcut is not None:
             custom_image = None
@@ -4596,20 +4913,27 @@ def _key_images_from_layout(
                 and key.shortcut_icon.asset_id is not None
             ):
                 custom_image = shortcut_icon_store.key_image(
-                    key.shortcut_icon.asset_id
+                    key.shortcut_icon.asset_id,
+                    appearance=appearance,
                 )
             key_images[key.index + 1] = (
-                custom_image or resolved_shortcut_key_cache.image(key.shortcut)
+                custom_image
+                or resolved_shortcut_key_cache.image(
+                    key.shortcut,
+                    appearance=appearance,
+                )
             )
         if key.kind == "quota_status" and quota_snapshot is not None:
             key_images[key.index + 1] = resolved_status_key_cache.quota_image(
                 quota_snapshot,
                 window=key.payload.get("quota_window"),
+                appearance=appearance,
             )
         if key.kind == "usage_summary" and token_usage_snapshot is not None:
             key_images[key.index + 1] = resolved_status_key_cache.usage_image(
                 token_usage_snapshot,
                 period=key.payload.get("usage_period"),
+                appearance=appearance,
             )
     return key_images
 

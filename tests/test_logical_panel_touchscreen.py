@@ -13,6 +13,7 @@ from agent_deck.adapters.codex_tokens import (
     CodexTokenUsageSnapshot,
     CodexTokenUsageStats,
 )
+from agent_deck.rendering.appearance import DeckAppearanceSettings
 from agent_deck.rendering.logical_panel import tokens_panel_plan
 from agent_deck.rendering.logical_panel_touchscreen import (
     render_logical_panel_touchscreen,
@@ -90,6 +91,29 @@ def test_render_token_usage_touchscreen_keeps_detail_row_in_viewport() -> None:
     ]
 
     assert (76, 205, 255) in detail_pixels
+
+
+def test_render_token_usage_panel_has_no_outer_rounded_backplate() -> None:
+    """金额/Token 内容应直接落在用户背景上，不再绘制整块圆角底板。
+
+    入参：固定浅色外观和 Token 快照。
+    返回：无；断言旧底板内部的左侧空白像素保持用户背景。
+    错误处理：底板回归或渲染异常由 pytest 报告。
+    副作用：只创建内存图片。
+    """
+
+    image = render_token_usage_touchscreen(
+        _token_snapshot_with_daily_history(),
+        period=CodexTokenPeriod.WEEK,
+        appearance=DeckAppearanceSettings(background_color="#F0D8B0"),
+    )
+    viewport = N4PRO_LOGICAL_PANEL_VIEWPORT
+
+    assert image.getpixel((viewport.left + 20, viewport.top + 68)) == (
+        240,
+        216,
+        176,
+    )
 
 
 def _token_snapshot() -> CodexTokenUsageSnapshot:

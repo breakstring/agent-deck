@@ -351,6 +351,7 @@ def test_panel_render_stays_inside_800x136_and_uses_direction_rows(
     assert left_image.size == PANEL_CANVAS_SIZE
     assert right_image.getpixel((8, 30)) != PET_BACKGROUND
     assert right_image.getpixel((97, 30)) == PET_BACKGROUND
+    assert right_image.getpixel((400, 124)) == PET_BACKGROUND
     assert left_image.getpixel((702, 30)) == PET_BACKGROUND
     assert left_image.getpixel((703, 30)) != PET_BACKGROUND
     assert left_image.getpixel((791, 30)) != PET_BACKGROUND

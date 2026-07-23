@@ -11,6 +11,12 @@ from urllib.parse import urlparse
 
 from PIL import Image, ImageDraw, ImageFont
 
+from agent_deck.rendering.appearance import (
+    DeckAppearanceSettings,
+    RenderPalette,
+    resolve_render_palette,
+)
+
 N4PRO_URL_KEY_IMAGE_SIZE = (112, 112)
 """N4 Pro URL 主按键图片尺寸。"""
 
@@ -26,11 +32,12 @@ def render_url_key_image(
     favicon: Image.Image | None = None,
     icon_token: str | None = None,
     size: tuple[int, int] = N4PRO_URL_KEY_IMAGE_SIZE,
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
     """渲染 URL 快捷键静态图。
 
     入参：`url` 是用户配置的网址；`favicon` 是可选网站图标；`icon_token` 是可选 fallback
-    短标签；`size` 默认是 N4 Pro 主键尺寸。
+    短标签；`size` 默认是 N4 Pro 主键尺寸；``appearance`` 可覆盖基础画布。
     返回：RGB `Image`，可直接传给 StreamDock key image sink。
     错误处理：图标缺失或坏图标会自动 fallback 到 token 图；尺寸过小时抛 ValueError。
     副作用：无；只处理内存图像。
@@ -39,7 +46,14 @@ def render_url_key_image(
     if size[0] < 64 or size[1] < 64:
         raise ValueError("url key image size is too small")
 
-    canvas = _base_canvas(size)
+    palette = resolve_render_palette(
+        appearance,
+        default_background=_KEY_BACKGROUND,
+        default_foreground=_FALLBACK_TEXT,
+        default_surface=_FALLBACK_FILL,
+        default_divider=_FALLBACK_ACCENT,
+    )
+    canvas = _base_canvas(size, palette=palette)
     prepared = _prepare_favicon(favicon, max_size=(104, 104))
     if prepared is not None:
         _paste_centered(canvas, prepared)
@@ -48,6 +62,7 @@ def render_url_key_image(
     _draw_token_fallback(
         canvas,
         token=icon_token or token_for_url(url),
+        palette=palette,
     )
     return canvas.convert("RGB")
 
@@ -73,16 +88,20 @@ def token_for_url(url: str | None) -> str:
     return compact[:2]
 
 
-def _base_canvas(size: tuple[int, int]) -> Image.Image:
+def _base_canvas(
+    size: tuple[int, int],
+    *,
+    palette: RenderPalette,
+) -> Image.Image:
     """创建无装饰边框的按键背景。
 
-    入参：`size` 是目标图尺寸。
+    入参：`size` 是目标图尺寸；``palette`` 提供基础背景。
     返回：RGBA `Image`。
     错误处理：无。
     副作用：无。
     """
 
-    return Image.new("RGBA", size, (*_KEY_BACKGROUND, 255))
+    return Image.new("RGBA", size, (*palette.background, 255))
 
 
 def _prepare_favicon(
@@ -122,10 +141,15 @@ def _paste_centered(canvas: Image.Image, icon: Image.Image) -> None:
     canvas.alpha_composite(icon, (x, y))
 
 
-def _draw_token_fallback(canvas: Image.Image, *, token: str) -> None:
+def _draw_token_fallback(
+    canvas: Image.Image,
+    *,
+    token: str,
+    palette: RenderPalette,
+) -> None:
     """绘制没有真实 favicon 时的 token fallback。
 
-    入参：`canvas` 是目标图；`token` 是 1-3 字符短标签。
+    入参：`canvas` 是目标图；`token` 是 1-3 字符短标签；``palette`` 提供中性色。
     返回：无显式返回值。
     错误处理：字体不可用时使用 Pillow 默认字体。
     副作用：原地修改 `canvas`。
@@ -133,8 +157,11 @@ def _draw_token_fallback(canvas: Image.Image, *, token: str) -> None:
 
     draw = ImageDraw.Draw(canvas)
     rect = (22, 24, canvas.width - 23, canvas.height - 25)
-    draw.rounded_rectangle(rect, radius=16, fill=(*_FALLBACK_FILL, 255))
-    draw.rounded_rectangle(rect, radius=16, outline=(*_FALLBACK_ACCENT, 210), width=2)
+    fill = palette.surface if palette.custom else _FALLBACK_FILL
+    outline = palette.divider if palette.custom else _FALLBACK_ACCENT
+    text_fill = palette.foreground if palette.custom else _FALLBACK_TEXT
+    draw.rounded_rectangle(rect, radius=16, fill=(*fill, 255))
+    draw.rounded_rectangle(rect, radius=16, outline=(*outline, 210), width=2)
 
     font = _token_font(token)
     bbox = draw.textbbox((0, 0), token, font=font)
@@ -142,7 +169,7 @@ def _draw_token_fallback(canvas: Image.Image, *, token: str) -> None:
     text_height = bbox[3] - bbox[1]
     x = (canvas.width - text_width) / 2
     y = (canvas.height - text_height) / 2 - 2
-    draw.text((x, y), token, font=font, fill=(*_FALLBACK_TEXT, 255))
+    draw.text((x, y), token, font=font, fill=(*text_fill, 255))
 
 
 def _token_font(token: str) -> ImageFont.ImageFont:

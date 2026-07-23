@@ -12,6 +12,11 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 from agent_deck.actions.apps import load_local_app_icon
+from agent_deck.rendering.appearance import (
+    DeckAppearanceSettings,
+    RenderPalette,
+    resolve_render_palette,
+)
 
 N4PRO_KEY_IMAGE_SIZE = (112, 112)
 """N4 Pro 主按键图片尺寸。"""
@@ -29,11 +34,12 @@ def render_app_key_image(
     icon_token: str | None = None,
     icon_color: str | None = None,
     size: tuple[int, int] = N4PRO_KEY_IMAGE_SIZE,
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
     """渲染 App 快捷键静态图。
 
     入参：`app_name`、`app_path`、`icon_token` 和 `icon_color` 来自 `KeyPlan.payload`；
-    `size` 默认是 N4 Pro 主键尺寸。
+    `size` 默认是 N4 Pro 主键尺寸；``appearance`` 可覆盖 Agent Deck 拥有的基础画布。
     返回：RGB `Image`，可直接传给 StreamDock key image sink。
     错误处理：图标缺失或坏图标会自动 fallback 到 token 图；尺寸过小时抛 ValueError。
     副作用：当 `app_path` 存在时只读该 `.app` bundle 的图标资源。
@@ -42,7 +48,14 @@ def render_app_key_image(
     if size[0] < 64 or size[1] < 64:
         raise ValueError("app key image size is too small")
 
-    canvas = _base_canvas(size)
+    palette = resolve_render_palette(
+        appearance,
+        default_background=_KEY_BACKGROUND,
+        default_foreground=_FALLBACK_TEXT,
+        default_surface=_FALLBACK_FILL,
+        default_divider=_FALLBACK_ACCENT,
+    )
+    canvas = _base_canvas(size, palette=palette)
     icon = load_local_app_icon(Path(app_path), max_size=(104, 104)) if app_path else None
     if icon is not None:
         _paste_centered(canvas, icon)
@@ -52,21 +65,27 @@ def render_app_key_image(
     _draw_token_fallback(
         canvas,
         token=token,
-        fill=_parse_hex_color(icon_color) or _FALLBACK_FILL,
+        fill=_parse_hex_color(icon_color) or palette.surface,
+        text_fill=palette.foreground,
+        outline=palette.divider if palette.custom else _FALLBACK_ACCENT,
     )
     return canvas.convert("RGB")
 
 
-def _base_canvas(size: tuple[int, int]) -> Image.Image:
+def _base_canvas(
+    size: tuple[int, int],
+    *,
+    palette: RenderPalette,
+) -> Image.Image:
     """创建无装饰边框的按键背景。
 
-    入参：`size` 是目标图尺寸。
+    入参：`size` 是目标图尺寸；``palette`` 提供基础背景。
     返回：RGBA `Image`。
     错误处理：无。
     副作用：无。
     """
 
-    return Image.new("RGBA", size, (*_KEY_BACKGROUND, 255))
+    return Image.new("RGBA", size, (*palette.background, 255))
 
 
 def _paste_centered(canvas: Image.Image, icon: Image.Image) -> None:
@@ -88,10 +107,13 @@ def _draw_token_fallback(
     *,
     token: str,
     fill: tuple[int, int, int],
+    text_fill: tuple[int, int, int],
+    outline: tuple[int, int, int],
 ) -> None:
     """绘制没有真实图标时的 token fallback。
 
-    入参：`canvas` 是目标图；`token` 是 1-2 字符短标签；`fill` 是卡片底色。
+    入参：`canvas` 是目标图；`token` 是 1-2 字符短标签；`fill` 是卡片底色；
+    ``text_fill`` 和 ``outline`` 来自当前调色板。
     返回：无显式返回值。
     错误处理：字体不可用时使用 Pillow 默认字体。
     副作用：原地修改 `canvas`。
@@ -100,7 +122,7 @@ def _draw_token_fallback(
     draw = ImageDraw.Draw(canvas)
     rect = (24, 24, canvas.width - 25, canvas.height - 25)
     draw.rounded_rectangle(rect, radius=14, fill=(*fill, 255))
-    draw.rounded_rectangle(rect, radius=14, outline=(*_FALLBACK_ACCENT, 210), width=2)
+    draw.rounded_rectangle(rect, radius=14, outline=(*outline, 210), width=2)
 
     font = _token_font()
     bbox = draw.textbbox((0, 0), token, font=font)
@@ -108,7 +130,7 @@ def _draw_token_fallback(
     text_height = bbox[3] - bbox[1]
     x = (canvas.width - text_width) / 2
     y = (canvas.height - text_height) / 2 - 2
-    draw.text((x, y), token, font=font, fill=(*_FALLBACK_TEXT, 255))
+    draw.text((x, y), token, font=font, fill=(*text_fill, 255))
 
 
 def _token_font() -> ImageFont.ImageFont:

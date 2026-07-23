@@ -13,6 +13,11 @@ from typing import Final
 from PIL import Image, ImageDraw, ImageFont
 
 from agent_deck.adapters.codex_tokens import CodexTokenPeriod, CodexTokenUsageSnapshot
+from agent_deck.rendering.appearance import (
+    DeckAppearanceSettings,
+    RenderPalette,
+    resolve_render_palette,
+)
 from agent_deck.rendering.logical_panel import LogicalPanelPlan, PanelKind, PanelMetric
 from agent_deck.rendering.n4pro_panel import (
     N4PRO_BACKGROUND_COLOR,
@@ -44,12 +49,14 @@ def render_logical_panel_touchscreen(
     viewport: VirtualPanelViewport = N4PRO_LOGICAL_PANEL_VIEWPORT,
     token_period: CodexTokenPeriod | None = None,
     token_trend: tuple[float, ...] = (),
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
     """把 logical panel plan 渲染为 N4 Pro 背景图。
 
     入参：`plan` 是待展示的 logical panel；`size` 是 N4 Pro 背景尺寸；
     `viewport` 是内容所在的底部逻辑窗口；Token 面板可选传入 `token_period` 和已聚合的
-    `token_trend`，让 touch bar 与状态按键使用同一套周期趋势语义。
+    `token_trend`，让 touch bar 与状态按键使用同一套周期趋势语义；``appearance`` 可覆盖
+    基础背景与中性层级。
     返回：RGB `Image`，尺寸为 `size`，内容只绘制在 `viewport` 内。
     错误处理：panel 尺寸过小时抛 ValueError；Pillow 字体加载失败会回退默认字体。
     副作用：只创建内存图像，不访问外部 I/O。
@@ -60,8 +67,14 @@ def render_logical_panel_touchscreen(
         size=viewport.size,
         token_period=token_period,
         token_trend=token_trend,
+        appearance=appearance,
     )
-    return compose_n4pro_background(panel, viewport=viewport, background_size=size)
+    return compose_n4pro_background(
+        panel,
+        viewport=viewport,
+        background_size=size,
+        appearance=appearance,
+    )
 
 
 def render_token_usage_touchscreen(
@@ -70,11 +83,13 @@ def render_token_usage_touchscreen(
     period: CodexTokenPeriod,
     size: tuple[int, int] = N4PRO_BACKGROUND_SIZE,
     viewport: VirtualPanelViewport = N4PRO_LOGICAL_PANEL_VIEWPORT,
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
     """渲染带周期色趋势线的 Token/金额 touch bar 面板。
 
     入参：`snapshot` 是 daemon 已缓存的 ccusage 快照；`period` 是当前 Day、Week、Month 或
-    All 选择；`size` 和 `viewport` 允许 fake hardware 或后续设备复用几何契约。
+    All 选择；`size` 和 `viewport` 允许 fake hardware 或后续设备复用几何契约；
+    ``appearance`` 可覆盖基础背景。
     返回：N4 Pro 背景图，内容只位于 logical panel viewport。
     错误处理：快照缺少周期或 Pillow 绘制失败时按原语义抛出。
     副作用：只创建内存图像，不执行 ccusage、不写真实硬件。
@@ -88,6 +103,7 @@ def render_token_usage_touchscreen(
         viewport=viewport,
         token_period=period,
         token_trend=usage_sparkline_values(snapshot, period=period),
+        appearance=appearance,
     )
 
 
@@ -97,17 +113,20 @@ def render_logical_panel(
     size: tuple[int, int] = N4PRO_LOGICAL_PANEL_VIEWPORT.size,
     token_period: CodexTokenPeriod | None = None,
     token_trend: tuple[float, ...] = (),
+    appearance: DeckAppearanceSettings | None = None,
 ) -> Image.Image:
     """把 logical panel plan 渲染为独立 panel 图像。
 
-    入参：`plan` 是待展示内容；`size` 是 panel 自身尺寸；Token 面板可选接收已经聚合的趋势。
+    入参：`plan` 是待展示内容；`size` 是 panel 自身尺寸；Token 面板可选接收已经聚合的趋势；
+    ``appearance`` 可覆盖基础背景和中性色。
     返回：RGB `Image`，只包含 panel 内容，不包含 N4 Pro 整屏背景。
     错误处理：尺寸太小时抛 ValueError；文本过长会被截断加省略号。
     副作用：只创建内存图像。
     """
 
     _validate_panel_size(size)
-    image = Image.new("RGB", size, _BACKGROUND)
+    palette = _logical_panel_palette(appearance)
+    image = Image.new("RGB", size, palette.background)
     draw = ImageDraw.Draw(image)
     width, height = size
     left, top, right, bottom = 0, 0, width, height
@@ -115,13 +134,6 @@ def render_logical_panel(
     content_right = width - 34
     content_top = 18
     content_bottom = height - 18
-
-    draw.rounded_rectangle(
-        (left + 18, top + 8, right - 18, bottom - 8),
-        radius=24,
-        fill=_PANEL,
-    )
-    draw.line((left + 28, top + 10, right - 28, top + 10), fill=_DIVIDER, width=1)
 
     if plan.kind == PanelKind.TOKENS:
         _draw_token_panel(
@@ -132,6 +144,7 @@ def render_logical_panel(
             content_top=content_top,
             period=token_period,
             trend=token_trend,
+            palette=palette,
         )
         return image
 
@@ -140,7 +153,12 @@ def render_logical_panel(
     metric_label_font = _load_font(15, bold=True)
     line_font = _load_font(18, bold=False)
 
-    draw.text((content_left, content_top), plan.title, fill=_MUTED, font=title_font)
+    draw.text(
+        (content_left, content_top),
+        plan.title,
+        fill=palette.muted_foreground,
+        font=title_font,
+    )
     metric_left = content_left
     metric_top = content_top + 32
     _draw_metrics(
@@ -150,6 +168,7 @@ def render_logical_panel(
         max_right=content_left + 290,
         value_font=metric_value_font,
         label_font=metric_label_font,
+        palette=palette,
     )
 
     lines_left = content_left + 330
@@ -158,7 +177,7 @@ def render_logical_panel(
     for index, line in enumerate(plan.lines[:4]):
         y = lines_top + index * line_gap
         text = _fit_text(draw, line, font=line_font, max_width=content_right - lines_left)
-        draw.text((lines_left, y), text, fill=_TEXT, font=line_font)
+        draw.text((lines_left, y), text, fill=palette.foreground, font=line_font)
 
     return image
 
@@ -172,12 +191,13 @@ def _draw_token_panel(
     content_top: int,
     period: CodexTokenPeriod | None,
     trend: tuple[float, ...],
+    palette: RenderPalette,
 ) -> None:
     """绘制 tokens 面板的专用小屏布局。
 
     入参：`draw` 是绘图对象；`plan` 是 tokens logical panel；`content_left`、
     `content_right` 和 `content_top` 是卡片内部内容边界；`period` 与 `trend` 是预先聚合的
-    当前周期身份与趋势数据。
+    当前周期身份与趋势数据；``palette`` 提供中性文字和表面颜色。
     返回：无返回值。
     错误处理：Pillow 绘制失败时异常传播；缺少指标或辅助行时按可用内容降级绘制。
     副作用：修改内存图像，不访问外部 I/O。
@@ -196,6 +216,7 @@ def _draw_token_panel(
         origin=(content_left, metric_top),
         value_font=main_value_font,
         label_font=main_label_font,
+        palette=palette,
     )
     if period is not None:
         period_label = usage_period_label(period)
@@ -220,6 +241,7 @@ def _draw_token_panel(
         max_right=content_right,
         label_font=detail_label_font,
         value_font=detail_value_font,
+        palette=palette,
     )
 
 
@@ -230,23 +252,29 @@ def _draw_token_main_metrics(
     origin: tuple[int, int],
     value_font: ImageFont.ImageFont,
     label_font: ImageFont.ImageFont,
+    palette: RenderPalette,
 ) -> None:
     """绘制 token 面板左侧金额和总 token 主指标。
 
     入参：`draw` 是绘图对象；`metrics` 是最多两个主指标，约定为 Cost 与 Total；
-    `origin` 是主指标区域左上角；`value_font`/`label_font` 是字体。
+    `origin` 是主指标区域左上角；`value_font`/`label_font` 是字体；``palette`` 提供中性色。
     返回：无返回值。
     错误处理：文本过长会在各自 slot 内截断，避免压到右侧趋势图。
     副作用：修改内存图像。
     """
 
     x, y = origin
-    slots = ((x, 155, _GOLD), (x + 184, 150, _TEXT))
+    slots = ((x, 155, _GOLD), (x + 184, 150, palette.foreground))
     for metric, (slot_x, slot_width, color) in zip(metrics, slots, strict=False):
         value = _fit_text(draw, metric.value, font=value_font, max_width=slot_width)
         label = _fit_text(draw, metric.label, font=label_font, max_width=slot_width)
         draw.text((slot_x, y), value, fill=color, font=value_font)
-        draw.text((slot_x + 1, y + 35), label, fill=_MUTED, font=label_font)
+        draw.text(
+            (slot_x + 1, y + 35),
+            label,
+            fill=palette.muted_foreground,
+            font=label_font,
+        )
 
 
 def _draw_token_detail_grid(
@@ -257,11 +285,13 @@ def _draw_token_detail_grid(
     max_right: int,
     label_font: ImageFont.ImageFont,
     value_font: ImageFont.ImageFont,
+    palette: RenderPalette,
 ) -> None:
     """把 token 辅助指标绘制成底部四列扫描行。
 
     入参：`draw` 是绘图对象；`lines` 是如 `Input 954K` 的格式化指标行；`origin`
-    是网格左上角；`max_right` 是右边界；`label_font`/`value_font` 是字体。
+    是网格左上角；`max_right` 是右边界；`label_font`/`value_font` 是字体；
+    ``palette`` 提供次要文字色。
     返回：无返回值。
     错误处理：行文本拆分失败时把整行作为 label、value 留空；文本过长会在 cell 内截断。
     副作用：修改内存图像。
@@ -275,7 +305,12 @@ def _draw_token_detail_grid(
         label, value = _split_token_detail_line(line)
         label_text = _fit_text(draw, label, font=label_font, max_width=cell_width - 12)
         value_text = _fit_text(draw, value, font=value_font, max_width=cell_width - 12)
-        draw.text((cell_x, cell_y), label_text, fill=_MUTED, font=label_font)
+        draw.text(
+            (cell_x, cell_y),
+            label_text,
+            fill=palette.muted_foreground,
+            font=label_font,
+        )
         draw.text((cell_x, cell_y + 13), value_text, fill=_PRIMARY, font=value_font)
 
 
@@ -346,11 +381,12 @@ def _draw_metrics(
     max_right: int,
     value_font: ImageFont.ImageFont,
     label_font: ImageFont.ImageFont,
+    palette: RenderPalette,
 ) -> None:
     """绘制最多两个强调指标。
 
     入参：`draw` 是绘图对象；`metrics` 是待绘制指标；`origin` 是指标区左上角；
-    `max_right` 是指标区右边界；`value_font`/`label_font` 是字体。
+    `max_right` 是指标区右边界；`value_font`/`label_font` 是字体；``palette`` 提供中性色。
     返回：无返回值。
     错误处理：Pillow 绘制失败时异常传播。
     副作用：修改内存图像。
@@ -360,17 +396,26 @@ def _draw_metrics(
     slot_width = max(120, (max_right - x) // max(1, len(metrics)))
     for index, metric in enumerate(metrics):
         slot_x = x + index * slot_width
-        color = _metric_color(metric)
+        color = _metric_color(metric, palette=palette)
         value = _fit_text(draw, metric.value, font=value_font, max_width=slot_width - 10)
         label = _fit_text(draw, metric.label, font=label_font, max_width=slot_width - 10)
         draw.text((slot_x, y), value, fill=color, font=value_font)
-        draw.text((slot_x + 2, y + 42), label, fill=_MUTED, font=label_font)
+        draw.text(
+            (slot_x + 2, y + 42),
+            label,
+            fill=palette.muted_foreground,
+            font=label_font,
+        )
 
 
-def _metric_color(metric: PanelMetric) -> tuple[int, int, int]:
+def _metric_color(
+    metric: PanelMetric,
+    *,
+    palette: RenderPalette,
+) -> tuple[int, int, int]:
     """根据 metric emphasis 返回展示颜色。
 
-    入参：`metric` 是 logical panel 指标。
+    入参：`metric` 是 logical panel 指标；``palette`` 提供普通文字色。
     返回：RGB 颜色。
     错误处理：未知 emphasis 按普通文本色降级。
     副作用：无。
@@ -380,7 +425,28 @@ def _metric_color(metric: PanelMetric) -> tuple[int, int, int]:
         return _PRIMARY
     if metric.emphasis == "secondary":
         return _SECONDARY
-    return _TEXT
+    return palette.foreground
+
+
+def _logical_panel_palette(
+    appearance: DeckAppearanceSettings | None,
+) -> RenderPalette:
+    """解析 logical panel 使用的默认或自定义中性色。
+
+    入参：可选全局显示外观。
+    返回：未设置时保持既有常量，设置时返回对比度感知调色板。
+    错误处理：外观模型已校验。
+    副作用：无。
+    """
+
+    return resolve_render_palette(
+        appearance,
+        default_background=_BACKGROUND,
+        default_foreground=_TEXT,
+        default_muted_foreground=_MUTED,
+        default_surface=_PANEL,
+        default_divider=_DIVIDER,
+    )
 
 
 def _fit_text(

@@ -35,6 +35,7 @@ from agent_deck.actions.macos_keyboard import MacOSKeyboardShortcutExecutor
 from agent_deck.core.modes import DeckMode, DeckSelection
 from agent_deck.hardware.fake import HardwareInput
 from agent_deck.input.interactions import interaction_intent_from_hardware_input
+from agent_deck.rendering.appearance import DeckAppearanceSettings
 from agent_deck.rendering.key_surface import (
     KeySurfaceKind,
     N4ProKeyBinding,
@@ -491,6 +492,24 @@ def test_shortcut_icon_store_is_content_addressed_and_renderer_has_auto_fallback
         shortcut_key_cache=cache,
     )
     assert fallback_images[1] is cache.image(shortcut)
+
+
+def test_shortcut_auto_icon_has_no_inner_rounded_backplate() -> None:
+    """快捷键自动图标应直接落在用户背景上，不再绘制内层圆角底板。
+
+    入参：固定浅色外观与单步快捷键。
+    返回：无；断言旧底板范围内的无内容探针保持用户背景色。
+    错误处理：底板回归或渲染异常由 pytest 报告。
+    副作用：只创建内存图片。
+    """
+
+    image = render_shortcut_key_image(
+        _shortcut({"key": "KeyP", "modifiers": ["command", "shift"]}),
+        appearance=DeckAppearanceSettings(background_color="#F0D8B0"),
+    )
+
+    assert image.getpixel((10, 56)) == (240, 216, 176)
+    assert image.getpixel((56, 10)) == (240, 216, 176)
 
 
 def test_shortcut_renderer_prefers_font_with_readable_return_glyph(

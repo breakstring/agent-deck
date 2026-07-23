@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from PIL import Image
 
 from agent_deck.adapters.codex_quota import CodexQuotaSnapshot
+from agent_deck.rendering.appearance import DeckAppearanceSettings
 from agent_deck.rendering.quota_touchscreen import render_quota_panel, render_quota_touchscreen
 
 _DEFAULT_SECONDARY = object()
@@ -76,7 +77,24 @@ def test_render_quota_panel_removes_subtitle_text() -> None:
 
     panel = render_quota_panel(_snapshot())
 
-    assert panel.getpixel((50, 103)) == (18, 24, 36)
+    assert panel.getpixel((50, 103)) == (14, 18, 28)
+
+
+def test_render_quota_panel_has_no_outer_rounded_backplate() -> None:
+    """订阅状态内容应直接绘制在用户背景上，不再包整块圆角底板。
+
+    入参：固定浅色外观与 quota 快照。
+    返回：无；断言左侧无内容探针保持用户背景。
+    错误处理：底板回归或渲染异常由 pytest 报告。
+    副作用：只创建内存图片。
+    """
+
+    panel = render_quota_panel(
+        _snapshot(),
+        appearance=DeckAppearanceSettings(background_color="#F0D8B0"),
+    )
+
+    assert panel.getpixel((20, 68)) == (240, 216, 176)
 
 
 def test_render_quota_panel_aligns_labels_with_progress_bars() -> None:
