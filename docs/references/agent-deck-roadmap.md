@@ -104,6 +104,17 @@ flowchart LR
    不应立即覆盖同一 session 刚由 hook 推入的 thinking/running_tool 状态，避免用户正在看的
    working 动画被本地扫描打断。
 
+7.1 ChatGPT App SSH Remote observer
+   Agent Deck 只从 ChatGPT Settings 的 managed connections 中取
+   `auto-connect=true` 的 SSH 项，动态建立独立、可复用的 `codex app-server proxy` 连接；
+   不自行读取 `~/.ssh/config`，不使用历史 project/selected host，也不连接 false/missing 项。
+   设置关闭或不可判定时立即 fail-closed，关闭对应 observer 并清理其状态。协议只调用
+   `initialize/initialized/thread-list(useStateDbOnly=true)`。立即丢弃 preview、turn、item 和
+   rollout path，只保留顶层 `vscode` thread 的 host-aware 粗粒度状态。本地与不同 host 使用
+   不冲突的 agent identity；active/waiting/error 可参与 App Key 宠物覆盖，active->idle 仅产生
+   有界完成反馈，冷 idle/notLoaded 不覆盖原图标。连接持续失败超过 stale 窗口时清理该 host
+   的 observer-owned 状态。OpenAI 中转 Remote 没有公开第三方 status API，当前不逆向接入。
+
 8. state reducer
    把事件归约为 AgentState。
 
@@ -263,6 +274,9 @@ P1 验收清单：
 - [x] PermissionRequest 能在硬件上显示并返回 allow/deny。
 - [x] Codex App Plan Mode `request_user_input` 未完成时能被只读扫描为 `waiting_user`。
 - [x] Codex App 最近有效会话能被只读扫描同步到 daemon，并按 running/idle/waiting 状态显示到 slot。
+- [x] SSH Remote ChatGPT App 顶层任务可经独立只读 app-server proxy 合并到 daemon；自动主机
+  严格跟随 Settings 中 enabled connection，CLI/child 被过滤，preview/turn/item 不进入模型
+  或诊断，设置关闭、发现失败或失联会恢复原 App 图标。
 - [x] Codex quota 能自动刷新到 daemon runtime，并显示到 N4 Pro 底部虚拟视窗。
 - [x] 启用统一 N4 Pro renderer 后，Codex 会话状态按钮和底部 quota 背景能在同一次硬件写入链路中共存。
 - [x] 超时默认策略按配置执行。

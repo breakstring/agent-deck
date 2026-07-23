@@ -115,9 +115,10 @@ class CodexAppStateReport(BaseModel):
 class CodexAppActiveSession(BaseModel):
     """描述一个适合显示到硬件按钮上的 Codex App 活动会话。
 
-    入参：字段来自 scan report 和 rollout 推断；`status` 是 Agent Deck 内部状态枚举，
-    `reason` 用于解释为什么判定为该状态；父子 thread metadata 会透传给 daemon，
-    但默认 active session 选择器已经排除 child thread。
+    入参：字段来自本地 scan report/rollout 或远端只读 app-server 投影；`status` 是
+    Agent Deck 内部状态枚举，`reason` 解释判定；远端没有可安全复用的本地 rollout path，
+    因此该字段可空；``execution_host_*`` 和 ``is_remote`` 为 daemon 提供 host-aware identity。
+    父子 thread metadata 会透传给 daemon，但默认选择器已经排除 child thread。
     返回：不可变 Pydantic model，可由 CLI/daemon 渲染按钮或输出诊断 JSON。
     错误处理：字段类型或状态枚举非法时由 Pydantic 报告。
     副作用：模型自身不读取文件、不访问 Codex、不操作硬件。
@@ -128,13 +129,16 @@ class CodexAppActiveSession(BaseModel):
     thread_id: str
     title: str | None
     cwd: str | None
-    rollout_path: str
+    rollout_path: str | None
     updated_at: int
     status: AgentStatus
     reason: str
     parent_thread_id: str | None = None
     thread_source: str | None = None
     is_child_thread: bool = False
+    execution_host_id: str = "local"
+    execution_host_label: str | None = None
+    is_remote: bool = False
 
 
 class CodexThreadMetadata(BaseModel):
@@ -219,6 +223,8 @@ def select_active_codex_app_sessions(
     sessions: list[CodexAppActiveSession] = []
     for thread in report.threads:
         if thread.updated_at is None or thread.updated_at < cutoff_epoch:
+            continue
+        if thread.thread_source not in {None, "vscode"}:
             continue
         if thread.is_child_thread:
             continue
@@ -355,7 +361,7 @@ def _load_thread_rows(db_path: Path, *, limit: int) -> tuple[dict[str, Any], ...
     """从 Codex App SQLite 读取最近的未归档 thread 行。
 
     入参：`db_path` 是 SQLite 文件路径；`limit` 是最大 thread 数。
-    返回：每行一个 dict，包含 id、title、cwd、rollout_path、updated_at。
+    返回：每行一个 dict，包含 id、title、cwd、rollout_path、updated_at 和 source。
     错误处理：SQLite 打开或查询失败由 sqlite3 抛出。
     副作用：以只读 URI 打开 SQLite 并执行 SELECT；不写数据库。
     """
@@ -366,9 +372,10 @@ def _load_thread_rows(db_path: Path, *, limit: int) -> tuple[dict[str, Any], ...
     try:
         cursor = conn.execute(
             """
-            select id, title, cwd, rollout_path, updated_at
+            select id, title, cwd, rollout_path, updated_at, source
             from threads
             where coalesce(archived, 0) = 0
+              and source = 'vscode'
             order by updated_at desc
             limit ?
             """,
@@ -406,7 +413,7 @@ def _thread_snapshot_from_row(row: Mapping[str, Any]) -> CodexAppThreadSnapshot:
         status="waiting_user" if pending_user_input is not None else "observed",
         pending_user_input=pending_user_input,
         parent_thread_id=metadata.parent_thread_id,
-        thread_source=metadata.thread_source,
+        thread_source=metadata.thread_source or _optional_string(row.get("source")),
         is_child_thread=metadata.is_child_thread,
     )
 

@@ -879,6 +879,8 @@ def test_daemon_callback_calls_uvicorn_run(monkeypatch: Any) -> None:
     assert poller_config.codex_app_state_scan_limit == 80
     assert poller_config.codex_app_active_window_seconds == 3600
     assert poller_config.codex_app_active_session_limit == 10
+    assert poller_config.codex_remote_ssh_enabled is False
+    assert "codex_remote_ssh_hosts" not in poller_config.model_dump()
     assert poller_config.codex_quota_enabled is True
     assert poller_config.codex_quota_interval_seconds == 300.0
     assert poller_config.codex_quota_timeout_seconds == 10.0
@@ -927,6 +929,59 @@ def test_daemon_callback_can_disable_codex_pollers(monkeypatch: Any) -> None:
     assert poller_config.codex_token_usage_enabled is False
     assert poller_config.streamdock_quota_touchscreen_enabled is False
     assert poller_config.streamdock_n4pro_renderer_enabled is False
+
+
+def test_daemon_callback_maps_remote_ssh_config(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """验证 daemon 把 SSH Remote 总开关和轮询参数映射到 poller config。
+
+    入参：``monkeypatch`` 隔离 uvicorn/app factory；``tmp_path`` 保存配置。
+    返回：无；断言不含 host 名单，轮询、timeout、limit、stale 和完成反馈均透传。
+    错误处理：无。
+    副作用：只写 pytest 临时 TOML，不启动网络或硬件。
+    """
+
+    config_path = tmp_path / "agent-deck.toml"
+    config_path.write_text(
+        "\n".join(
+            (
+                "[hardware_renderer]",
+                "enabled = false",
+                "[codex.remote_ssh]",
+                "enabled = true",
+                "poll_interval_seconds = 7",
+                "timeout_seconds = 9",
+                "thread_limit = 42",
+                "stale_after_seconds = 23",
+                "completed_feedback_seconds = 11",
+            )
+        ),
+        encoding="utf-8",
+    )
+    create_app_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        cli,
+        "create_app",
+        lambda **kwargs: create_app_calls.append(kwargs) or object(),
+    )
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
+
+    result = runner.invoke(
+        cli.daemon_app,
+        ["--config", str(config_path)],
+    )
+
+    assert result.exit_code == 0
+    remote = create_app_calls[0]["poller_config"]
+    assert remote.codex_remote_ssh_enabled is True
+    assert "codex_remote_ssh_hosts" not in remote.model_dump()
+    assert remote.codex_remote_ssh_interval_seconds == 7
+    assert remote.codex_remote_ssh_timeout_seconds == 9
+    assert remote.codex_remote_ssh_thread_limit == 42
+    assert remote.codex_remote_ssh_stale_after_seconds == 23
+    assert remote.codex_remote_ssh_completed_feedback_seconds == 11
 
 
 def test_daemon_callback_configures_default_unified_n4pro_renderer(
@@ -2069,3 +2124,112 @@ def _json_object_text(output: str) -> str:
     start = output.find("{")
     assert start >= 0
     return output[start:]
+
+
+def test_codex_remote_state_command_prints_sanitized_snapshot(monkeypatch: Any) -> None:
+    """远端诊断命令应传递 host/limit/timeout，并只输出 observer 的安全快照。
+
+    入参：pytest ``monkeypatch`` 替换真实 SSH observer。
+    返回：无；断言命令成功、关闭连接且 JSON 不含 prompt。
+    错误处理：无。
+    副作用：仅修改测试进程内 CLI 符号，不访问 SSH。
+    """
+
+    captured: dict[str, Any] = {}
+
+    class FakeSnapshot:
+        """提供 CLI 所需 model_dump 的最小安全快照。
+
+        入参：无。
+        返回：固定诊断 dict。
+        错误处理：无。
+        副作用：无。
+        """
+
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            """返回固定 JSON-safe 诊断。
+
+            入参：``mode`` 应为 json。
+            返回：不含 preview/prompt 的 dict。
+            错误处理：无。
+            副作用：记录 mode 供断言。
+            """
+
+            captured["mode"] = mode
+            return {"host": "minibox", "sessions": [], "status_counts": {"idle": 1}}
+
+    class FakeObserver:
+        """记录 CLI 构造参数并模拟 context-managed observer。
+
+        入参：host 和关键字配置。
+        返回：实例可 read/close。
+        错误处理：无。
+        副作用：只写 captured dict。
+        """
+
+        def __init__(self, host: str, **kwargs: Any) -> None:
+            """记录 host 和配置。
+
+            入参：CLI 传入的 observer 参数。
+            返回：无。
+            错误处理：无。
+            副作用：更新 captured。
+            """
+
+            captured["host"] = host
+            captured["kwargs"] = kwargs
+
+        def __enter__(self) -> FakeObserver:
+            """返回自身。
+
+            入参：无。
+            返回：当前 fake。
+            错误处理：无。
+            副作用：无。
+            """
+
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            """记录 context 已关闭。
+
+            入参：标准 context manager 参数。
+            返回：无。
+            错误处理：无。
+            副作用：设置 closed。
+            """
+
+            captured["closed"] = True
+
+        def read_snapshot(self) -> FakeSnapshot:
+            """返回固定安全快照。
+
+            入参：无。
+            返回：``FakeSnapshot``。
+            错误处理：无。
+            副作用：无。
+            """
+
+            return FakeSnapshot()
+
+    monkeypatch.setattr(cli, "CodexRemoteSshObserver", FakeObserver)
+    result = runner.invoke(
+        cli.ctl_app,
+        [
+            "codex-remote-state",
+            "--host",
+            "minibox",
+            "--timeout-seconds",
+            "7",
+            "--limit",
+            "32",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(_json_object_text(result.stdout))["host"] == "minibox"
+    assert captured["host"] == "minibox"
+    assert captured["kwargs"]["timeout_seconds"] == 7.0
+    assert captured["kwargs"]["thread_limit"] == 32
+    assert captured["kwargs"]["completed_feedback_seconds"] == 0
+    assert captured["closed"] is True

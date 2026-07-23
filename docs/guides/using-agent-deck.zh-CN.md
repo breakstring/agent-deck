@@ -309,6 +309,71 @@ N4 Pro 的宠物按键使用 `112×112` 深色画布，完整 cell 等比缩放�
 当前不支持 Agent Deck 单独选宠物、多宠物、按会话选择不同宠物、宠物按键交互、v2 gaze/鼠标
 跟踪，也不替换现有 Agent 状态按键。
 
+### 6.2 远端 ChatGPT App 任务状态（SSH）
+
+ChatGPT App 的 [Remote Connections](https://learn.chatgpt.com/docs/remote-connections.md)
+可以通过 SSH 在另一台电脑运行 Codex。Agent Deck 对这一类连接提供显式 opt-in 的只读观察：
+它为每个 host 创建自己的 SSH 子进程，执行固定的 `codex app-server proxy`，再按
+[Codex app-server](https://learn.chatgpt.com/docs/app-server.md) 合同只调用
+`initialize`、`initialized` 和 `thread/list(useStateDbOnly=true)`。这条连接和 ChatGPT App
+自己的连接彼此独立；Agent Deck 不读取或复用 App 的 socket 文件描述符，也不调用
+`thread/resume`、`thread/start`、`turn/start`、interrupt、archive 等改变远端状态的方法。
+
+先用诊断命令确认 SSH alias、远端 Codex 路径和共享 app-server 可达：
+
+```bash
+uv run agent-deckctl codex-remote-state \
+  --host minibox.example \
+  --timeout-seconds 10 \
+  --limit 80
+```
+
+输出只含 host 摘要、cwd、可选 thread name、更新时间和粗粒度状态计数。app-server 返回的
+`preview`（通常来自首条 prompt）、turn、item、rollout path 和原始响应会在适配器内立即丢弃，
+不会进入 daemon 状态、日志或 `/status`。
+
+确认诊断成功后，先在 ChatGPT 的 **Settings → Connections** 中添加并启用需要观察的
+SSH Connection，再在本机 `agent-deck.toml` 打开 Agent Deck 总开关：
+
+```toml
+[codex.remote_ssh]
+enabled = true
+poll_interval_seconds = 5.0
+timeout_seconds = 10.0
+thread_limit = 80
+stale_after_seconds = 20.0
+completed_feedback_seconds = 10.0
+```
+
+Agent Deck 每轮只读取 ChatGPT 自己保存的 managed connections，并且仅接受
+`remote-connection-auto-connect-by-host-id` 中值**严格为 `true`** 的 SSH 项。它不会读取
+`~/.ssh/config` 来发现或扩展主机，不会把历史 `remote-projects`、当前 selected host 或
+auto-connect 为 `false`/缺失的记录当作授权。用户在 Settings 中关闭 Connection 后，daemon
+会动态关闭自己的 observer 并清理旧状态；设置文件缺失或结构无法确认时同样 fail-closed。
+
+保存总开关后重启后台服务。多个已启用 host 会各自复用一条独立连接并并行轮询；本地和远端
+thread 即使 ID 相同也使用不同的 host-aware agent identity。只消费
+`sourceKinds=["vscode"]` 的顶层 thread，
+因此 Codex CLI、exec 和 child/subagent 不会触发 App Key 宠物覆盖。状态映射如下：
+
+| 远端 `ThreadStatus` | Agent Deck |
+| --- | --- |
+| `active + waitingOnApproval` | `APPROVAL_NEEDED` |
+| `active + waitingOnUserInput` | `WAITING_USER` |
+| `active`（无等待 flag） | `THINKING`（宠物显示 running） |
+| `systemError` | `ERROR` |
+| `active -> idle` | 本机短暂 `COMPLETED_RECENTLY`，窗口后恢复原图标 |
+| 冷启动 `idle`、`notLoaded` | 不覆盖原图标 |
+
+app-server 当前粗粒度状态不能区分 thinking 与 running tool，也没有显式 review/未读信号，因此
+Agent Deck 不猜测 `RUNNING_TOOL` 或常驻 review。连接持续失败超过 `stale_after_seconds` 后会清理
+该 host 的旧活动状态并恢复 App Key 原图标；按键原有的“打开或聚焦 ChatGPT App”动作不受影响。
+`/status.pollers.codex_remote_ssh` 会给出 Settings 发现计数、各 host 的成功时间、短错误类型、
+状态计数和关联 agent 数。
+
+OpenAI 中转型 Remote Connections 目前没有供第三方读取远端 thread/status 的公开接口，本版本不
+逆向或接入该私有链路；这里只支持用户已经能从本机 `ssh <host>` 访问的 SSH Remote。
+
 #### 真机验收清单
 
 以下是发布前必须重新执行的验收步骤，不代表当前版本已经通过真机测试：

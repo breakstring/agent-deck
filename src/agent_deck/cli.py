@@ -1,7 +1,7 @@
 """Agent Deck daemon、控制命令和 Codex hook 的命令行入口。
 
 本模块只负责 CLI 参数解析、JSON/stdin 处理、本地 daemon HTTP 调用、Codex 检测/安装、
-Codex App 本地状态扫描命令分派、真实 N4 Pro 预览命令，以及打包后的 console scripts
+Codex App 本地状态扫描、显式 SSH Remote 只读诊断命令分派、真实 N4 Pro 预览命令，以及打包后的 console scripts
 启动 uvicorn。它不持久化 daemon 状态、不实现 broker 业务逻辑；默认命令不修改用户文件，
 只有用户显式运行 `codex-install --apply` 时才会写 Codex 配置。网络副作用限于用户显式执行
 命令时访问配置的本地 daemon URL，并使用有界 httpx timeout；daemon 默认会按本地配置启用
@@ -46,6 +46,10 @@ from agent_deck.adapters.codex_discovery import (
     validate_codex_managed_system_integration,
 )
 from agent_deck.adapters.codex_quota import read_codex_quota
+from agent_deck.adapters.codex_remote_ssh import (
+    CodexRemoteSshObserver,
+    CodexRemoteSshError,
+)
 from agent_deck.core.decisions import DecisionBehavior
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
 from agent_deck.hardware.streamdock_probe import probe_streamdock_devices
@@ -275,6 +279,8 @@ def daemon_callback(
     `codex_token_usage_poll_interval_seconds` 控制 token usage 刷新周期；
     Codex 宠物不提供独立 CLI 选择，始终使用配置文件 `[codex.pet]` 的开关、刷新率、
     面板 FPS 与 motion 并跟随 Codex 全局选择；
+    `[codex.remote_ssh]` 只有显式 enabled 时才跟随 ChatGPT Settings 中已启用自动连接的
+    SSH Connection；不会从 Agent Deck 配置或 ``~/.ssh/config`` 扩展主机；
     `disable_streamdock_quota_touchscreen` 可关闭旧 quota-only 真实硬件触屏下发；
     `config_path` 指向 daemon 默认配置；`disable_hardware_renderer` 可关闭默认真实硬件渲染；
     `device_profile`、`render_interval_seconds` 和 `renderer_fps` 是面向临时调试的通用覆盖项，
@@ -316,6 +322,20 @@ def daemon_callback(
         codex_app_state_scan_limit=codex_app_state_scan_limit,
         codex_app_active_window_seconds=codex_app_active_window_seconds,
         codex_app_active_session_limit=codex_app_active_session_limit,
+        codex_remote_ssh_enabled=local_config.codex.remote_ssh.enabled,
+        codex_remote_ssh_interval_seconds=(
+            local_config.codex.remote_ssh.poll_interval_seconds
+        ),
+        codex_remote_ssh_timeout_seconds=(
+            local_config.codex.remote_ssh.timeout_seconds
+        ),
+        codex_remote_ssh_thread_limit=local_config.codex.remote_ssh.thread_limit,
+        codex_remote_ssh_stale_after_seconds=(
+            local_config.codex.remote_ssh.stale_after_seconds
+        ),
+        codex_remote_ssh_completed_feedback_seconds=(
+            local_config.codex.remote_ssh.completed_feedback_seconds
+        ),
         codex_quota_enabled=not disable_codex_quota_poller,
         codex_quota_interval_seconds=codex_quota_poll_interval_seconds,
         codex_quota_timeout_seconds=codex_quota_timeout_seconds,
@@ -842,6 +862,58 @@ def codex_app_state(
             "report": report.model_dump(mode="json"),
         }
     )
+
+
+@ctl_app.command("codex-remote-state")
+def codex_remote_state(
+    host: Annotated[
+        str,
+        typer.Option(
+            "--host",
+            help="SSH config alias/hostname running ChatGPT/Codex app-server.",
+        ),
+    ],
+    timeout_seconds: Annotated[
+        float,
+        typer.Option(
+            "--timeout-seconds",
+            help="Seconds allowed for SSH, WebSocket, and read-only RPC.",
+            min=1.0,
+        ),
+    ] = 10.0,
+    limit: Annotated[
+        int,
+        typer.Option(
+            "--limit",
+            help="Maximum recent remote ChatGPT App threads to inspect.",
+            min=1,
+            max=200,
+        ),
+    ] = 80,
+) -> None:
+    """通过独立 SSH proxy 只读输出远端 ChatGPT App 状态。
+
+    入参：``host`` 是具体 SSH config alias/hostname；``timeout_seconds`` 控制连接和 RPC；
+    ``limit`` 控制 ``thread/list(useStateDbOnly=true)`` 页大小。
+    返回：无显式返回值；stdout 输出不含 preview、prompt、turn 或 item 的 JSON 快照。
+    错误处理：host 校验、SSH、WebSocket 或 app-server 失败时写 stderr 并以 exit 1 退出；
+    Typer 参数范围错误以 exit 2 退出。
+    副作用：启动一条短生命周期独立 SSH 连接，只调用 initialize/initialized/thread-list；
+    不复用 ChatGPT App 连接、不修改远端 thread、不连接 Agent Deck daemon 或硬件。
+    """
+
+    try:
+        with CodexRemoteSshObserver(
+            host,
+            timeout_seconds=timeout_seconds,
+            thread_limit=limit,
+            completed_feedback_seconds=0,
+        ) as observer:
+            snapshot = observer.read_snapshot()
+    except (CodexRemoteSshError, OSError, ValueError) as exc:
+        typer.echo(f"agent-deckctl codex-remote-state: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    _echo_json(snapshot.model_dump(mode="json"))
 
 
 @ctl_app.command("codex-hosts")

@@ -5,7 +5,8 @@ decisions, layout planning, optional Codex pollers, a fake hardware surface, and
 optional real N4 Pro render sinks. It deliberately does not bind sockets, install
 hooks, write user configuration, or persist state; callers such as CLI entry
 points are responsible for hosting the returned ASGI app and choosing whether
-Codex local-state/quota polling or real StreamDock rendering is enabled.
+Codex local-state/quota polling, ChatGPT Settings-gated read-only SSH Remote
+observation, or real StreamDock rendering is enabled.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import math
 import base64
 import binascii
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -23,7 +24,7 @@ from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import RLock
-from typing import Any
+from typing import Any, Protocol
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, Response
@@ -74,6 +75,14 @@ from agent_deck.adapters.codex_app_state import (
     read_codex_app_active_sessions,
 )
 from agent_deck.adapters.codex_quota import CodexQuotaSnapshot, read_codex_quota
+from agent_deck.adapters.codex_remote_ssh import (
+    CodexRemoteSshObserver,
+    CodexRemoteSshDiscoverySnapshot,
+    CodexRemoteSshEnabledHost,
+    CodexRemoteSshSnapshot,
+    codex_remote_host_id,
+    discover_enabled_codex_remote_ssh_hosts,
+)
 from agent_deck.adapters.codex_pet import CodexPetResolver
 from agent_deck.adapters.codex_tokens import (
     CodexTokenPeriod,
@@ -180,6 +189,7 @@ from agent_deck.server.codex_pet_runtime import CodexPetRuntime, ReducedMotionRe
 
 CodexAppStateEventReader = Callable[[], tuple[NormalizedEvent, ...]]
 CodexAppActiveSessionsReader = Callable[..., tuple[CodexAppActiveSession, ...]]
+CodexRemoteSshHostsReader = Callable[[], CodexRemoteSshDiscoverySnapshot]
 CodexQuotaReader = Callable[..., CodexQuotaSnapshot]
 CodexTokenUsageReader = Callable[[], CodexTokenUsageSnapshot]
 QuotaTouchscreenSink = Callable[[Any], StreamDockTouchscreenRenderResult]
@@ -191,6 +201,48 @@ LocalAppActionExecutor = Callable[..., LocalAppActionResult]
 LocalUrlActionExecutor = Callable[..., LocalTargetActionResult]
 KeyboardAccessibilitySettingsOpener = Callable[[], None]
 """由显式 GUI 操作调用、用于打开 macOS 辅助功能设置的可注入函数。"""
+
+
+class CodexRemoteSshObserverProtocol(Protocol):
+    """定义 daemon 所需的远端 SSH observer 最小接口。
+
+    入参：实现必须提供稳定 ``host``/``host_id``、同步 ``read_snapshot`` 和幂等 ``close``。
+    返回：Protocol 仅用于类型检查和测试注入。
+    错误处理：读取异常由 daemon poller 捕获；close 应 best-effort。
+    副作用：协议自身无副作用，生产实现会维护独立 SSH 子进程。
+    """
+
+    host: str
+    host_id: str
+
+    def read_snapshot(self) -> CodexRemoteSshSnapshot:
+        """读取一次脱敏远端状态快照。
+
+        入参：无。
+        返回：不含 prompt/turn/item 的 ``CodexRemoteSshSnapshot``。
+        错误处理：连接或协议异常向调用 poller 传播。
+        副作用：实现可以使用自己拥有的 SSH 连接，但不得修改远端 thread。
+        """
+
+        ...
+
+    def close(self) -> None:
+        """释放 observer 自己持有的连接。
+
+        入参：无。
+        返回：无。
+        错误处理：实现应 best-effort，避免阻断 daemon shutdown。
+        副作用：只关闭 observer 自己创建的连接和子进程。
+        """
+
+        ...
+
+
+CodexRemoteSshObserverFactory = Callable[
+    [CodexRemoteSshEnabledHost],
+    CodexRemoteSshObserverProtocol,
+]
+"""按 ChatGPT 已启用 SSH connection 创建独立只读 observer 的可注入工厂。"""
 
 _STREAMDOCK_TOUCH_TAP_DEBOUNCE_SECONDS = 0.45
 """真实 StreamDock touch bar 连续 touch_point 归并为一次 tap 的最短间隔。"""
@@ -235,7 +287,9 @@ class DaemonPollerConfig(BaseModel):
     入参：`codex_app_state_enabled` 控制是否扫描 Codex App 本地 state/rollout；
     `codex_app_state_interval_seconds` 是扫描间隔；`codex_app_state_scan_limit`、
     `codex_app_active_window_seconds` 和 `codex_app_active_session_limit` 控制 Codex App
-    最近有效会话筛选；`codex_quota_enabled` 控制是否读取 Codex app-server quota；
+    最近有效会话筛选；``codex_remote_ssh_*`` 控制仅跟随 ChatGPT Settings 已启用 connection
+    的独立只读 app-server proxy、轮询/超时、thread 上限、失联清理和完成反馈；
+    `codex_quota_enabled` 控制是否读取 Codex app-server quota；
     `codex_quota_interval_seconds` 是 quota 间隔，默认 5 分钟；
     `codex_quota_timeout_seconds` 是单次 app-server 读取超时；
     `codex_pet_enabled`、刷新间隔、面板 FPS 与 motion 控制只读 Codex 宠物展示；
@@ -259,6 +313,16 @@ class DaemonPollerConfig(BaseModel):
     codex_app_state_scan_limit: int = Field(default=80, gt=0)
     codex_app_active_window_seconds: int = Field(default=3600, gt=0)
     codex_app_active_session_limit: int = Field(default=10, gt=0)
+    codex_remote_ssh_enabled: bool = False
+    codex_remote_ssh_interval_seconds: float = Field(default=5.0, gt=0)
+    codex_remote_ssh_timeout_seconds: float = Field(default=10.0, gt=0)
+    codex_remote_ssh_thread_limit: int = Field(default=80, gt=0, le=200)
+    codex_remote_ssh_stale_after_seconds: float = Field(default=20.0, gt=0)
+    codex_remote_ssh_completed_feedback_seconds: float = Field(
+        default=10.0,
+        ge=0,
+        le=60,
+    )
     codex_quota_enabled: bool = False
     codex_quota_interval_seconds: float = Field(default=300.0, gt=0)
     codex_quota_timeout_seconds: float = Field(default=10.0, gt=0)
@@ -710,6 +774,9 @@ class _DaemonRuntime:
     terminal_synced_decision_ids: set[str]
     codex_app_state_last_polled_at: datetime | None
     codex_app_state_last_error: str | None
+    codex_observed_agent_keys_by_scope: dict[str, set[str]]
+    codex_remote_ssh_discovery_diagnostic: dict[str, Any]
+    codex_remote_ssh_diagnostics: dict[str, dict[str, Any]]
     codex_quota_snapshot: CodexQuotaSnapshot | None
     codex_quota_updated_at: datetime | None
     codex_quota_last_error: str | None
@@ -978,37 +1045,197 @@ class _DaemonRuntime:
         sessions: tuple[CodexAppActiveSession, ...],
         *,
         observed_at: datetime,
+        observation_scope: str = "local",
     ) -> None:
-        """Apply active Codex App sessions observed by the local state scanner.
+        """应用某个本地或远端观察域的 ChatGPT/Codex App 会话。
 
-        入参：`sessions` 是 adapter 按最近有效窗口筛选出的 Codex App 会话；`observed_at`
-        是本轮扫描时间。
+        入参：`sessions` 是 adapter 筛选出的顶层 App 会话；`observed_at` 是本轮扫描时间；
+        ``observation_scope`` 标识 local 或一个 SSH host；只有独占 namespace 的远端 scope
+        会清理上轮写入但本轮消失的状态，本地不会误删 hook 写入的同 key 状态。
         返回：无显式返回值。
         错误处理：state model 校验失败会向调用方传播，由 poller 捕获记录。
-        副作用：幂等更新 store 中对应 Codex agent 状态；有会话时 render fake surface 一帧。
+        副作用：幂等更新 store；远端 scope 会移除同 scope 上轮存在但本轮消失的
+        observer-owned agent；状态有变化时 render fake surface 一帧。
         """
 
+        current_agent_keys: set[str] = set()
+        changed = False
         for session in sessions:
-            focus_target = (
-                f"codex-app:{session.thread_id}"
-                if session.thread_id
-                else "app:Codex"
+            session_id = _qualified_codex_app_session_id(session)
+            parent_session_id = (
+                _qualified_codex_app_parent_session_id(session)
+                if session.parent_thread_id is not None
+                else None
             )
+            agent_key = f"{AgentSource.CODEX.value}:{session_id}"
+            current_agent_keys.add(agent_key)
+            focus_target = _codex_app_focus_target(session)
+            title = _codex_app_session_display_name(session)
             self.store.upsert_observed_state(
                 source=AgentSource.CODEX,
-                session_id=session.thread_id,
+                session_id=session_id,
                 observed_at=observed_at,
                 status=session.status,
-                title=session.title,
+                title=title,
                 cwd=session.cwd,
                 summary=session.reason,
                 active_tool=_active_tool_from_reason(session.reason),
                 focus_target=focus_target,
-                parent_session_id=session.parent_thread_id,
+                parent_session_id=parent_session_id,
                 is_child_agent=session.is_child_thread,
             )
-        if sessions:
+            changed = True
+        if observation_scope != "local":
+            previous_agent_keys = self.codex_observed_agent_keys_by_scope.get(
+                observation_scope,
+                set(),
+            )
+            for stale_agent_key in previous_agent_keys - current_agent_keys:
+                changed = self.store.remove(stale_agent_key) is not None or changed
+            self.codex_observed_agent_keys_by_scope[observation_scope] = (
+                current_agent_keys
+            )
+        if changed:
             self.render_current()
+
+    def clear_codex_observation_scope(self, observation_scope: str) -> None:
+        """清理一个持续失联观察域先前写入的所有 Agent 状态。
+
+        入参：``observation_scope`` 必须与 ``apply_codex_active_sessions`` 使用的 scope 一致。
+        返回：无。
+        错误处理：未知 scope 是幂等 no-op。
+        副作用：只删除该 scope 明确追踪的 observer-owned agent，并在有删除时重渲染。
+        """
+
+        agent_keys = self.codex_observed_agent_keys_by_scope.pop(observation_scope, set())
+        changed = False
+        for agent_key in agent_keys:
+            changed = self.store.remove(agent_key) is not None or changed
+        if changed:
+            self.render_current()
+
+    def mark_codex_remote_ssh_poll_success(
+        self,
+        snapshot: CodexRemoteSshSnapshot,
+    ) -> None:
+        """记录某个 SSH host 的成功观察诊断。
+
+        入参：``snapshot`` 已在 adapter 中脱敏，不包含 prompt、turn 或 item。
+        返回：无。
+        错误处理：本方法只复制 JSON-safe 字段，不主动抛业务异常。
+        副作用：更新 runtime 内存诊断；保留首次成功时间供失联 stale 判定。
+        """
+
+        previous = self.codex_remote_ssh_diagnostics.get(snapshot.host_id, {})
+        first_success_at = previous.get("first_success_at") or snapshot.observed_at
+        self.codex_remote_ssh_diagnostics[snapshot.host_id] = {
+            "host": snapshot.host,
+            "host_id": snapshot.host_id,
+            "last_polled_at": snapshot.observed_at,
+            "first_success_at": first_success_at,
+            "last_success_at": snapshot.observed_at,
+            "last_error": None,
+            "server_user_agent": snapshot.server_user_agent,
+            "considered_thread_count": snapshot.considered_thread_count,
+            "status_counts": dict(snapshot.status_counts),
+            "active_session_count": len(snapshot.sessions),
+        }
+
+    def mark_codex_remote_ssh_discovery_success(
+        self,
+        snapshot: CodexRemoteSshDiscoverySnapshot,
+    ) -> None:
+        """记录一次 ChatGPT Settings connection 发现成功。
+
+        入参：``snapshot`` 只含 managed/启用/忽略计数和已启用主机模型。
+        返回：无。
+        错误处理：不主动抛业务异常。
+        副作用：覆盖 runtime 内存诊断；不保存 global-state 路径或原始设置内容。
+        """
+
+        self.codex_remote_ssh_discovery_diagnostic = {
+            "source": "chatgpt_settings",
+            "last_checked_at": snapshot.observed_at,
+            "last_error": None,
+            "managed_ssh_count": snapshot.managed_ssh_count,
+            "enabled_host_count": len(snapshot.enabled_hosts),
+            "auto_connect_disabled_count": snapshot.auto_connect_disabled_count,
+            "ignored_non_ssh_count": snapshot.ignored_non_ssh_count,
+        }
+
+    def mark_codex_remote_ssh_discovery_error(
+        self,
+        error: Exception,
+        *,
+        checked_at: datetime,
+    ) -> None:
+        """记录设置发现失败，且只暴露异常类型。
+
+        入参：``error`` 是读取或解析 ChatGPT global state 的异常；``checked_at`` 必须带时区。
+        返回：无。
+        错误处理：不保存异常消息，避免路径或内容进入状态 API。
+        副作用：覆盖 discovery 诊断；observer 的关闭和状态清理由 poller 负责。
+        """
+
+        self.codex_remote_ssh_discovery_diagnostic = {
+            "source": "chatgpt_settings",
+            "last_checked_at": checked_at,
+            "last_error": type(error).__name__,
+            "managed_ssh_count": 0,
+            "enabled_host_count": 0,
+            "auto_connect_disabled_count": 0,
+            "ignored_non_ssh_count": 0,
+        }
+
+    def remove_codex_remote_ssh_host(self, host_id: str) -> None:
+        """删除一个不再启用的远端主机诊断与 observer-owned 状态。
+
+        入参：``host_id`` 是由 SSH alias 派生的不可逆短摘要。
+        返回：无。
+        错误处理：未知 host id 是幂等 no-op。
+        副作用：删除对应诊断并清理该观察域内的 Agent 状态，必要时触发重渲染。
+        """
+
+        self.codex_remote_ssh_diagnostics.pop(host_id, None)
+        self.clear_codex_observation_scope(f"remote-ssh:{host_id}")
+
+    def mark_codex_remote_ssh_poll_error(
+        self,
+        *,
+        host: str,
+        host_id: str,
+        error: Exception,
+        polled_at: datetime,
+        stale_after_seconds: float,
+    ) -> None:
+        """记录 SSH host 读取失败，并在超过 stale 窗口后恢复原图标。
+
+        入参：host/host_id 标识观察域；``error`` 只用于短类型诊断；``polled_at`` 必须带时区；
+        ``stale_after_seconds`` 是距最后成功多久后清理旧状态。
+        返回：无。
+        错误处理：未知首次失败不会抛异常；naive 时间由调用方合同禁止。
+        副作用：更新诊断；最后成功不存在或已过 stale 窗口时清理该 host 的 observer 状态。
+        """
+
+        previous = self.codex_remote_ssh_diagnostics.get(host_id, {})
+        last_success_at = previous.get("last_success_at")
+        diagnostic = dict(previous)
+        diagnostic.update(
+            {
+                "host": host,
+                "host_id": host_id,
+                "last_polled_at": polled_at,
+                "last_error": type(error).__name__,
+            }
+        )
+        self.codex_remote_ssh_diagnostics[host_id] = diagnostic
+        should_clear = not isinstance(last_success_at, datetime)
+        if isinstance(last_success_at, datetime):
+            should_clear = (
+                polled_at - last_success_at
+            ).total_seconds() >= stale_after_seconds
+        if should_clear:
+            self.clear_codex_observation_scope(f"remote-ssh:{host_id}")
 
     def mark_codex_app_state_poll_success(self, polled_at: datetime) -> None:
         """Record a successful Codex App state poll.
@@ -2527,6 +2754,25 @@ class _DaemonRuntime:
                     ),
                     "last_error": self.codex_app_state_last_error,
                 },
+                "codex_remote_ssh": {
+                    "discovery": _dump_codex_remote_ssh_diagnostic(
+                        self.codex_remote_ssh_discovery_diagnostic
+                    ),
+                    "hosts": [
+                        _dump_codex_remote_ssh_diagnostic(diagnostic)
+                        for diagnostic in sorted(
+                            self.codex_remote_ssh_diagnostics.values(),
+                            key=lambda item: str(item.get("host", "")),
+                        )
+                    ],
+                    "associated_agent_count": sum(
+                        len(agent_keys)
+                        for scope, agent_keys in (
+                            self.codex_observed_agent_keys_by_scope.items()
+                        )
+                        if scope.startswith("remote-ssh:")
+                    ),
+                },
             },
             "codex_quota": {
                 "snapshot": _dump_optional_model(self.codex_quota_snapshot),
@@ -2809,6 +3055,10 @@ def create_app(
     poller_config: DaemonPollerConfig | None = None,
     codex_app_state_event_reader: CodexAppStateEventReader = build_codex_app_state_events,
     codex_app_active_sessions_reader: CodexAppActiveSessionsReader = read_codex_app_active_sessions,
+    codex_remote_ssh_hosts_reader: CodexRemoteSshHostsReader = (
+        discover_enabled_codex_remote_ssh_hosts
+    ),
+    codex_remote_ssh_observer_factory: CodexRemoteSshObserverFactory | None = None,
     codex_quota_reader: CodexQuotaReader = read_codex_quota,
     codex_token_usage_reader: CodexTokenUsageReader = read_codex_token_usage,
     quota_touchscreen_sink: QuotaTouchscreenSink = render_touchscreen_image_to_n4pro,
@@ -2839,6 +3089,9 @@ def create_app(
     入参：`poller_config` 控制是否启动 Codex App state 和 quota 后台 pollers；为空时不启用
     任何 poller，保持测试和嵌入调用无外部 I/O；`codex_app_state_event_reader` 和
     `codex_app_active_sessions_reader` 读取最近有效 Codex App 会话，生产默认只读扫描本机状态；
+    ``codex_remote_ssh_hosts_reader`` 只读取 ChatGPT Settings 已管理且明确启用自动连接的
+    SSH connections；``codex_remote_ssh_observer_factory`` 可为测试注入 observer，生产按
+    每轮发现结果动态创建或关闭独立只读 SSH app-server proxy；
     `codex_quota_reader` 是可注入 reader，生产默认读取真实本机 Codex quota；
     `codex_token_usage_reader` 是可注入 reader，生产默认通过 ccusage 读取 Codex token usage；
     `quota_touchscreen_sink` 是 quota-only 真实硬件触屏下发函数，仅在配置启用时调用；
@@ -2868,6 +3121,21 @@ def create_app(
     """
 
     resolved_poller_config = poller_config or DaemonPollerConfig()
+    resolved_codex_remote_ssh_observers: dict[
+        str, CodexRemoteSshObserverProtocol
+    ] = {}
+    resolved_codex_remote_ssh_observer_factory = (
+        codex_remote_ssh_observer_factory
+        if codex_remote_ssh_observer_factory is not None
+        else lambda enabled_host: CodexRemoteSshObserver(
+            enabled_host.alias,
+            timeout_seconds=resolved_poller_config.codex_remote_ssh_timeout_seconds,
+            thread_limit=resolved_poller_config.codex_remote_ssh_thread_limit,
+            completed_feedback_seconds=(
+                resolved_poller_config.codex_remote_ssh_completed_feedback_seconds
+            ),
+        )
+    )
     codex_pet_temp_directory: TemporaryDirectory[str] | None = None
     if resolved_poller_config.codex_pet_enabled and codex_pet_cache_path is None:
         codex_pet_temp_directory = TemporaryDirectory(
@@ -2944,6 +3212,17 @@ def create_app(
         terminal_synced_decision_ids=set(),
         codex_app_state_last_polled_at=None,
         codex_app_state_last_error=None,
+        codex_observed_agent_keys_by_scope={},
+        codex_remote_ssh_discovery_diagnostic={
+            "source": "chatgpt_settings",
+            "last_checked_at": None,
+            "last_error": None,
+            "managed_ssh_count": 0,
+            "enabled_host_count": 0,
+            "auto_connect_disabled_count": 0,
+            "ignored_non_ssh_count": 0,
+        },
+        codex_remote_ssh_diagnostics={},
         codex_quota_snapshot=None,
         codex_quota_updated_at=None,
         codex_quota_last_error=None,
@@ -3039,6 +3318,9 @@ def create_app(
                 resolved_poller_config,
                 codex_app_state_event_reader,
                 codex_app_active_sessions_reader,
+                codex_remote_ssh_hosts_reader,
+                resolved_codex_remote_ssh_observer_factory,
+                resolved_codex_remote_ssh_observers,
                 codex_quota_reader,
                 codex_token_usage_reader,
                 quota_touchscreen_sink,
@@ -3058,6 +3340,23 @@ def create_app(
                         ),
                         active_session_limit=(
                             resolved_poller_config.codex_app_active_session_limit
+                        ),
+                    )
+                )
+            )
+        if resolved_poller_config.codex_remote_ssh_enabled:
+            tasks.append(
+                asyncio.create_task(
+                    _poll_codex_remote_ssh_loop(
+                        runtime,
+                        observers=resolved_codex_remote_ssh_observers,
+                        hosts_reader=codex_remote_ssh_hosts_reader,
+                        observer_factory=resolved_codex_remote_ssh_observer_factory,
+                        interval_seconds=(
+                            resolved_poller_config.codex_remote_ssh_interval_seconds
+                        ),
+                        stale_after_seconds=(
+                            resolved_poller_config.codex_remote_ssh_stale_after_seconds
                         ),
                     )
                 )
@@ -3142,8 +3441,14 @@ def create_app(
                         if callable(close_renderer):
                             close_renderer()
                     finally:
-                        if codex_pet_temp_directory is not None:
-                            codex_pet_temp_directory.cleanup()
+                        try:
+                            for observer in (
+                                resolved_codex_remote_ssh_observers.values()
+                            ):
+                                observer.close()
+                        finally:
+                            if codex_pet_temp_directory is not None:
+                                codex_pet_temp_directory.cleanup()
 
     app = FastAPI(title="Agent Deck Daemon API", lifespan=lifespan)
     app.state.runtime = runtime
@@ -3638,6 +3943,9 @@ async def _run_enabled_pollers_once(
     config: DaemonPollerConfig,
     codex_app_state_event_reader: CodexAppStateEventReader,
     codex_app_active_sessions_reader: CodexAppActiveSessionsReader,
+    codex_remote_ssh_hosts_reader: CodexRemoteSshHostsReader,
+    codex_remote_ssh_observer_factory: CodexRemoteSshObserverFactory,
+    codex_remote_ssh_observers: dict[str, CodexRemoteSshObserverProtocol],
     codex_quota_reader: CodexQuotaReader,
     codex_token_usage_reader: CodexTokenUsageReader,
     quota_touchscreen_sink: QuotaTouchscreenSink,
@@ -3660,6 +3968,14 @@ async def _run_enabled_pollers_once(
             scan_limit=config.codex_app_state_scan_limit,
             active_window_seconds=config.codex_app_active_window_seconds,
             active_session_limit=config.codex_app_active_session_limit,
+        )
+    if config.codex_remote_ssh_enabled:
+        await _poll_codex_remote_ssh_once(
+            runtime,
+            observers=codex_remote_ssh_observers,
+            hosts_reader=codex_remote_ssh_hosts_reader,
+            observer_factory=codex_remote_ssh_observer_factory,
+            stale_after_seconds=config.codex_remote_ssh_stale_after_seconds,
         )
     if config.codex_quota_enabled:
         await _poll_codex_quota_once(
@@ -3719,6 +4035,36 @@ async def _poll_codex_app_state_loop(
             scan_limit=scan_limit,
             active_window_seconds=active_window_seconds,
             active_session_limit=active_session_limit,
+        )
+
+
+async def _poll_codex_remote_ssh_loop(
+    runtime: _DaemonRuntime,
+    *,
+    observers: dict[str, CodexRemoteSshObserverProtocol],
+    hosts_reader: CodexRemoteSshHostsReader,
+    observer_factory: CodexRemoteSshObserverFactory,
+    interval_seconds: float,
+    stale_after_seconds: float,
+) -> None:
+    """周期性读取多个 SSH host 的远端 ChatGPT App 粗粒度状态。
+
+    入参：``runtime`` 是 daemon 状态；``observers`` 按 host id 保存动态只读连接；
+    ``hosts_reader`` 只读 ChatGPT Settings；``observer_factory`` 为新启用主机创建 observer；
+    ``interval_seconds`` 是轮询间隔；``stale_after_seconds`` 控制失联清理。
+    返回：不主动返回；任务取消时结束。
+    错误处理：单 host 异常在 poll-once 内记录，不终止其他 host 或后台循环。
+    副作用：周期性使用 observer 的 SSH 连接并更新内存 agent/store 诊断。
+    """
+
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await _poll_codex_remote_ssh_once(
+            runtime,
+            observers=observers,
+            hosts_reader=hosts_reader,
+            observer_factory=observer_factory,
+            stale_after_seconds=stale_after_seconds,
         )
 
 
@@ -4290,6 +4636,96 @@ def _active_tool_from_reason(reason: str) -> str | None:
     return tool_name or None
 
 
+def _qualified_codex_app_session_id(session: CodexAppActiveSession) -> str:
+    """生成不会让本地和不同 SSH host thread id 冲突的 session id。
+
+    入参：``session`` 是本地或远端 App 会话。
+    返回：本地保持原 thread id；远端使用 ``remote-ssh:<host-id>:<thread-id>``。
+    错误处理：模型已保证字段是字符串，本函数不额外抛业务异常。
+    副作用：无。
+    """
+
+    if not session.is_remote:
+        return session.thread_id
+    return f"remote-ssh:{session.execution_host_id}:{session.thread_id}"
+
+
+def _qualified_codex_app_parent_session_id(
+    session: CodexAppActiveSession,
+) -> str | None:
+    """把父 thread id 投影到与子会话一致的 host namespace。
+
+    入参：``session`` 可包含 parent_thread_id。
+    返回：无 parent 时 None；本地返回原 id；远端返回 host-aware id。
+    错误处理：无。
+    副作用：无。
+    """
+
+    if session.parent_thread_id is None:
+        return None
+    if not session.is_remote:
+        return session.parent_thread_id
+    return (
+        f"remote-ssh:{session.execution_host_id}:{session.parent_thread_id}"
+    )
+
+
+def _codex_app_focus_target(session: CodexAppActiveSession) -> str:
+    """生成仍由本机 ChatGPT App action 处理的 host-aware focus target。
+
+    入参：``session`` 是本地或远端 App 会话。
+    返回：以 ``codex-app:`` 开头的目标；远端目标带 host namespace，便于诊断和宠物筛选。
+    错误处理：无。
+    副作用：无；不会尝试切换 ChatGPT App 内部 thread。
+    """
+
+    if not session.is_remote:
+        return f"codex-app:{session.thread_id}" if session.thread_id else "app:ChatGPT"
+    return (
+        f"codex-app:remote-ssh:{session.execution_host_id}:{session.thread_id}"
+    )
+
+
+def _codex_app_session_display_name(session: CodexAppActiveSession) -> str | None:
+    """为远端会话添加主机标签，同时保持本地标题不变。
+
+    入参：``session`` 带可选 title 和 execution_host_label。
+    返回：本地原 title；远端 ``<host> · <title>``。
+    错误处理：无。
+    副作用：无。
+    """
+
+    if not session.is_remote:
+        return session.title
+    host_label = session.execution_host_label or session.execution_host_id
+    title = session.title or "ChatGPT 远端任务"
+    return f"{host_label} · {title}"
+
+
+def _dump_codex_remote_ssh_diagnostic(
+    diagnostic: Mapping[str, Any],
+) -> dict[str, Any]:
+    """把 runtime 内部 SSH host 诊断转换为 JSON-safe 且脱敏的 dict。
+
+    入参：``diagnostic`` 只包含 host 别名、时间、计数、短错误类型和 server user-agent。
+    返回：datetime 已转换为 ISO 字符串的新 dict。
+    错误处理：未知字段被原样复制；调用方保证没有 prompt/raw response。
+    副作用：无；不修改原 mapping。
+    """
+
+    dumped = dict(diagnostic)
+    for key in (
+        "first_success_at",
+        "last_success_at",
+        "last_polled_at",
+        "last_checked_at",
+    ):
+        value = dumped.get(key)
+        if isinstance(value, datetime):
+            dumped[key] = _dump_datetime(value)
+    return dumped
+
+
 async def _poll_codex_app_state_once(
     runtime: _DaemonRuntime,
     event_reader: CodexAppStateEventReader,
@@ -4322,6 +4758,99 @@ async def _poll_codex_app_state_once(
         runtime.mark_codex_app_state_poll_success(polled_at)
     except Exception as exc:  # noqa: BLE001 - poller 必须保护 daemon 主循环。
         runtime.mark_codex_app_state_poll_error(exc, polled_at=polled_at)
+
+
+async def _poll_codex_remote_ssh_once(
+    runtime: _DaemonRuntime,
+    *,
+    observers: dict[str, CodexRemoteSshObserverProtocol],
+    hosts_reader: CodexRemoteSshHostsReader,
+    observer_factory: CodexRemoteSshObserverFactory,
+    stale_after_seconds: float,
+) -> None:
+    """发现并并行读取一次 ChatGPT Settings 当前已启用的 SSH hosts。
+
+    入参：``runtime`` 是 daemon 内存状态；``observers`` 是可动态增删的 observer 映射；
+    ``hosts_reader`` 只能返回 ChatGPT 已管理且 auto-connect=true 的 SSH connection；
+    ``observer_factory`` 为新启用主机创建 observer；``stale_after_seconds`` 控制启用主机
+    持续连接失败后清理旧远端 agent。
+    返回：无。
+    错误处理：发现失败时 fail-closed，关闭全部 observer 并清理状态；单 host 普通异常只写入
+    诊断并继续；task cancellation 正常向上传播。
+    副作用：设置关闭的主机会立即关闭；启用主机通过 ``asyncio.to_thread`` 使用独立 SSH
+    连接，并更新 host-aware agent 状态与渲染。
+    """
+
+    checked_at = datetime.now(UTC)
+    try:
+        discovery = await asyncio.to_thread(hosts_reader)
+    except Exception as exc:  # noqa: BLE001 - 设置不可判定时必须 fail-closed。
+        runtime.mark_codex_remote_ssh_discovery_error(exc, checked_at=checked_at)
+        for host_id, observer in tuple(observers.items()):
+            with suppress(Exception):
+                observer.close()
+            observers.pop(host_id, None)
+            runtime.remove_codex_remote_ssh_host(host_id)
+        return
+
+    runtime.mark_codex_remote_ssh_discovery_success(discovery)
+    enabled_by_host_id = {
+        codex_remote_host_id(enabled_host.alias): enabled_host
+        for enabled_host in discovery.enabled_hosts
+    }
+    for host_id in tuple(observers):
+        if host_id in enabled_by_host_id:
+            continue
+        observer = observers.pop(host_id)
+        with suppress(Exception):
+            observer.close()
+        runtime.remove_codex_remote_ssh_host(host_id)
+    for host_id, enabled_host in enabled_by_host_id.items():
+        if host_id in observers:
+            continue
+        try:
+            observers[host_id] = observer_factory(enabled_host)
+        except Exception as exc:  # noqa: BLE001 - 单主机构造失败不影响其他已启用主机。
+            runtime.mark_codex_remote_ssh_poll_error(
+                host=enabled_host.display_name,
+                host_id=host_id,
+                error=exc,
+                polled_at=discovery.observed_at,
+                stale_after_seconds=stale_after_seconds,
+            )
+
+    if not observers:
+        return
+    observer_items = tuple(observers.items())
+    results = await asyncio.gather(
+        *(
+            asyncio.to_thread(observer.read_snapshot)
+            for _host_id, observer in observer_items
+        ),
+        return_exceptions=True,
+    )
+    polled_at = datetime.now(UTC)
+    for (configured_host_id, observer), result in zip(
+        observer_items,
+        results,
+        strict=True,
+    ):
+        if isinstance(result, Exception):
+            runtime.mark_codex_remote_ssh_poll_error(
+                host=observer.host,
+                host_id=configured_host_id,
+                error=result,
+                polled_at=polled_at,
+                stale_after_seconds=stale_after_seconds,
+            )
+            continue
+        snapshot = result
+        runtime.apply_codex_active_sessions(
+            snapshot.sessions,
+            observed_at=snapshot.observed_at,
+            observation_scope=f"remote-ssh:{snapshot.host_id}",
+        )
+        runtime.mark_codex_remote_ssh_poll_success(snapshot)
 
 
 async def _poll_codex_quota_once(

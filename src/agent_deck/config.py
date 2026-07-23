@@ -116,11 +116,35 @@ class CodexPetConfig(BaseModel):
     motion: CodexPetMotion = CodexPetMotion.AUTO
 
 
+class CodexRemoteSshConfig(BaseModel):
+    """配置经独立 SSH app-server proxy 只读观察远端 ChatGPT App。
+
+    入参：``enabled`` 是 Agent Deck 总开关，默认关闭；主机集合不在本配置重复维护，只读取
+    ChatGPT Settings 已管理且 auto-connect=true 的 SSH connection。``poll_interval_seconds``
+    和 ``timeout_seconds`` 控制设置刷新与单次 RPC；``thread_limit`` 限制远端 state DB 页大小；
+    ``stale_after_seconds`` 控制连接持续失败后何时清理旧状态；
+    ``completed_feedback_seconds`` 控制 active->idle 后的本地完成反馈时长。
+    返回：冻结 Pydantic 模型。
+    错误处理：旧 ``hosts`` 字段、非正时间或越界数量由 Pydantic 拒绝。
+    副作用：模型自身不读取 SSH config、不建立连接、不访问远端。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = False
+    poll_interval_seconds: float = Field(default=5.0, ge=1.0)
+    timeout_seconds: float = Field(default=10.0, ge=1.0)
+    thread_limit: int = Field(default=80, ge=1, le=200)
+    stale_after_seconds: float = Field(default=20.0, gt=0)
+    completed_feedback_seconds: float = Field(default=10.0, ge=0, le=60)
+
+
 class CodexConfig(BaseModel):
     """配置 Agent Deck 对 Codex 专属能力的处理方式。
 
     入参：`permission_request` 控制 sandbox/escalation 审批 hook 的响应策略；`pet`
-    控制只读跟随 Codex 全局宠物选择的硬件展示。
+    控制只读跟随 Codex 全局宠物选择的硬件展示；``remote_ssh`` 控制只跟随 ChatGPT
+    Settings 已启用 SSH Connection 的远端粗粒度任务状态观察。
     返回：frozen Pydantic model。
     错误处理：子配置非法时由 Pydantic 报告。
     副作用：模型自身不读写外部资源。
@@ -132,6 +156,7 @@ class CodexConfig(BaseModel):
         default_factory=CodexPermissionRequestConfig
     )
     pet: CodexPetConfig = Field(default_factory=CodexPetConfig)
+    remote_ssh: CodexRemoteSshConfig = Field(default_factory=CodexRemoteSshConfig)
 
 
 class FocusActionConfig(BaseModel):

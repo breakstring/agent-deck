@@ -12,6 +12,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from agent_deck.adapters.codex_app_state import (
+    CodexAppStateReport,
+    CodexAppThreadSnapshot,
     build_codex_app_state_events,
     scan_codex_app_state,
     select_active_codex_app_sessions,
@@ -450,3 +452,48 @@ def test_select_active_codex_app_sessions_excludes_subagent_threads(
     assert child.parent_thread_id == "parent-thread"
     assert child.is_child_thread is True
     assert [session.thread_id for session in sessions] == ["parent-thread"]
+
+
+def test_select_active_codex_app_sessions_excludes_cli_source(tmp_path: Path) -> None:
+    """验证普通 Codex CLI thread 不会触发 ChatGPT App 任务态覆盖。
+
+    入参：``tmp_path`` 提供一个空 rollout path。
+    返回：无；断言 source=cli 被排除而 source=vscode 被保留。
+    错误处理：无。
+    副作用：只在 pytest 临时目录写空 JSONL。
+    """
+
+    rollout = tmp_path / "thread.jsonl"
+    rollout.write_text("", encoding="utf-8")
+    now_epoch = int(datetime.now(UTC).timestamp())
+    report = CodexAppStateReport(
+        codex_home=str(tmp_path),
+        state_db_path=str(tmp_path / "state.sqlite"),
+        threads=(
+            CodexAppThreadSnapshot(
+                thread_id="cli-thread",
+                title="CLI",
+                cwd="/repo",
+                rollout_path=str(rollout),
+                updated_at=now_epoch,
+                status="observed",
+                thread_source="cli",
+            ),
+            CodexAppThreadSnapshot(
+                thread_id="app-thread",
+                title="ChatGPT",
+                cwd="/repo",
+                rollout_path=str(rollout),
+                updated_at=now_epoch - 1,
+                status="observed",
+                thread_source="vscode",
+            ),
+        ),
+    )
+
+    sessions = select_active_codex_app_sessions(
+        report,
+        now=datetime.fromtimestamp(now_epoch, tz=UTC),
+    )
+
+    assert [session.thread_id for session in sessions] == ["app-thread"]

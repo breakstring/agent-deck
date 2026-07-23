@@ -380,6 +380,20 @@ class AgentStateStore:
 
         return self._states.get(agent_key)
 
+    def remove(self, agent_key: str) -> AgentState | None:
+        """移除一个由外部观察器拥有的 Agent 状态。
+
+        入参：``agent_key`` 是 source/session 派生出的稳定 key；调用方必须只移除自己先前
+        写入并追踪的 key，避免误删 hook 或其他 ingress 的状态。
+        返回：被移除的 ``AgentState``；未知 key 返回 None。
+        错误处理：本方法不主动抛业务异常。
+        副作用：从内存状态和活跃工具计数中删除该 agent；不访问外部 I/O。
+        """
+
+        removed = self._states.pop(agent_key, None)
+        self._active_tools.pop(agent_key, None)
+        return removed
+
     def snapshot(self, now: datetime | None = None) -> list[AgentState]:
         """Return all states sorted by recency with stale agents projected offline.
 
