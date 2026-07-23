@@ -18,6 +18,7 @@ from agent_deck.adapters.codex_pet import (
     CodexPetResolutionStatus,
     CodexPetResolver,
     PetActivity,
+    derive_codex_app_pet_actors,
     derive_pet_activity,
     load_custom_codex_pet,
     resolve_codex_home,
@@ -97,6 +98,7 @@ def _state(
     status_since: datetime,
     source: AgentSource = AgentSource.CODEX,
     child: bool = False,
+    focus_target: str | None = None,
 ) -> AgentState:
     """构造活动优先级测试所需的最小 frozen AgentState。
 
@@ -115,6 +117,7 @@ def _state(
         last_event_at=status_since,
         parent_agent_key="codex:parent" if child else None,
         is_child_agent=child,
+        focus_target=focus_target,
     )
 
 
@@ -491,3 +494,36 @@ def test_global_activity_is_idle_without_active_top_level_codex() -> None:
     assert snapshot.activity == PetActivity.IDLE
     assert snapshot.agent_key is None
     assert snapshot.status_since is None
+
+
+def test_app_actor_extraction_separates_local_remote_and_excludes_cli() -> None:
+    """PETS 群体只消费顶层 ChatGPT App，并提取远端 observer host id。"""
+
+    now = datetime(2026, 7, 23, 8, 0, tzinfo=UTC)
+    actors = derive_codex_app_pet_actors(
+        (
+            _state(
+                key="codex:local",
+                status=AgentStatus.THINKING,
+                status_since=now,
+                focus_target="codex-app:local-thread",
+            ),
+            _state(
+                key="codex:remote",
+                status=AgentStatus.WAITING_USER,
+                status_since=now + timedelta(seconds=1),
+                focus_target="codex-app:remote-ssh:ssh-abcd:remote-thread",
+            ),
+            _state(
+                key="codex:cli",
+                status=AgentStatus.ERROR,
+                status_since=now + timedelta(seconds=2),
+                focus_target="terminal:codex",
+            ),
+        )
+    )
+
+    assert [actor.agent_key for actor in actors] == ["codex:remote", "codex:local"]
+    assert actors[0].is_remote is True
+    assert actors[0].remote_host_key == "ssh-abcd"
+    assert actors[1].is_remote is False

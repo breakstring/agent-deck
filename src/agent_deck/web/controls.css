@@ -168,6 +168,15 @@
   box-shadow: 0 0 0 2px rgba(111, 213, 255, 0.12);
 }
 
+/*
+ * macOS Chromium 的原生下拉菜单可能在暗色页面中仍使用浅色弹层；
+ * 为 option 显式指定浅底深字，避免继承 --text 后出现浅底浅字。
+ */
+.select-input option {
+  background-color: #f7fafc;
+  color: #14202d;
+}
+
 .color-setting {
   display: grid;
   grid-template-columns: 44px minmax(0, 1fr);

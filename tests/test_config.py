@@ -30,6 +30,8 @@ def test_codex_pet_config_defaults_follow_codex_without_pet_id(tmp_path) -> None
     assert config.codex.pet.refresh_interval_seconds == 5.0
     assert config.codex.pet.panel_fps == 8
     assert config.codex.pet.motion == CodexPetMotion.AUTO
+    assert config.codex.pet.remote_pet_source.value == "builtin_random"
+    assert config.codex.pet.patrol_speed.value == "medium"
     assert "pet_id" not in config.codex.pet.model_dump()
 
 
@@ -51,6 +53,8 @@ def test_codex_pet_config_round_trip_and_validation(tmp_path) -> None:
                 "refresh_interval_seconds = 2.5",
                 "panel_fps = 6",
                 'motion = "reduced"',
+                'remote_pet_source = "remote_config"',
+                'patrol_speed = "fast"',
             )
         ),
         encoding="utf-8",
@@ -61,6 +65,8 @@ def test_codex_pet_config_round_trip_and_validation(tmp_path) -> None:
     assert pet.refresh_interval_seconds == 2.5
     assert pet.panel_fps == 6
     assert pet.motion == CodexPetMotion.REDUCED
+    assert pet.remote_pet_source.value == "remote_config"
+    assert pet.patrol_speed.value == "fast"
 
     config_path.write_text('[codex.pet]\nmotion = "unknown"\n', encoding="utf-8")
     with pytest.raises(AgentDeckConfigError, match="motion"):

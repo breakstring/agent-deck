@@ -1,8 +1,9 @@
 """通过 SSH 只读观察远端 ChatGPT/Codex App 的顶层任务状态。
 
 本模块启动一条独立的 ``ssh ... codex app-server proxy`` 子进程，通过代理流上的
-WebSocket/JSON-RPC 连接远端共享 app-server，只调用 ``initialize`` 和
-``thread/list(useStateDbOnly=true)``。返回模型会立即丢弃 thread preview、turn 和 item，
+WebSocket/JSON-RPC 连接远端共享 app-server，只调用 ``initialize``、
+``thread/list(useStateDbOnly=true)``，以及显式启用时的 ``config/read``。配置响应只投影
+``desktop.selected-avatar-id``，返回模型会立即丢弃其余 config、thread preview、turn 和 item，
 不记录 prompt，也不会调用任何创建、恢复、执行、打断或归档方法。观察器可跨轮询复用同一
 SSH 连接；传输失败时只重建自己的连接，不接触 ChatGPT App 已建立的 SSH 会话。
 """
@@ -43,7 +44,7 @@ _MANAGED_CONNECTIONS_KEY: Final[str] = "codex-managed-remote-connections"
 _AUTO_CONNECT_KEY: Final[str] = "remote-connection-auto-connect-by-host-id"
 _REMOTE_SSH_HOST_ID_PREFIX: Final[str] = "remote-ssh-"
 _READ_ONLY_METHODS: Final[frozenset[str]] = frozenset(
-    {"initialize", "initialized", "thread/list"}
+    {"initialize", "initialized", "thread/list", "config/read"}
 )
 
 
@@ -77,6 +78,8 @@ class CodexRemoteSshSnapshot(BaseModel):
     considered_thread_count: int = 0
     status_counts: dict[str, int] = Field(default_factory=dict)
     sessions: tuple[CodexAppActiveSession, ...] = ()
+    selected_avatar_id: str | None = None
+    pet_config_available: bool = False
 
 
 class CodexRemoteSshEnabledHost(BaseModel):
@@ -292,12 +295,43 @@ def build_codex_remote_ssh_command(
     )
 
 
+def _selected_avatar_from_config_read(result: Any) -> tuple[str | None, bool]:
+    """从 config/read 响应中只投影 Desktop App 的宠物选择。
+
+    入参：``result`` 是远端 app-server 的 config/read result。
+    返回：``(selected_avatar_id, available)``；config/desktop 合法即 available=true，
+    未选择宠物时 ID 为 None。
+    错误处理：顶层或 desktop 类型非法时抛 ``CodexRemoteSshError``；非字符串选择按未选择
+    处理，避免把任意配置对象保留进内存。
+    副作用：无；不复制 origins、layers 或其他配置字段。
+    """
+
+    if not isinstance(result, Mapping):
+        raise CodexRemoteSshError("远端 config/read 结果非法")
+    config = result.get("config")
+    if not isinstance(config, Mapping):
+        raise CodexRemoteSshError("远端 config/read 缺少 config object")
+    desktop = config.get("desktop")
+    if desktop is None:
+        return None, True
+    if not isinstance(desktop, Mapping):
+        raise CodexRemoteSshError("远端 config/read 的 desktop 非 object")
+    raw_selected = desktop.get("selected-avatar-id")
+    if not isinstance(raw_selected, str):
+        return None, True
+    selected = raw_selected.strip()
+    if len(selected) > 256:
+        return None, True
+    return (selected or None), True
+
+
 class CodexRemoteSshObserver:
     """复用一条独立 SSH/WebSocket 连接读取远端顶层 ChatGPT App 状态。
 
     入参：``host`` 是 SSH destination；``timeout_seconds`` 控制握手和单次 RPC；
     ``thread_limit`` 控制只读 thread/list 页大小；``completed_feedback_seconds`` 控制
     active->idle 后保留 ``COMPLETED_RECENTLY`` 的本地反馈时间；``process_factory`` 供测试注入。
+    ``read_pet_config`` 为 true 时额外调用一次 ``config/read``，但只保留宠物选择 ID。
     返回：实例通过 ``read_snapshot`` 返回脱敏快照，并可用 ``close`` 释放自己的子进程。
     错误处理：首次连接或协议失败抛 ``CodexRemoteSshError``；读取时先自动重连一次，
     连续失败后按 1、2、4…最多 60 秒退避。
@@ -311,6 +345,7 @@ class CodexRemoteSshObserver:
         timeout_seconds: float = 10.0,
         thread_limit: int = 80,
         completed_feedback_seconds: float = 10.0,
+        read_pet_config: bool = False,
         process_factory: ProcessFactory = subprocess.Popen,
     ) -> None:
         """保存观察器配置；实际 SSH 连接延迟到首次读取。
@@ -332,6 +367,7 @@ class CodexRemoteSshObserver:
         self.timeout_seconds = timeout_seconds
         self.thread_limit = thread_limit
         self.completed_feedback_seconds = completed_feedback_seconds
+        self.read_pet_config = bool(read_pet_config)
         self._process_factory = process_factory
         self._lock = RLock()
         self._process: subprocess.Popen[bytes] | None = None
@@ -344,6 +380,18 @@ class CodexRemoteSshObserver:
         self._completed_until: dict[str, float] = {}
         self._consecutive_failures = 0
         self._retry_not_before_monotonic = 0.0
+
+    def set_read_pet_config(self, enabled: bool) -> None:
+        """动态控制后续轮询是否附带只读 config/read。
+
+        入参：``enabled`` 仅由 PETS 面板远端来源策略驱动。
+        返回：无显式返回。
+        错误处理：无。
+        副作用：只更新本观察器布尔值；不立即发送 RPC、不重连 SSH。
+        """
+
+        with self._lock:
+            self.read_pet_config = bool(enabled)
 
     def read_snapshot(self) -> CodexRemoteSshSnapshot:
         """读取一次远端 thread/list，并立即投影为脱敏状态快照。
@@ -368,6 +416,22 @@ class CodexRemoteSshObserver:
             for _attempt in range(2):
                 try:
                     self._ensure_connected()
+                    selected_avatar_id: str | None = None
+                    pet_config_available = False
+                    if self.read_pet_config:
+                        try:
+                            config_result = self._request(
+                                "config/read",
+                                {"cwd": None, "includeLayers": False},
+                            )
+                            selected_avatar_id, pet_config_available = (
+                                _selected_avatar_from_config_read(config_result)
+                            )
+                        except CodexRemoteSshError:
+                            # 旧版远端 app-server 可能尚不支持 config/read；任务状态
+                            # 观察不能因此失效，runtime 会把宠物素材降级为内置分配。
+                            selected_avatar_id = None
+                            pet_config_available = False
                     result = self._request(
                         "thread/list",
                         {
@@ -380,7 +444,11 @@ class CodexRemoteSshObserver:
                             "useStateDbOnly": True,
                         },
                     )
-                    snapshot = self._snapshot_from_thread_list(result)
+                    snapshot = self._snapshot_from_thread_list(
+                        result,
+                        selected_avatar_id=selected_avatar_id,
+                        pet_config_available=pet_config_available,
+                    )
                     self._consecutive_failures = 0
                     self._retry_not_before_monotonic = 0.0
                     return snapshot
@@ -576,10 +644,17 @@ class CodexRemoteSshObserver:
             raise ValueError(f"RPC notification is not allowed: {method}")
         self._send_json({"method": method, "params": dict(params)})
 
-    def _snapshot_from_thread_list(self, result: Any) -> CodexRemoteSshSnapshot:
+    def _snapshot_from_thread_list(
+        self,
+        result: Any,
+        *,
+        selected_avatar_id: str | None = None,
+        pet_config_available: bool = False,
+    ) -> CodexRemoteSshSnapshot:
         """把 thread/list result 立即缩减为不含 prompt 的安全快照。
 
-        入参：``result`` 是刚收到的 response result；只读取 ``data`` 中的少量 metadata。
+        入参：``result`` 是刚收到的 response result；只读取 ``data`` 中的少量 metadata；
+        宠物字段已经由 config/read 安全投影。
         返回：含状态分布和活动会话的 ``CodexRemoteSshSnapshot``。
         错误处理：result 顶层非法时抛 ``CodexRemoteSshError``；单条 thread 非法时跳过。
         副作用：更新 active->idle 完成反馈的本地过渡表，原始 result 在返回后即可释放。
@@ -606,6 +681,8 @@ class CodexRemoteSshObserver:
             considered_thread_count=len(threads),
             status_counts=counts,
             sessions=sessions,
+            selected_avatar_id=selected_avatar_id,
+            pet_config_available=pet_config_available,
         )
 
     def _sessions_from_threads(

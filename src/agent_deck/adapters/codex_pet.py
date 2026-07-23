@@ -1,9 +1,10 @@
-"""Codex 全局宠物选择与自定义精灵图集的只读适配器。
+"""Codex 全局宠物选择、任务宠物角色与精灵图集的只读适配器。
 
 本模块只读取 ``${CODEX_HOME:-~/.codex}`` 下的 ``config.toml`` 和自定义宠物包，
 将 Codex 的全局选择解析为经过路径边界、图集版本和透明像素校验的内存快照。它不
-修改 Codex 配置、不解析 Desktop App 内置资源、不写入派生图片，也不连接 Agent Deck
-daemon 或硬件。``CodexPetResolver`` 只在能够确认选择 ID 未改变时保留 last-known-good。
+修改 Codex 配置、不写入派生图片，也不连接 Agent Deck daemon 或硬件。Desktop App
+内置资源由独立 catalog 只读发现后复用本模块的图集校验函数；``CodexPetResolver`` 只在
+能够确认选择 ID 未改变时保留 last-known-good。
 """
 
 from __future__ import annotations
@@ -16,10 +17,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path, PureWindowsPath
-from typing import Final
+from typing import Final, Self
 
 from PIL import Image, ImageChops
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agent_deck.core.events import AgentSource
 from agent_deck.core.state import AgentState, AgentStatus
@@ -250,6 +251,70 @@ class PetActivitySnapshot(BaseModel):
         错误处理：无。
         副作用：无。
         """
+
+        return (self.activity, self.status_since)
+
+
+class CodexAppPetActorSnapshot(BaseModel):
+    """描述 PETS 面板中的一个顶层 ChatGPT App 活动任务。
+
+    入参：``agent_key`` 标识任务；``activity``/``status_since`` 驱动动作切换；
+    ``is_remote`` 与 ``remote_host_key`` 只表达远端主机视觉分组，不包含 prompt 或凭据。
+    返回：冻结快照，可安全交给多宠物场景控制器。
+    错误处理：时间必须带时区；本地角色不得携带 remote host，远端角色必须携带。
+    副作用：无；只保存内存状态。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    agent_key: str
+    activity: PetActivity
+    status_since: datetime
+    is_remote: bool = False
+    remote_host_key: str | None = None
+
+    @field_validator("agent_key")
+    @classmethod
+    def _require_actor_key(cls, value: str) -> str:
+        """去除角色 key 空白并拒绝空值。"""
+
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("pet actor agent_key must not be empty")
+        return stripped
+
+    @field_validator("status_since")
+    @classmethod
+    def _require_actor_timezone(cls, value: datetime) -> datetime:
+        """拒绝角色状态时间中的 naive datetime。"""
+
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("pet actor status_since must be timezone-aware")
+        return value
+
+    @field_validator("remote_host_key")
+    @classmethod
+    def _normalize_remote_host_key(cls, value: str | None) -> str | None:
+        """规范化可选远端主机 key，并拒绝空字符串。"""
+
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("remote_host_key must not be empty")
+        return stripped
+
+    @model_validator(mode="after")
+    def _validate_remote_pair(self) -> Self:
+        """保证远端标记与 host key 成对出现。"""
+
+        if self.is_remote != (self.remote_host_key is not None):
+            raise ValueError("remote pet actor must pair is_remote with remote_host_key")
+        return self
+
+    @property
+    def trigger_key(self) -> tuple[PetActivity, datetime]:
+        """返回该角色动作重播去重使用的稳定触发键。"""
 
         return (self.activity, self.status_since)
 
@@ -552,15 +617,9 @@ def load_custom_codex_pet(
     except Exception as exc:
         raise CodexPetLoadError(f"宠物图集无法解码: {type(exc).__name__}") from exc
 
-    expected_width, expected_height, _ = CODEX_PET_VERSION_GEOMETRY[version]
-    if spritesheet.size != (expected_width, expected_height):
-        raise CodexPetLoadError(
-            "宠物图集几何无效: "
-            f"期望 {expected_width}x{expected_height}，实际 {spritesheet.width}x{spritesheet.height}"
-        )
-    normalized, had_residue = _normalize_transparent_rgb(spritesheet)
-    warnings = (
-        ("已将完全透明像素中的非零 RGB 残留归零",) if had_residue else ()
+    normalized, warnings = normalize_codex_pet_spritesheet(
+        spritesheet,
+        sprite_version_number=version,
     )
     return CodexPetAsset(
         selected_avatar_id=selected_id,
@@ -578,6 +637,37 @@ def load_custom_codex_pet(
         ),
         warnings=warnings,
     )
+
+
+def normalize_codex_pet_spritesheet(
+    image: Image.Image,
+    *,
+    sprite_version_number: int,
+) -> tuple[Image.Image, tuple[str, ...]]:
+    """校验并规范化一张 custom 或 Desktop 内置宠物完整图集。
+
+    入参：``image`` 是已解码图片；``sprite_version_number`` 必须是受支持的 v1/v2 合同。
+    返回：固定几何的 RGBA 副本与非阻塞 warning；不会裁 cell 或重新对齐角色。
+    错误处理：未知版本抛 ``CodexPetUnknownVersionError``，几何不符抛 ``CodexPetLoadError``。
+    副作用：只创建内存图像，不修改来源或写文件。
+    """
+
+    geometry = CODEX_PET_VERSION_GEOMETRY.get(sprite_version_number)
+    if geometry is None:
+        raise CodexPetUnknownVersionError(
+            f"不支持 spriteVersionNumber={sprite_version_number}"
+        )
+    expected_width, expected_height, _ = geometry
+    if image.size != (expected_width, expected_height):
+        raise CodexPetLoadError(
+            "宠物图集几何无效: "
+            f"期望 {expected_width}x{expected_height}，实际 {image.width}x{image.height}"
+        )
+    normalized, had_residue = _normalize_transparent_rgb(image)
+    warnings = (
+        ("已将完全透明像素中的非零 RGB 残留归零",) if had_residue else ()
+    )
+    return normalized, warnings
 
 
 def derive_pet_activity(
@@ -679,6 +769,72 @@ def derive_codex_app_pet_activity(
         agent_key=winner.agent_key,
         updated_at=observed_at,
     )
+
+
+def derive_codex_app_pet_actors(
+    states: Iterable[AgentState],
+) -> tuple[CodexAppPetActorSnapshot, ...]:
+    """提取 PETS 面板应独立绘制的顶层 ChatGPT App 活动任务。
+
+    入参：``states`` 是完整 store 快照；只消费 ``codex-app:*`` 顶层 Codex 状态。
+    返回：按介入优先级、状态新鲜度和 agent key 排序的不可变角色快照；idle/offline、CLI、
+    child agent 与普通 App 被排除。``remote-ssh`` target 会提取不含线程 ID 的稳定 host key。
+    错误处理：状态模型已校验时间；无法识别 host 的 target 按本地任务处理。
+    副作用：无；不修改状态、不连接远端。
+    """
+
+    actors: list[CodexAppPetActorSnapshot] = []
+    for state in states:
+        if state.source != AgentSource.CODEX:
+            continue
+        if state.is_child_agent or state.parent_agent_key is not None:
+            continue
+        focus_target = state.focus_target or ""
+        if not (
+            focus_target.startswith("codex-app:")
+            or focus_target in {"app:Codex", "app:ChatGPT"}
+        ):
+            continue
+        activity = _ACTIVITY_BY_STATUS.get(state.status)
+        if activity is None or activity == PetActivity.IDLE:
+            continue
+        remote_host_key = _remote_host_key_from_focus_target(focus_target)
+        actors.append(
+            CodexAppPetActorSnapshot(
+                agent_key=state.agent_key,
+                activity=activity,
+                status_since=state.status_since,
+                is_remote=remote_host_key is not None,
+                remote_host_key=remote_host_key,
+            )
+        )
+    actors.sort(
+        key=lambda actor: (
+            -_CODEX_APP_ACTIVITY_PRIORITY[actor.activity],
+            -actor.status_since.timestamp(),
+            actor.agent_key,
+        )
+    )
+    return tuple(actors)
+
+
+def _remote_host_key_from_focus_target(focus_target: str) -> str | None:
+    """从 remote-ssh App target 中提取不含线程 ID 的稳定主机 key。
+
+    入参：``focus_target`` 是 state scanner 产生的只读 focus target。
+    返回：observer 使用的 ``host-id``；本地、兼容 App target 或结构不完整时返回 None。
+    错误处理：无；未知远端协议不猜测。
+    副作用：无。
+    """
+
+    prefix = "codex-app:remote-ssh:"
+    if not focus_target.startswith(prefix):
+        return None
+    remainder = focus_target.removeprefix(prefix)
+    host_id, separator, _thread_id = remainder.partition(":")
+    if not separator or not host_id:
+        return None
+    return host_id
 
 
 def _validate_pet_folder_name(pet_name: str) -> None:

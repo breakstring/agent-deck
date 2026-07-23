@@ -497,3 +497,50 @@ def test_select_active_codex_app_sessions_excludes_cli_source(tmp_path: Path) ->
     )
 
     assert [session.thread_id for session in sessions] == ["app-thread"]
+
+
+def test_select_active_codex_app_sessions_accepts_new_user_thread_source(
+    tmp_path: Path,
+) -> None:
+    """验证新版 ChatGPT 顶层 ``thread_source=user`` 仍属于本地 App 会话。
+
+    入参：``tmp_path`` 提供最小 rollout。
+    返回：无；断言 user 顶层进入选择，而 subagent/cli 仍不进入。
+    错误处理：无。
+    副作用：只写 pytest 临时空 JSONL。
+    """
+
+    rollout = tmp_path / "thread.jsonl"
+    rollout.write_text("", encoding="utf-8")
+    now_epoch = int(datetime.now(UTC).timestamp())
+    report = CodexAppStateReport(
+        codex_home=str(tmp_path),
+        state_db_path=str(tmp_path / "state.sqlite"),
+        threads=(
+            CodexAppThreadSnapshot(
+                thread_id="app-user-thread",
+                title="ChatGPT 顶层会话",
+                cwd="/repo",
+                rollout_path=str(rollout),
+                updated_at=now_epoch,
+                status="observed",
+                thread_source="user",
+            ),
+            CodexAppThreadSnapshot(
+                thread_id="cli-thread",
+                title="CLI",
+                cwd="/repo",
+                rollout_path=str(rollout),
+                updated_at=now_epoch - 1,
+                status="observed",
+                thread_source="cli",
+            ),
+        ),
+    )
+
+    sessions = select_active_codex_app_sessions(
+        report,
+        now=datetime.fromtimestamp(now_epoch, tz=UTC),
+    )
+
+    assert [session.thread_id for session in sessions] == ["app-user-thread"]

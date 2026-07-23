@@ -69,6 +69,9 @@ from agent_deck.rendering.quota_touchscreen import render_quota_touchscreen
 from agent_deck.rendering.visuals import resolve_visual_icon_spec
 from agent_deck.server.app import DaemonPollerConfig, create_app
 from agent_deck.server.key_layout_store import resolve_n4pro_key_layout_path
+from agent_deck.server.pets_panel_settings_store import (
+    resolve_n4pro_pets_panel_settings_path,
+)
 from agent_deck.server.rotary_layout_store import resolve_n4pro_rotary_layout_path
 from agent_deck.server.quota_presentation_store import resolve_quota_presentation_path
 
@@ -347,6 +350,8 @@ def daemon_callback(
         ),
         codex_pet_panel_fps=local_config.codex.pet.panel_fps,
         codex_pet_motion=local_config.codex.pet.motion,
+        codex_pet_remote_pet_source=local_config.codex.pet.remote_pet_source,
+        codex_pet_patrol_speed=local_config.codex.pet.patrol_speed,
         streamdock_quota_touchscreen_enabled=(
             not disable_streamdock_quota_touchscreen
             and not hardware_renderer.enabled
@@ -365,6 +370,7 @@ def daemon_callback(
             poller_config=poller_config,
             key_layout_path=resolve_n4pro_key_layout_path(),
             rotary_layout_path=resolve_n4pro_rotary_layout_path(),
+            pets_panel_settings_path=resolve_n4pro_pets_panel_settings_path(),
             quota_presentation_path=resolve_quota_presentation_path(),
         ),
         host=host,

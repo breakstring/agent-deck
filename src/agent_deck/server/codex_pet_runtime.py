@@ -1,13 +1,13 @@
-"""Codex 宠物在 daemon 内的线程安全展示协调器。
+"""Codex 单 Key、App 覆盖与多任务 PETS 面板的线程安全展示协调器。
 
-本模块组合只读资产 resolver、顶层 Agent 状态聚合、绝对时间场景控制器和临时 Key
-缓存，为 FastAPI runtime 与现有 N4 Pro persistent animator 提供原子快照。它不创建
-HID 会话、不启动刷新线程、不修改 Codex 配置，也不持久化宠物选择；调用方负责安排
-资产轮询、把返回 revision 合并进全局 surface，并在退出时清理由其创建的临时目录。
+本模块组合 custom resolver、ChatGPT 内置宠物 catalog、顶层 Agent 状态、独立/群体场景
+控制器和临时 Key 缓存，为 FastAPI runtime 与 N4 Pro persistent animator 提供原子快照。
+它不创建 HID 会话、不修改 Codex 配置，也不持久化宠物选择或解包内置素材。
 """
 
 from __future__ import annotations
 
+import hashlib
 import platform
 import subprocess
 import time
@@ -19,14 +19,30 @@ from typing import Any, Final
 
 from PIL import Image
 
+from agent_deck.adapters.codex_builtin_pets import (
+    CodexBuiltinPetCatalog,
+    CodexBuiltinPetDescriptor,
+    CodexBuiltinPetCatalogSnapshot,
+    CodexBuiltinPetCatalogStatus,
+)
 from agent_deck.adapters.codex_pet import (
+    CodexAppPetActorSnapshot,
+    CodexPetAsset,
     CodexPetResolution,
     CodexPetResolver,
     PetActivitySnapshot,
     derive_codex_app_pet_activity,
+    derive_codex_app_pet_actors,
     derive_pet_activity,
 )
-from agent_deck.config import CodexPetMotion
+from agent_deck.adapters.codex_remote_pet_mirror import (
+    CodexRemotePetMirrorResolution,
+    CodexRemotePetMirrorStatus,
+)
+from agent_deck.config import (
+    CodexPetMotion,
+    CodexRemotePetSource,
+)
 from agent_deck.core.state import AgentState
 from agent_deck.rendering.codex_pet import (
     CodexAppPetOverlayController,
@@ -36,7 +52,13 @@ from agent_deck.rendering.codex_pet import (
     pre_render_pet_key_frames,
     render_pet_panel_image,
 )
+from agent_deck.rendering.codex_pet_colony import (
+    PetColonyController,
+    PetColonyRenderActor,
+    render_pet_colony_panel,
+)
 from agent_deck.rendering.n4pro_panel import compose_n4pro_background
+from agent_deck.server.pets_panel_settings_store import N4ProPetsPanelSettings
 
 ReducedMotionReader = Callable[[], bool]
 """返回 macOS 当前是否启用 Reduce Motion 的可注入只读函数。"""
@@ -68,7 +90,9 @@ class CodexPetRuntime:
         motion: CodexPetMotion,
         cache_root: Path,
         fallback_key_path: Path | None,
+        panel_settings: N4ProPetsPanelSettings | None = None,
         resolver: CodexPetResolver | None = None,
+        builtin_catalog: CodexBuiltinPetCatalog | None = None,
         reduced_motion_reader: ReducedMotionReader | None = None,
         started_at_monotonic: float | None = None,
     ) -> None:
@@ -89,6 +113,8 @@ class CodexPetRuntime:
         self._cache_root = cache_root
         self._fallback_key_path = fallback_key_path
         self._resolver = resolver or CodexPetResolver()
+        self._builtin_catalog = builtin_catalog or CodexBuiltinPetCatalog()
+        self._panel_settings = panel_settings or N4ProPetsPanelSettings()
         reduced_motion, effective_motion, motion_error = resolve_codex_pet_motion(
             motion,
             reader=reduced_motion_reader,
@@ -104,10 +130,26 @@ class CodexPetRuntime:
             reduced_motion=reduced_motion,
             started_at_monotonic=started_at_monotonic,
         )
+        self._colony_controller = PetColonyController(
+            reduced_motion=reduced_motion,
+            patrol_speed=self._panel_settings.patrol_speed,
+            started_at_monotonic=started_at_monotonic,
+        )
         self._lock = RLock()
         self._resolution: CodexPetResolution | None = None
+        self._builtin_catalog_snapshot: CodexBuiltinPetCatalogSnapshot | None = None
         self._activity = derive_pet_activity(())
         self._app_activity = derive_codex_app_pet_activity(())
+        self._panel_actors: tuple[CodexAppPetActorSnapshot, ...] = ()
+        self._panel_actor_assignments: dict[str, str] = {}
+        self._panel_actor_assets: dict[str, CodexPetAsset] = {}
+        self._panel_actor_asset_errors: tuple[str, ...] = ()
+        self._remote_selected_avatar_ids: dict[str, str | None] = {}
+        self._remote_pet_config_available: dict[str, bool] = {}
+        self._remote_custom_pet_resolutions: dict[
+            str, CodexRemotePetMirrorResolution
+        ] = {}
+        self._panel_collision_count = 0
         self._key_frames: dict[str, tuple[Path, ...]] = {}
         self._key_asset_fingerprint: str | None = None
         self._last_error: str | None = None
@@ -143,6 +185,22 @@ class CodexPetRuntime:
 
         return self._enabled
 
+    @property
+    def reads_remote_pet_config(self) -> bool:
+        """返回当前面板策略是否需要远端 config/read。
+
+        入参：无。
+        返回：仅 ``remote_config`` 策略为 True。
+        错误处理：无。
+        副作用：无；不连接远端。
+        """
+
+        with self._lock:
+            return (
+                self._panel_settings.remote_pet_source
+                == CodexRemotePetSource.REMOTE_CONFIG
+            )
+
     def refresh(self, *, now: datetime | None = None) -> CodexPetResolution | None:
         """重新读取 Codex 全局选择，并按素材指纹更新临时 Key 缓存。
 
@@ -156,10 +214,14 @@ class CodexPetRuntime:
         if not self._enabled:
             return None
         resolved_at = now or datetime.now(UTC)
+        catalog_snapshot = self._builtin_catalog.resolve(now=resolved_at)
+        with self._lock:
+            self._builtin_catalog_snapshot = catalog_snapshot
         try:
             resolution = self._resolver.resolve(now=resolved_at)
         except Exception as exc:  # noqa: BLE001 - 第三方图片解码不能终止 daemon。
             self.mark_refresh_error(exc, updated_at=resolved_at)
+            self._refresh_panel_actor_assets()
             return None
 
         new_frames: dict[str, tuple[Path, ...]] | None = None
@@ -199,7 +261,8 @@ class CodexPetRuntime:
             elif cache_error is not None and (selection_changed or fingerprint_changed):
                 self._key_frames = {}
                 self._key_asset_fingerprint = None
-            return resolution
+        self._refresh_panel_actor_assets()
+        return resolution
 
     def mark_refresh_error(self, error: Exception, *, updated_at: datetime) -> None:
         """记录 resolver 未建模异常但不清除同选择的最近成功画面。
@@ -234,14 +297,223 @@ class CodexPetRuntime:
             state_snapshot,
             updated_at=updated_at,
         )
+        actors = derive_codex_app_pet_actors(state_snapshot)
         with self._lock:
             self._activity = snapshot
             self._app_activity = app_snapshot
+            self._panel_actors = actors
             self._app_overlay_diagnostics = {
                 **self._app_overlay_diagnostics,
                 "activity": app_snapshot.activity.value,
             }
+        self._refresh_panel_actor_assets()
         return snapshot
+
+    def update_panel_settings(self, settings: N4ProPetsPanelSettings) -> None:
+        """应用 PETS 面板展示设置并重算角色素材分配。
+
+        入参：``settings`` 已由 Pydantic/API 校验。
+        返回：无显式返回。
+        错误处理：内置素材按需加载失败会进入角色诊断，不阻断设置保存。
+        副作用：更新内存设置与控制器速度档位，可能按需读取已发现的 ASAR 内置图集；不写配置。
+        """
+
+        with self._lock:
+            self._panel_settings = settings
+            self._colony_controller.set_patrol_speed(settings.patrol_speed)
+            if settings.remote_pet_source != CodexRemotePetSource.REMOTE_CONFIG:
+                self._remote_custom_pet_resolutions.clear()
+            self._panel_visual_key = None
+            self._panel_semantic_key = None
+        self._refresh_panel_actor_assets()
+
+    def update_remote_pet_selection(
+        self,
+        host_key: str,
+        *,
+        selected_avatar_id: str | None,
+        config_available: bool,
+    ) -> None:
+        """保存一个已启用远端 host 的最小宠物配置投影。
+
+        入参：``host_key`` 是 observer 的不可逆 host id；``selected_avatar_id`` 是可空选择；
+        ``config_available`` 表示远端支持且成功返回 config/read。
+        返回：无显式返回。
+        错误处理：空 host key 抛 ValueError。
+        副作用：只替换该 host 的两项内存投影并重算角色资产，不保存完整远端配置。
+        """
+
+        normalized = host_key.strip()
+        if not normalized:
+            raise ValueError("remote pet host key must not be empty")
+        with self._lock:
+            self._remote_selected_avatar_ids[normalized] = selected_avatar_id
+            self._remote_pet_config_available[normalized] = bool(config_available)
+        self._refresh_panel_actor_assets()
+
+    def update_remote_custom_pet_resolution(
+        self,
+        host_key: str,
+        resolution: CodexRemotePetMirrorResolution | None,
+    ) -> None:
+        """保存或清除一个远端 host 的受限 custom 宠物镜像结果。
+
+        入参：``host_key`` 是 observer 不可逆 host id；``resolution`` 必须归属同一 host，
+        传 None 表示当前策略/选择不需要 custom 资产。
+        返回：无显式返回。
+        错误处理：空 key 或 resolution host 不匹配时抛 ValueError。
+        副作用：只更新内存引用并重算 PETS 角色素材；不联网、不读写缓存或硬件。
+        """
+
+        normalized = host_key.strip()
+        if not normalized:
+            raise ValueError("remote custom pet host key must not be empty")
+        if resolution is not None and resolution.host_id != normalized:
+            raise ValueError("remote custom pet resolution host mismatch")
+        with self._lock:
+            if resolution is None:
+                self._remote_custom_pet_resolutions.pop(normalized, None)
+            else:
+                self._remote_custom_pet_resolutions[normalized] = resolution
+        self._refresh_panel_actor_assets()
+
+    def remove_remote_pet_selection(self, host_key: str) -> None:
+        """移除不再启用远端 host 的宠物配置投影。
+
+        入参：``host_key`` 是 observer host id。
+        返回：无显式返回。
+        错误处理：未知 key 是幂等 no-op。
+        副作用：删除两项内存记录并重算活动角色素材。
+        """
+
+        with self._lock:
+            self._remote_selected_avatar_ids.pop(host_key, None)
+            self._remote_pet_config_available.pop(host_key, None)
+            self._remote_custom_pet_resolutions.pop(host_key, None)
+        self._refresh_panel_actor_assets()
+
+    def _refresh_panel_actor_assets(self) -> None:
+        """按当前策略为全部活动角色解析素材并原子替换分配。
+
+        入参：无；读取当前角色、本机选择、远端最小配置投影和内置 catalog snapshot。
+        返回：无显式返回。
+        错误处理：单只内置图集加载失败只进入短诊断，其余角色继续；远端 custom 仅使用
+        poller 已安全镜像并校验的同 ID 资产，否则稳定降级为内置随机。
+        副作用：可能按需从本机 ChatGPT app.asar 读取被使用的 WebP，并裁剪 catalog 内存缓存。
+        """
+
+        with self._lock:
+            actors = self._panel_actors
+            settings = self._panel_settings
+            resolution = self._resolution
+            catalog_snapshot = self._builtin_catalog_snapshot
+            remote_selected = dict(self._remote_selected_avatar_ids)
+            remote_available = dict(self._remote_pet_config_available)
+            remote_custom = dict(self._remote_custom_pet_resolutions)
+        descriptors = (
+            catalog_snapshot.descriptor_by_id
+            if catalog_snapshot is not None
+            and catalog_snapshot.status == CodexBuiltinPetCatalogStatus.LOADED
+            else {}
+        )
+        local_asset = resolution.asset if resolution is not None else None
+        local_selected = (
+            resolution.selected_avatar_id if resolution is not None else None
+        )
+        assets: dict[str, CodexPetAsset] = {}
+        assignments: dict[str, str] = {}
+        loaded_builtin_ids: set[str] = set()
+        errors: list[str] = []
+
+        def load_builtin(asset_id: str) -> CodexPetAsset | None:
+            """按 ID 从当前 catalog 加载一只内置宠物并收敛错误。"""
+
+            descriptor = descriptors.get(asset_id)
+            if descriptor is None:
+                return None
+            try:
+                asset = self._builtin_catalog.load_asset(descriptor)
+            except Exception as exc:  # noqa: BLE001 - 单素材失败不得清空全场。
+                errors.append(_short_error(f"内置宠物 {asset_id} 加载失败", exc))
+                return None
+            loaded_builtin_ids.add(asset_id)
+            return asset
+
+        for actor in actors:
+            chosen_asset: CodexPetAsset | None = None
+            assignment = "unavailable"
+            if not actor.is_remote:
+                chosen_asset, assignment = _local_actor_asset(
+                    actor,
+                    local_asset=local_asset,
+                    local_selected=local_selected,
+                    descriptors=descriptors,
+                    load_builtin=load_builtin,
+                )
+            elif settings.remote_pet_source == CodexRemotePetSource.FOLLOW_LOCAL:
+                chosen_asset, assignment = _local_actor_asset(
+                    actor,
+                    local_asset=local_asset,
+                    local_selected=local_selected,
+                    descriptors=descriptors,
+                    load_builtin=load_builtin,
+                )
+                assignment = f"follow_local:{assignment}"
+            elif settings.remote_pet_source == CodexRemotePetSource.REMOTE_CONFIG:
+                host_key = actor.remote_host_key or ""
+                selected = remote_selected.get(host_key)
+                builtin_id = _selected_builtin_id(selected, descriptors)
+                if remote_available.get(host_key, False) and builtin_id is not None:
+                    chosen_asset = load_builtin(builtin_id)
+                    assignment = f"remote_config:builtin:{builtin_id}"
+                if (
+                    chosen_asset is None
+                    and remote_available.get(host_key, False)
+                    and selected is not None
+                    and selected.startswith("custom:")
+                ):
+                    custom_resolution = remote_custom.get(host_key)
+                    if (
+                        custom_resolution is not None
+                        and custom_resolution.selected_avatar_id == selected
+                        and custom_resolution.asset is not None
+                    ):
+                        chosen_asset = custom_resolution.asset
+                        assignment = (
+                            "remote_config:custom:"
+                            f"{custom_resolution.status.value}"
+                        )
+                if chosen_asset is None:
+                    fallback_id = _stable_builtin_id(actor.agent_key, descriptors)
+                    if fallback_id is not None:
+                        chosen_asset = load_builtin(fallback_id)
+                        reason = (
+                            "custom_fallback"
+                            if selected and selected.startswith("custom:")
+                            else "unavailable_fallback"
+                        )
+                        assignment = f"remote_config:{reason}:{fallback_id}"
+            else:
+                builtin_id = _stable_builtin_id(actor.agent_key, descriptors)
+                if builtin_id is not None:
+                    chosen_asset = load_builtin(builtin_id)
+                    assignment = f"builtin_random:{builtin_id}"
+            assignments[actor.agent_key] = assignment
+            if chosen_asset is not None:
+                assets[actor.agent_key] = chosen_asset
+
+        self._builtin_catalog.retain_assets(loaded_builtin_ids)
+        actor_keys = tuple(actor.agent_key for actor in actors)
+        with self._lock:
+            if actor_keys != tuple(actor.agent_key for actor in self._panel_actors):
+                return
+            if settings != self._panel_settings:
+                return
+            self._panel_actor_assignments = assignments
+            self._panel_actor_assets = assets
+            self._panel_actor_asset_errors = tuple(errors[:8])
+            self._panel_visual_key = None
+            self._panel_semantic_key = None
 
     def record_app_overlay_key_press(
         self,
@@ -453,6 +725,83 @@ class CodexPetRuntime:
 
         with self._lock:
             sampled_at = time.monotonic() if monotonic_seconds is None else monotonic_seconds
+            if self._panel_actors:
+                colony_sample = self._colony_controller.sample(
+                    self._panel_actors,
+                    monotonic_seconds=sampled_at,
+                )
+                render_actors = tuple(
+                    PetColonyRenderActor(
+                        asset=self._panel_actor_assets[sample.agent_key],
+                        sample=sample,
+                    )
+                    for sample in colony_sample.actors
+                    if sample.agent_key in self._panel_actor_assets
+                )
+                if render_actors:
+                    asset_fingerprints = tuple(
+                        (
+                            actor.sample.agent_key,
+                            actor.asset.source_fingerprint,
+                            self._panel_actor_assignments.get(actor.sample.agent_key),
+                        )
+                        for actor in render_actors
+                    )
+                    visual_key = (
+                        "colony",
+                        asset_fingerprints,
+                        colony_sample.visual_key,
+                        self._effective_motion,
+                        self._panel_settings.patrol_speed.value,
+                    )
+                    semantic_key = (
+                        "colony",
+                        asset_fingerprints,
+                        tuple(
+                            (
+                                actor.agent_key,
+                                actor.activity.value,
+                                actor.status_since,
+                            )
+                            for actor in self._panel_actors
+                        ),
+                    )
+                    if (
+                        visual_key == self._panel_visual_key
+                        and self._panel_image is not None
+                    ):
+                        return self._panel_revision, self._panel_image
+                    render_bucket = int(sampled_at * self._panel_fps)
+                    rate_limited = (
+                        render_bucket == self._panel_render_bucket
+                        and semantic_key == self._panel_semantic_key
+                    )
+                    if rate_limited and self._panel_image is not None:
+                        return self._panel_revision, self._panel_image
+                    panel = render_pet_colony_panel(render_actors)
+                    self._panel_image = compose_n4pro_background(panel)
+                    self._panel_visual_key = visual_key
+                    self._panel_semantic_key = semantic_key
+                    self._panel_render_bucket = render_bucket
+                    self._panel_collision_count = colony_sample.collision_count
+                    self._panel_revision += 1
+                    return self._panel_revision, self._panel_image
+                if colony_sample.actors:
+                    return self._panel_revision, None
+                visual_key = (
+                    "colony-empty",
+                    tuple(actor.agent_key for actor in self._panel_actors),
+                )
+                if visual_key != self._panel_visual_key or self._panel_image is None:
+                    self._panel_image = compose_n4pro_background(
+                        render_pet_colony_panel(())
+                    )
+                    self._panel_visual_key = visual_key
+                    self._panel_semantic_key = visual_key
+                    self._panel_render_bucket = int(sampled_at * self._panel_fps)
+                    self._panel_collision_count = colony_sample.collision_count
+                    self._panel_revision += 1
+                return self._panel_revision, self._panel_image
             sample = self._controller.sample(
                 self._activity,
                 monotonic_seconds=sampled_at,
@@ -507,6 +856,13 @@ class CodexPetRuntime:
             if last_error is None and resolution is not None:
                 last_error = resolution.error
             warnings = resolution.warnings if resolution is not None else ()
+            catalog = self._builtin_catalog_snapshot
+            remote_actor_count = sum(
+                1 for actor in self._panel_actors if actor.is_remote
+            )
+            remote_custom_resolutions = tuple(
+                self._remote_custom_pet_resolutions.values()
+            )
             return {
                 "enabled": self._enabled,
                 "selected_avatar_id": (
@@ -525,6 +881,43 @@ class CodexPetRuntime:
                 ),
                 "activity": self._activity.activity.value,
                 "app_overlay": dict(self._app_overlay_diagnostics),
+                "panel_colony": {
+                    "actor_count": len(self._panel_actors),
+                    "remote_actor_count": remote_actor_count,
+                    "renderable_actor_count": len(self._panel_actor_assets),
+                    "remote_pet_source": (
+                        self._panel_settings.remote_pet_source.value
+                    ),
+                    "patrol_speed": self._panel_settings.patrol_speed.value,
+                    "collision_count": self._panel_collision_count,
+                    "assignments": dict(self._panel_actor_assignments),
+                    "asset_errors": list(self._panel_actor_asset_errors),
+                    "builtin_catalog_status": (
+                        catalog.status.value if catalog is not None else "not_polled"
+                    ),
+                    "builtin_pet_count": (
+                        len(catalog.descriptors) if catalog is not None else 0
+                    ),
+                    "remote_config_host_count": len(
+                        self._remote_selected_avatar_ids
+                    ),
+                    "remote_config_available_host_count": sum(
+                        self._remote_pet_config_available.values()
+                    ),
+                    "remote_custom_asset_count": sum(
+                        resolution.asset is not None
+                        for resolution in remote_custom_resolutions
+                    ),
+                    "remote_custom_stale_count": sum(
+                        resolution.status == CodexRemotePetMirrorStatus.STALE
+                        for resolution in remote_custom_resolutions
+                    ),
+                    "remote_custom_errors": {
+                        resolution.host_id: resolution.error
+                        for resolution in remote_custom_resolutions
+                        if resolution.error is not None
+                    },
+                },
                 "motion": self._motion.value,
                 "effective_motion": self._effective_motion,
                 "updated_at": (
@@ -550,6 +943,71 @@ class CodexPetRuntime:
         error = diagnostics["last_error"]
         lines = (str(error),) if error else ("Select a custom Codex pet to animate here.",)
         return "Codex Pet", f"{selected} · {status}", lines
+
+
+def _local_actor_asset(
+    actor: CodexAppPetActorSnapshot,
+    *,
+    local_asset: CodexPetAsset | None,
+    local_selected: str | None,
+    descriptors: dict[str, CodexBuiltinPetDescriptor],
+    load_builtin: Callable[[str], CodexPetAsset | None],
+) -> tuple[CodexPetAsset | None, str]:
+    """为本地或 follow-local 角色选择本机宠物素材。
+
+    入参：角色、已解析 custom 资产、本机选择 ID、内置 descriptor 和按需加载函数。
+    返回：``(asset, assignment label)``；无本机可用选择时稳定回退内置系统宠物。
+    错误处理：加载错误由注入函数收敛为 None。
+    副作用：可能通过 ``load_builtin`` 读取一个 ASAR WebP。
+    """
+
+    if local_asset is not None:
+        return local_asset, f"local:{local_asset.selected_avatar_id}"
+    builtin_id = _selected_builtin_id(local_selected, descriptors)
+    if builtin_id is None:
+        builtin_id = _stable_builtin_id(actor.agent_key, descriptors)
+    if builtin_id is None:
+        return None, "local:unavailable"
+    return load_builtin(builtin_id), f"local:builtin:{builtin_id}"
+
+
+def _selected_builtin_id(
+    selected_avatar_id: str | None,
+    descriptors: dict[str, CodexBuiltinPetDescriptor],
+) -> str | None:
+    """把 App 选择 ID 映射为当前本机 catalog 中的内置 ID。
+
+    入参：可空选择和 descriptor 字典。
+    返回：识别 ``builtin:<id>`` 或直接 ID 且 catalog 存在时返回 ID，否则 None。
+    错误处理：无。
+    副作用：无。
+    """
+
+    if not selected_avatar_id:
+        return None
+    candidate = selected_avatar_id.strip()
+    if candidate.startswith("builtin:"):
+        candidate = candidate.removeprefix("builtin:")
+    return candidate if candidate in descriptors else None
+
+
+def _stable_builtin_id(
+    stable_key: str,
+    descriptors: dict[str, CodexBuiltinPetDescriptor],
+) -> str | None:
+    """按角色 key 从当前内置 catalog 做跨帧稳定分配。
+
+    入参：``stable_key`` 通常为 agent key；``descriptors`` 按 catalog 稳定顺序构造。
+    返回：无 descriptor 时 None，否则返回一个内置 ID。
+    错误处理：无。
+    副作用：无；只计算 BLAKE2 摘要。
+    """
+
+    asset_ids = tuple(descriptors)
+    if not asset_ids:
+        return None
+    digest = hashlib.blake2b(stable_key.encode("utf-8"), digest_size=8).digest()
+    return asset_ids[int.from_bytes(digest, "big") % len(asset_ids)]
 
 
 def resolve_codex_pet_motion(

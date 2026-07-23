@@ -31,6 +31,8 @@ DEFAULT_ACTIVE_SESSION_EXCLUDE_PATTERNS: tuple[str, ...] = (
     "codex-a-b-c",
     "smoke",
 )
+_APP_TOP_LEVEL_THREAD_SOURCES = frozenset({None, "vscode", "user"})
+"""ChatGPT App 顶层 rollout metadata 的兼容来源；SQLite 查询仍严格限定 source=vscode。"""
 
 
 class CodexUserInputRequest(BaseModel):
@@ -201,7 +203,8 @@ def select_active_codex_app_sessions(
     入参：`report` 是只读扫描结果；`now` 默认当前 UTC，用于计算最近窗口；
     `active_window_seconds` 是 thread `updated_at` 距当前时间的最大秒数，默认 1 小时；
     `max_sessions` 是最多返回数量，N4 Pro 默认 10 个主按键槽；`exclude_patterns` 是
-    在 title/cwd/rollout_path 中命中即排除的大小写不敏感子串。
+    在 title/cwd/rollout_path 中命中即排除的大小写不敏感子串；SQLite 已先限定
+    ``source=vscode``，rollout metadata 兼容旧 ``vscode`` 与新版顶层 ``user``。
     返回：按 `updated_at` 倒序排列的顶层 `CodexAppActiveSession` 元组。
     错误处理：窗口或数量非正数时抛 `ValueError`；缺失 `updated_at` 的 thread 被跳过。
     副作用：可能只读解析每个候选 thread 的 rollout JSONL 以推断状态；不写文件、不访问网络。
@@ -224,7 +227,7 @@ def select_active_codex_app_sessions(
     for thread in report.threads:
         if thread.updated_at is None or thread.updated_at < cutoff_epoch:
             continue
-        if thread.thread_source not in {None, "vscode"}:
+        if thread.thread_source not in _APP_TOP_LEVEL_THREAD_SOURCES:
             continue
         if thread.is_child_thread:
             continue

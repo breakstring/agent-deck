@@ -835,18 +835,22 @@ def test_permission_request_deny_mode_returns_configured_deny(
     }
 
 
-def test_daemon_callback_calls_uvicorn_run(monkeypatch: Any) -> None:
+def test_daemon_callback_calls_uvicorn_run(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
     """Verify bare `agent-deckd` starts uvicorn with Codex poller defaults.
 
-    入参：`monkeypatch` 替换 `uvicorn.run` 与 `create_app`。
+    入参：`monkeypatch` 替换工作目录、`uvicorn.run` 与 `create_app`；`tmp_path` 提供无项目配置的目录。
     返回：无返回值；断言通过代表 callback 使用默认 host/port，并启用状态与 quota poller。
     错误处理：命令失败、uvicorn 参数或 poller 配置不匹配时由 pytest 报告。
-    副作用：只写入测试内存记录，不打开真实 socket。
+    副作用：临时切换测试进程工作目录并写入内存记录，不打开真实 socket。
     """
 
     uvicorn_calls: list[dict[str, Any]] = []
     create_app_calls: list[dict[str, Any]] = []
     fake_app = object()
+    monkeypatch.chdir(tmp_path)
 
     def fake_create_app(**kwargs: Any) -> object:
         """捕获 daemon callback 传给 app factory 的配置。

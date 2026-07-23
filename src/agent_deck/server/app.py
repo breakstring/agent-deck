@@ -2,11 +2,10 @@
 
 This module wires the MVP in-memory runtime for normalized events, approval
 decisions, layout planning, optional Codex pollers, a fake hardware surface, and
-optional real N4 Pro render sinks. It deliberately does not bind sockets, install
-hooks, write user configuration, or persist state; callers such as CLI entry
-points are responsible for hosting the returned ASGI app and choosing whether
-Codex local-state/quota polling, ChatGPT Settings-gated read-only SSH Remote
-observation, or real StreamDock rendering is enabled.
+optional real N4 Pro render sinks. It deliberately does not bind sockets or install
+hooks. 当调用方提供用户级路径时，配置路由可持久化 N4 Pro key、rotary 和 PETS 设置；
+CLI entry point 负责 hosting，并决定是否启用 Codex local-state/quota polling、
+ChatGPT Settings-gated read-only SSH Remote observation 与真实 StreamDock rendering。
 """
 
 from __future__ import annotations
@@ -83,6 +82,10 @@ from agent_deck.adapters.codex_remote_ssh import (
     codex_remote_host_id,
     discover_enabled_codex_remote_ssh_hosts,
 )
+from agent_deck.adapters.codex_remote_pet_mirror import (
+    CodexRemotePetMirror,
+    CodexRemotePetMirrorResolution,
+)
 from agent_deck.adapters.codex_pet import CodexPetResolver
 from agent_deck.adapters.codex_tokens import (
     CodexTokenPeriod,
@@ -98,7 +101,11 @@ from agent_deck.core.decisions import (
 from agent_deck.core.events import AgentSource, EventType, NormalizedEvent
 from agent_deck.core.modes import DeckSelection
 from agent_deck.core.state import AgentState, AgentStateStore
-from agent_deck.config import CodexPetMotion
+from agent_deck.config import (
+    CodexPetMotion,
+    CodexPetPatrolSpeed,
+    CodexRemotePetSource,
+)
 from agent_deck.hardware.fake import FakeHardwareSurface, HardwareInput
 from agent_deck.hardware.capabilities import get_device_profile
 from agent_deck.hardware.streamdock_n4pro import (
@@ -186,6 +193,12 @@ from agent_deck.server.quota_presentation_store import (
     load_quota_presentation,
 )
 from agent_deck.server.codex_pet_runtime import CodexPetRuntime, ReducedMotionReader
+from agent_deck.server.pets_panel_settings_store import (
+    N4ProPetsPanelSettings,
+    PetsPanelSettingsStoreError,
+    load_n4pro_pets_panel_settings,
+    save_n4pro_pets_panel_settings,
+)
 
 CodexAppStateEventReader = Callable[[], tuple[NormalizedEvent, ...]]
 CodexAppActiveSessionsReader = Callable[..., tuple[CodexAppActiveSession, ...]]
@@ -233,6 +246,34 @@ class CodexRemoteSshObserverProtocol(Protocol):
         返回：无。
         错误处理：实现应 best-effort，避免阻断 daemon shutdown。
         副作用：只关闭 observer 自己创建的连接和子进程。
+        """
+
+        ...
+
+
+class CodexRemotePetMirrorProtocol(Protocol):
+    """定义 daemon poller 所需的远端 custom 宠物镜像接口。
+
+    入参：实现接收已启用 Connection 的 alias、observer host id 和 config/read 选择。
+    返回：经过完整校验或安全降级的镜像结果。
+    错误处理：生产实现收敛 I/O 错误；测试 fake 可抛异常以验证 poller 隔离。
+    副作用：协议自身无副作用，生产实现可只读 SFTP 并写 Agent Deck 自有缓存。
+    """
+
+    def resolve(
+        self,
+        *,
+        host: str,
+        host_id: str,
+        selected_avatar_id: str | None,
+        now: datetime | None = None,
+    ) -> CodexRemotePetMirrorResolution:
+        """解析一个已启用 host 当前选择的 custom 宠物。
+
+        入参：host/host_id/selection 由成功 observer snapshot 和 discovery 共同提供。
+        返回：冻结镜像结果。
+        错误处理：异常由远端 poller 捕获，不能终止其他主机状态读取。
+        副作用：实现可执行受限只读 SFTP 和本地缓存写入。
         """
 
         ...
@@ -332,6 +373,10 @@ class DaemonPollerConfig(BaseModel):
     codex_pet_refresh_interval_seconds: float = Field(default=5.0, gt=0)
     codex_pet_panel_fps: int = Field(default=8, ge=1, le=20)
     codex_pet_motion: CodexPetMotion = CodexPetMotion.AUTO
+    codex_pet_remote_pet_source: CodexRemotePetSource = (
+        CodexRemotePetSource.BUILTIN_RANDOM
+    )
+    codex_pet_patrol_speed: CodexPetPatrolSpeed = CodexPetPatrolSpeed.MEDIUM
     streamdock_quota_touchscreen_enabled: bool = False
     streamdock_quota_device: str = "n4pro"
     streamdock_n4pro_renderer_enabled: bool = False
@@ -459,9 +504,10 @@ class RotaryLayoutResponse(BaseModel):
 
 
 class ConsoleConfigurationApplyRequest(BaseModel):
-    """描述一次“保存并应用”提交的主按键和旋钮完整草稿。
+    """描述一次“保存并应用”提交的主按键、旋钮与 PETS 设置草稿。
 
-    入参：`key_layout` 是完整 10 键主表面配置；`rotary_layout` 是四旋钮、灯圈组和整体亮度配置。
+    入参：`key_layout` 是完整 10 键主表面配置；`rotary_layout` 是四旋钮、灯圈组和整体亮度；
+    ``pets_panel_settings`` 可选是兼容旧客户端的完整 PETS 设置。
     返回：frozen Pydantic model，确保任一子布局非法时在写入前返回 422。
     错误处理：子模型字段非法由 FastAPI/Pydantic 报告。
     副作用：模型本身不写文件、不访问硬件。
@@ -471,6 +517,26 @@ class ConsoleConfigurationApplyRequest(BaseModel):
 
     key_layout: N4ProKeyLayout
     rotary_layout: N4ProRotaryLayout
+    pets_panel_settings: N4ProPetsPanelSettings | None = None
+
+
+class PetsPanelSettingsResponse(BaseModel):
+    """向 GUI 返回当前 PETS 面板设置及其持久化来源。
+
+    入参：``source`` 是 default/config/runtime/persisted；``path`` 只用于本机诊断；
+    ``settings`` 是完整设置；``last_error`` 是启动读取失败的可选短文本。
+    返回：冻结响应模型。
+    错误处理：字段非法由 Pydantic 拒绝。
+    副作用：模型本身不读写文件或远端。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    device_profile: str = "mirabox.n4pro"
+    source: str
+    path: str | None = None
+    settings: N4ProPetsPanelSettings
+    last_error: str | None = None
 
 
 class StatusKeyImageCache:
@@ -839,6 +905,10 @@ class _DaemonRuntime:
     rotary_layout_source: str | None
     rotary_layout_path: Path | None
     rotary_layout_last_error: str | None
+    pets_panel_settings: N4ProPetsPanelSettings
+    pets_panel_settings_source: str
+    pets_panel_settings_path: Path | None
+    pets_panel_settings_last_error: str | None
     n4pro_last_applied_brightness_percent: int | None
     n4pro_last_applied_lighting: tuple[str, str | None, bool] | None
     n4pro_last_applied_led_brightness_percent: int | None
@@ -956,6 +1026,57 @@ class _DaemonRuntime:
             "render_count": self.surface.render_count,
         }
 
+    def current_pets_panel_settings_response(self) -> PetsPanelSettingsResponse:
+        """返回当前已应用的 N4 Pro PETS 面板设置。
+
+        入参：无。
+        返回：包含来源、可选路径、设置和启动读取错误的冻结响应。
+        错误处理：无。
+        副作用：无；不重新读取磁盘或远端。
+        """
+
+        return PetsPanelSettingsResponse(
+            source=self.pets_panel_settings_source,
+            path=(
+                str(self.pets_panel_settings_path)
+                if self.pets_panel_settings_path is not None
+                else None
+            ),
+            settings=self.pets_panel_settings,
+            last_error=self.pets_panel_settings_last_error,
+        )
+
+    def update_pets_panel_settings(
+        self,
+        settings: N4ProPetsPanelSettings,
+    ) -> dict[str, Any]:
+        """保存并立即应用一份 PETS 面板设置。
+
+        入参：``settings`` 已由 API/Pydantic 完整校验。
+        返回：当前设置响应和 PETS 诊断。
+        错误处理：持久化失败抛 ``PetsPanelSettingsStoreError`` 并保留旧 applied 设置。
+        副作用：可选写用户级 JSON，更新宠物 runtime 并唤醒当前逻辑面板渲染。
+        """
+
+        if self.pets_panel_settings_path is not None:
+            save_n4pro_pets_panel_settings(
+                settings,
+                self.pets_panel_settings_path,
+            )
+        self.pets_panel_settings = settings
+        self.pets_panel_settings_source = (
+            "persisted" if self.pets_panel_settings_path is not None else "runtime"
+        )
+        self.pets_panel_settings_last_error = None
+        self.codex_pet.update_panel_settings(settings)
+        self.render_current_logical_panel_image()
+        return {
+            "pets_panel_settings": _dump_model(
+                self.current_pets_panel_settings_response()
+            ),
+            "codex_pet": self.codex_pet.diagnostics(),
+        }
+
     def set_hardware_background_notifier(
         self,
         notifier: Callable[[], None] | None,
@@ -993,12 +1114,12 @@ class _DaemonRuntime:
         self,
         request: ConsoleConfigurationApplyRequest,
     ) -> dict[str, Any]:
-        """以一次 GUI 保存请求更新主按键和旋钮两个已应用配置域。
+        """以一次 GUI 保存请求更新主按键、旋钮和可选 PETS 配置域。
 
-        入参：`request` 的两个 layout 已在进入前完成 Pydantic 校验。
-        返回：两个 layout response、当前 renderer-neutral layout 和 render 计数。
+        入参：`request` 的 layout 与可选 PETS 设置已在进入前完成 Pydantic 校验。
+        返回：三个配置 response、当前 renderer-neutral layout 和 render 计数。
         错误处理：任一持久化写入失败时向 handler 抛出，runtime applied state 保留旧值。
-        副作用：可选地写两个用户级 JSON 文件；成功后统一刷新 key/panel 预览，真机在下个
+        副作用：可选地写三个用户级 JSON 文件；成功后统一刷新 key/panel 预览，真机在下个
         persistent renderer tick 的同一设备会话中接收新状态。
         """
 
@@ -1006,6 +1127,14 @@ class _DaemonRuntime:
             save_n4pro_key_layout(request.key_layout, self.key_layout_path)
         if self.rotary_layout_path is not None:
             save_n4pro_rotary_layout(request.rotary_layout, self.rotary_layout_path)
+        if (
+            request.pets_panel_settings is not None
+            and self.pets_panel_settings_path is not None
+        ):
+            save_n4pro_pets_panel_settings(
+                request.pets_panel_settings,
+                self.pets_panel_settings_path,
+            )
         self.key_layout = request.key_layout
         self.key_layout_source = "persisted" if self.key_layout_path is not None else "runtime"
         self.key_layout_last_error = None
@@ -1014,6 +1143,15 @@ class _DaemonRuntime:
             "persisted" if self.rotary_layout_path is not None else "runtime"
         )
         self.rotary_layout_last_error = None
+        if request.pets_panel_settings is not None:
+            self.pets_panel_settings = request.pets_panel_settings
+            self.pets_panel_settings_source = (
+                "persisted"
+                if self.pets_panel_settings_path is not None
+                else "runtime"
+            )
+            self.pets_panel_settings_last_error = None
+            self.codex_pet.update_panel_settings(request.pets_panel_settings)
         rendered_layout = self.render_current()
         self.prewarm_status_key_images(rendered_layout)
         self.publish_hardware_key_surface_images(rendered_layout)
@@ -1021,6 +1159,9 @@ class _DaemonRuntime:
         return {
             "key_layout": _dump_model(self.current_key_layout_response()),
             "rotary_layout": _dump_model(self.current_rotary_layout_response()),
+            "pets_panel_settings": _dump_model(
+                self.current_pets_panel_settings_response()
+            ),
             "layout": _dump_model(rendered_layout),
             "render_count": self.surface.render_count,
         }
@@ -1139,7 +1280,13 @@ class _DaemonRuntime:
             "considered_thread_count": snapshot.considered_thread_count,
             "status_counts": dict(snapshot.status_counts),
             "active_session_count": len(snapshot.sessions),
+            "pet_config_available": snapshot.pet_config_available,
         }
+        self.codex_pet.update_remote_pet_selection(
+            snapshot.host_id,
+            selected_avatar_id=snapshot.selected_avatar_id,
+            config_available=snapshot.pet_config_available,
+        )
 
     def mark_codex_remote_ssh_discovery_success(
         self,
@@ -1197,6 +1344,7 @@ class _DaemonRuntime:
         """
 
         self.codex_remote_ssh_diagnostics.pop(host_id, None)
+        self.codex_pet.remove_remote_pet_selection(host_id)
         self.clear_codex_observation_scope(f"remote-ssh:{host_id}")
 
     def mark_codex_remote_ssh_poll_error(
@@ -3059,6 +3207,8 @@ def create_app(
         discover_enabled_codex_remote_ssh_hosts
     ),
     codex_remote_ssh_observer_factory: CodexRemoteSshObserverFactory | None = None,
+    codex_remote_pet_mirror: CodexRemotePetMirrorProtocol | None = None,
+    codex_remote_pet_cache_path: Path | None = None,
     codex_quota_reader: CodexQuotaReader = read_codex_quota,
     codex_token_usage_reader: CodexTokenUsageReader = read_codex_token_usage,
     quota_touchscreen_sink: QuotaTouchscreenSink = render_touchscreen_image_to_n4pro,
@@ -3082,6 +3232,7 @@ def create_app(
     codex_pet_cache_path: Path | None = None,
     key_layout_path: Path | None = None,
     rotary_layout_path: Path | None = None,
+    pets_panel_settings_path: Path | None = None,
     quota_presentation_path: Path | None = None,
 ) -> FastAPI:
     """Create the local daemon FastAPI app without binding sockets.
@@ -3091,7 +3242,8 @@ def create_app(
     `codex_app_active_sessions_reader` 读取最近有效 Codex App 会话，生产默认只读扫描本机状态；
     ``codex_remote_ssh_hosts_reader`` 只读取 ChatGPT Settings 已管理且明确启用自动连接的
     SSH connections；``codex_remote_ssh_observer_factory`` 可为测试注入 observer，生产按
-    每轮发现结果动态创建或关闭独立只读 SSH app-server proxy；
+    每轮发现结果动态创建或关闭独立只读 SSH app-server proxy；``codex_remote_pet_mirror``
+    与 cache path 控制仅在 remote_config 策略下读取 custom manifest/图集的受限 SFTP 镜像；
     `codex_quota_reader` 是可注入 reader，生产默认读取真实本机 Codex quota；
     `codex_token_usage_reader` 是可注入 reader，生产默认通过 ccusage 读取 Codex token usage；
     `quota_touchscreen_sink` 是 quota-only 真实硬件触屏下发函数，仅在配置启用时调用；
@@ -3110,8 +3262,9 @@ def create_app(
     默认使用用户级 Application Support；`url_icon_fetcher` 供测试替换网络请求；
     `codex_pet_resolver`、reduced-motion reader 与 cache path 供宠物解析/可访问性/临时缓存测试
     注入，生产默认只读跟随 Codex 并使用 daemon 生命周期临时目录；
-    `key_layout_path` 与 `rotary_layout_path` 为 None 时相应 GUI 布局只保存在进程内，传入路径时
-    启动会读各自 JSON，保存会写回；`quota_presentation_path` 可选加载独立 quota 展示策略，
+    `key_layout_path`、`rotary_layout_path` 与 ``pets_panel_settings_path`` 为 None 时相应 GUI
+    设置只保存在进程内，传入路径时启动会读各自 JSON，保存会写回；
+    `quota_presentation_path` 可选加载独立 quota 展示策略，
     只影响硬件显示而不改原始采集数据；`system_control_executor` 可注入 fake，默认按平台构造
     保守 executor。
     返回：配置好路由且持有 in-memory runtime 的 `FastAPI` ASGI app。
@@ -3136,6 +3289,14 @@ def create_app(
             ),
         )
     )
+    resolved_codex_remote_pet_mirror = (
+        codex_remote_pet_mirror
+        if codex_remote_pet_mirror is not None
+        else CodexRemotePetMirror(
+            cache_root=codex_remote_pet_cache_path,
+            timeout_seconds=resolved_poller_config.codex_remote_ssh_timeout_seconds,
+        )
+    )
     codex_pet_temp_directory: TemporaryDirectory[str] | None = None
     if resolved_poller_config.codex_pet_enabled and codex_pet_cache_path is None:
         codex_pet_temp_directory = TemporaryDirectory(
@@ -3150,6 +3311,22 @@ def create_app(
             else Path(".")
         )
     )
+    initial_pets_panel_settings = N4ProPetsPanelSettings(
+        remote_pet_source=resolved_poller_config.codex_pet_remote_pet_source,
+        patrol_speed=resolved_poller_config.codex_pet_patrol_speed,
+    )
+    initial_pets_panel_settings_source = "config"
+    pets_panel_settings_last_error: str | None = None
+    if pets_panel_settings_path is not None:
+        try:
+            persisted_pets_settings = load_n4pro_pets_panel_settings(
+                pets_panel_settings_path
+            )
+            if persisted_pets_settings is not None:
+                initial_pets_panel_settings = persisted_pets_settings
+                initial_pets_panel_settings_source = "persisted"
+        except PetsPanelSettingsStoreError as exc:
+            pets_panel_settings_last_error = str(exc)
     codex_pet_runtime = CodexPetRuntime(
         enabled=resolved_poller_config.codex_pet_enabled,
         panel_fps=resolved_poller_config.codex_pet_panel_fps,
@@ -3158,6 +3335,7 @@ def create_app(
         fallback_key_path=(
             resolved_poller_config.streamdock_n4pro_frame_root / "offline.png"
         ),
+        panel_settings=initial_pets_panel_settings,
         resolver=codex_pet_resolver,
         reduced_motion_reader=codex_pet_reduced_motion_reader,
     )
@@ -3287,6 +3465,10 @@ def create_app(
         rotary_layout_source=initial_rotary_layout_source,
         rotary_layout_path=rotary_layout_path,
         rotary_layout_last_error=rotary_layout_last_error,
+        pets_panel_settings=initial_pets_panel_settings,
+        pets_panel_settings_source=initial_pets_panel_settings_source,
+        pets_panel_settings_path=pets_panel_settings_path,
+        pets_panel_settings_last_error=pets_panel_settings_last_error,
         n4pro_last_applied_brightness_percent=None,
         n4pro_last_applied_lighting=None,
         n4pro_last_applied_led_brightness_percent=None,
@@ -3321,6 +3503,7 @@ def create_app(
                 codex_remote_ssh_hosts_reader,
                 resolved_codex_remote_ssh_observer_factory,
                 resolved_codex_remote_ssh_observers,
+                resolved_codex_remote_pet_mirror,
                 codex_quota_reader,
                 codex_token_usage_reader,
                 quota_touchscreen_sink,
@@ -3352,6 +3535,7 @@ def create_app(
                         observers=resolved_codex_remote_ssh_observers,
                         hosts_reader=codex_remote_ssh_hosts_reader,
                         observer_factory=resolved_codex_remote_ssh_observer_factory,
+                        pet_mirror=resolved_codex_remote_pet_mirror,
                         interval_seconds=(
                             resolved_poller_config.codex_remote_ssh_interval_seconds
                         ),
@@ -3802,7 +3986,40 @@ def create_app(
 
         try:
             return runtime.update_console_configuration(request)
-        except (KeyLayoutStoreError, RotaryLayoutStoreError) as exc:
+        except (
+            KeyLayoutStoreError,
+            RotaryLayoutStoreError,
+            PetsPanelSettingsStoreError,
+        ) as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.get("/ui/pets-panel-settings")
+    async def get_pets_panel_settings() -> dict[str, Any]:
+        """返回 N4 Pro PETS 虚拟面板的当前设置。
+
+        入参：无。
+        返回：来源、持久化路径、完整设置和可选启动错误。
+        错误处理：无。
+        副作用：只读 runtime 快照，不访问磁盘、远端或硬件。
+        """
+
+        return _dump_model(runtime.current_pets_panel_settings_response())
+
+    @app.put("/ui/pets-panel-settings")
+    async def put_pets_panel_settings(
+        settings: N4ProPetsPanelSettings,
+    ) -> dict[str, Any]:
+        """保存并应用 N4 Pro PETS 虚拟面板设置。
+
+        入参：远端宠物来源和巡游速度完整设置。
+        返回：当前设置响应与宠物诊断。
+        错误处理：请求非法返回 422，持久化失败返回 500 并保留旧 applied 设置。
+        副作用：成功时写可选用户级 JSON、更新 runtime 并刷新当前 PETS 面板。
+        """
+
+        try:
+            return runtime.update_pets_panel_settings(settings)
+        except PetsPanelSettingsStoreError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.put("/ui/key-layout")
@@ -3946,6 +4163,7 @@ async def _run_enabled_pollers_once(
     codex_remote_ssh_hosts_reader: CodexRemoteSshHostsReader,
     codex_remote_ssh_observer_factory: CodexRemoteSshObserverFactory,
     codex_remote_ssh_observers: dict[str, CodexRemoteSshObserverProtocol],
+    codex_remote_pet_mirror: CodexRemotePetMirrorProtocol,
     codex_quota_reader: CodexQuotaReader,
     codex_token_usage_reader: CodexTokenUsageReader,
     quota_touchscreen_sink: QuotaTouchscreenSink,
@@ -3953,11 +4171,12 @@ async def _run_enabled_pollers_once(
 ) -> None:
     """Run each enabled poller once during app startup.
 
-    入参：`runtime` 是 daemon 内存状态；`config` 是 poller 配置；Codex reader、quota reader、
-    token usage reader、触屏 sink 和统一 N4 Pro renderer sink 是可注入数据源/输出端。
+    入参：`runtime` 是 daemon 内存状态；`config` 是 poller 配置；Codex reader、SSH observer、
+    远端宠物镜像、quota/token reader、触屏 sink 和统一 N4 Pro renderer sink 是可注入数据源/输出端。
     返回：无显式返回值。
     错误处理：单个 poller 的异常由 poll-once helper 记录，另一个 poller 仍会继续执行。
-    副作用：可能只读访问 Codex 本地状态、启动短生命周期 app-server、更新 runtime 和 fake surface。
+    副作用：可能只读访问 Codex 本地状态、启动 SSH/app-server/SFTP、写 Agent Deck 素材缓存，
+    并更新 runtime 和 fake surface。
     """
 
     if config.codex_app_state_enabled:
@@ -3975,6 +4194,7 @@ async def _run_enabled_pollers_once(
             observers=codex_remote_ssh_observers,
             hosts_reader=codex_remote_ssh_hosts_reader,
             observer_factory=codex_remote_ssh_observer_factory,
+            pet_mirror=codex_remote_pet_mirror,
             stale_after_seconds=config.codex_remote_ssh_stale_after_seconds,
         )
     if config.codex_quota_enabled:
@@ -4044,6 +4264,7 @@ async def _poll_codex_remote_ssh_loop(
     observers: dict[str, CodexRemoteSshObserverProtocol],
     hosts_reader: CodexRemoteSshHostsReader,
     observer_factory: CodexRemoteSshObserverFactory,
+    pet_mirror: CodexRemotePetMirrorProtocol,
     interval_seconds: float,
     stale_after_seconds: float,
 ) -> None:
@@ -4051,7 +4272,8 @@ async def _poll_codex_remote_ssh_loop(
 
     入参：``runtime`` 是 daemon 状态；``observers`` 按 host id 保存动态只读连接；
     ``hosts_reader`` 只读 ChatGPT Settings；``observer_factory`` 为新启用主机创建 observer；
-    ``interval_seconds`` 是轮询间隔；``stale_after_seconds`` 控制失联清理。
+    ``pet_mirror`` 仅按 remote_config 策略镜像 custom 素材；``interval_seconds`` 是轮询间隔；
+    ``stale_after_seconds`` 控制失联清理。
     返回：不主动返回；任务取消时结束。
     错误处理：单 host 异常在 poll-once 内记录，不终止其他 host 或后台循环。
     副作用：周期性使用 observer 的 SSH 连接并更新内存 agent/store 诊断。
@@ -4064,6 +4286,7 @@ async def _poll_codex_remote_ssh_loop(
             observers=observers,
             hosts_reader=hosts_reader,
             observer_factory=observer_factory,
+            pet_mirror=pet_mirror,
             stale_after_seconds=stale_after_seconds,
         )
 
@@ -4767,13 +4990,15 @@ async def _poll_codex_remote_ssh_once(
     hosts_reader: CodexRemoteSshHostsReader,
     observer_factory: CodexRemoteSshObserverFactory,
     stale_after_seconds: float,
+    pet_mirror: CodexRemotePetMirrorProtocol | None = None,
 ) -> None:
     """发现并并行读取一次 ChatGPT Settings 当前已启用的 SSH hosts。
 
     入参：``runtime`` 是 daemon 内存状态；``observers`` 是可动态增删的 observer 映射；
     ``hosts_reader`` 只能返回 ChatGPT 已管理且 auto-connect=true 的 SSH connection；
-    ``observer_factory`` 为新启用主机创建 observer；``stale_after_seconds`` 控制启用主机
-    持续连接失败后清理旧远端 agent。
+    ``observer_factory`` 为新启用主机创建 observer；``pet_mirror`` 只在策略为
+    remote_config 且 config/read 返回 custom ID 时读取两个素材文件；``stale_after_seconds``
+    控制启用主机持续连接失败后清理旧远端 agent。
     返回：无。
     错误处理：发现失败时 fail-closed，关闭全部 observer 并清理状态；单 host 普通异常只写入
     诊断并继续；task cancellation 正常向上传播。
@@ -4821,6 +5046,11 @@ async def _poll_codex_remote_ssh_once(
 
     if not observers:
         return
+    read_remote_pet_config = runtime.codex_pet.reads_remote_pet_config
+    for observer in observers.values():
+        setter = getattr(observer, "set_read_pet_config", None)
+        if callable(setter):
+            setter(read_remote_pet_config)
     observer_items = tuple(observers.items())
     results = await asyncio.gather(
         *(
@@ -4851,6 +5081,44 @@ async def _poll_codex_remote_ssh_once(
             observation_scope=f"remote-ssh:{snapshot.host_id}",
         )
         runtime.mark_codex_remote_ssh_poll_success(snapshot)
+        should_mirror_custom = (
+            pet_mirror is not None
+            and read_remote_pet_config
+            and snapshot.pet_config_available
+            and snapshot.selected_avatar_id is not None
+            and snapshot.selected_avatar_id.startswith("custom:")
+        )
+        if not should_mirror_custom:
+            runtime.codex_pet.update_remote_custom_pet_resolution(
+                snapshot.host_id,
+                None,
+            )
+            continue
+        enabled_host = enabled_by_host_id.get(configured_host_id)
+        if enabled_host is None:
+            runtime.codex_pet.update_remote_custom_pet_resolution(
+                snapshot.host_id,
+                None,
+            )
+            continue
+        try:
+            mirror_resolution = await asyncio.to_thread(
+                pet_mirror.resolve,
+                host=enabled_host.alias,
+                host_id=snapshot.host_id,
+                selected_avatar_id=snapshot.selected_avatar_id,
+                now=snapshot.observed_at,
+            )
+        except Exception:  # noqa: BLE001 - 素材镜像失败不得影响远端任务状态。
+            runtime.codex_pet.update_remote_custom_pet_resolution(
+                snapshot.host_id,
+                None,
+            )
+            continue
+        runtime.codex_pet.update_remote_custom_pet_resolution(
+            snapshot.host_id,
+            mirror_resolution,
+        )
 
 
 async def _poll_codex_quota_once(

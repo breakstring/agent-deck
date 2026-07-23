@@ -97,12 +97,42 @@ class CodexPetMotion(StrEnum):
     REDUCED = "reduced"
 
 
+class CodexRemotePetSource(StrEnum):
+    """定义 PETS 面板中远端任务的宠物来源策略。
+
+    入参：枚举值来自 ``[codex.pet].remote_pet_source`` 或 N4 Pro PETS 设置面板。
+    返回：字符串枚举；follow_local 跟随本机选择，remote_config 只读远端 App 选择，
+    builtin_random 按任务稳定分配 ChatGPT 内置宠物。
+    错误处理：未知字符串由 Pydantic 配置校验拒绝。
+    副作用：无；声明枚举不读取本地或远端配置。
+    """
+
+    FOLLOW_LOCAL = "follow_local"
+    REMOTE_CONFIG = "remote_config"
+    BUILTIN_RANDOM = "builtin_random"
+
+
+class CodexPetPatrolSpeed(StrEnum):
+    """定义 PETS 面板宠物巡游的用户可见速度档位。
+
+    入参：枚举值来自 ``[codex.pet].patrol_speed`` 或 N4 Pro PETS 设置面板。
+    返回：slow/medium/fast 字符串枚举；具体像素速度由渲染层统一控制。
+    错误处理：未知字符串由 Pydantic 配置校验拒绝。
+    副作用：无。
+    """
+
+    SLOW = "slow"
+    MEDIUM = "medium"
+    FAST = "fast"
+
+
 class CodexPetConfig(BaseModel):
     """配置 Agent Deck 对 Codex 全局宠物选择的只读展示。
 
     入参：``enabled`` 控制 PETS 面板和宠物 Key 动态资源；
     ``refresh_interval_seconds`` 是重新读取 Codex 选择与 manifest 的间隔；``panel_fps``
-    是 PETS 可见时背景的最高目标帧率；``motion`` 控制完整、减少或系统跟随动画。
+    是 PETS 可见时背景的最高目标帧率；``motion`` 控制完整、减少或系统跟随动画；
+    ``remote_pet_source`` 和 ``patrol_speed`` 是 N4 Pro PETS 面板的初始展示设置。
     返回：frozen Pydantic model；不包含独立 ``pet_id``，始终跟随 Codex 全局选择。
     错误处理：非正刷新间隔、超出 1-20 的 FPS 或未知 motion 由 Pydantic 拒绝。
     副作用：模型自身不读取 Codex 配置、不加载图片、不访问硬件。
@@ -114,6 +144,8 @@ class CodexPetConfig(BaseModel):
     refresh_interval_seconds: float = Field(default=5.0, gt=0)
     panel_fps: int = Field(default=8, ge=1, le=20)
     motion: CodexPetMotion = CodexPetMotion.AUTO
+    remote_pet_source: CodexRemotePetSource = CodexRemotePetSource.BUILTIN_RANDOM
+    patrol_speed: CodexPetPatrolSpeed = CodexPetPatrolSpeed.MEDIUM
 
 
 class CodexRemoteSshConfig(BaseModel):

@@ -108,9 +108,14 @@ flowchart LR
    Agent Deck 只从 ChatGPT Settings 的 managed connections 中取
    `auto-connect=true` 的 SSH 项，动态建立独立、可复用的 `codex app-server proxy` 连接；
    不自行读取 `~/.ssh/config`，不使用历史 project/selected host，也不连接 false/missing 项。
-   设置关闭或不可判定时立即 fail-closed，关闭对应 observer 并清理其状态。协议只调用
-   `initialize/initialized/thread-list(useStateDbOnly=true)`。立即丢弃 preview、turn、item 和
-   rollout path，只保留顶层 `vscode` thread 的 host-aware 粗粒度状态。本地与不同 host 使用
+   设置关闭或不可判定时立即 fail-closed，关闭对应 observer 并清理其状态。协议常态只调用
+   `initialize/initialized/thread-list(useStateDbOnly=true)`；仅当 PETS 面板选择“读取远端配置”
+   时增加只读 `config/read`，并立即只投影 `desktop.selected-avatar-id`。内置宠物 ID 是
+   `fireball`、`null-signal` 这类名字型注册 ID，不是序号；`builtin_random` 不读取远端选择，
+   诊断必须明确标记为随机分配。其余 config、preview、turn、item 和 rollout path，只保留顶层
+   App thread 的 host-aware 粗粒度状态；本地 SQLite 仍严格限定 `source=vscode`，rollout
+   metadata 兼容顶层 `thread_source=user|vscode`，继续排除 CLI、subagent 和有 parent 的 child。
+   本地与不同 host 使用
    不冲突的 agent identity；active/waiting/error 可参与 App Key 宠物覆盖，active->idle 仅产生
    有界完成反馈，冷 idle/notLoaded 不覆盖原图标。连接持续失败超过 stale 窗口时清理该 host
    的 observer-owned 状态。OpenAI 中转 Remote 没有公开第三方 status API，当前不逆向接入。
@@ -428,9 +433,10 @@ P5 macOS 产品化边界：
 
 目标：
 
-- 只读跟随 Codex 的全局宠物选择，把同一套自定义宠物素材投影到独立的主按键和 N4 Pro PETS
-  虚拟面板，但不污染核心状态机、审批或任务执行。
-- 首版先完成 Codex 自定义宠物闭环；Claude、通用 ambient theme 和更多硬件留到后续。
+- 只读跟随 Codex 的全局宠物选择，并把本地与远端顶层 ChatGPT App 活动任务作为独立角色投影到
+  N4 Pro PETS 虚拟面板，但不污染核心状态机、审批或任务执行。
+- ChatGPT Desktop 内置宠物只从本机已安装 App 读取；本地 custom 从本机 Codex 目录读取，
+  Remote SSH custom 只从 Agent Deck 自有的受限镜像缓存读取，不重新分发 App 素材。
 
 当前实现范围：
 
@@ -442,7 +448,8 @@ P5 macOS 产品化边界：
 3. 安全解析位于宠物目录内的 `spritesheetPath`，拒绝绝对路径、`..` 和符号链接逃逸；兼容
    `1536×1872` 的 v1 8×9 与 `1536×2288` 的 v2 8×11 固定图集，但首版不使用 gaze 行。
 4. 同一选择 ID 短暂读取失败时保留 last-known-good；选择 ID 改变却解析失败时不冒充旧宠物。
-   Codex 内置宠物首版不解析 App 资源，按键回退静态 Codex 图，PETS 显示简短诊断。
+   内置宠物通过已安装 ChatGPT/Codex App 的 `app.asar` header 按 offset 只读发现，按活动角色
+   解码到内存，不扫描其他 App、不解包到磁盘或仓库。
 5. 新增 `codex_pet` ambient key 类型：完整 cell 缩放到 `112×112` 深色画布，按下无 intent、
    不执行 action、不占 Agent slot，默认布局不自动占用键位。
 6. 宠物启用时将 PETS 加入 `brand -> quota -> tokens -> pets` 手动轮换；不因 Codex 状态自动
@@ -472,11 +479,30 @@ P5 macOS 产品化边界：
     有效 FPS 与预算。
 15. renderer 保存独立基础图映射，再叠加独立宠物键与 App 任务覆盖；覆盖退出时复用同一 App 图标
     缓存对象，不清空或重绘 fallback。宠物关闭、素材缺失或图集失败时完整回退基础图且动作仍有效。
+16. PETS 面板从全部顶层 `codex-app:*` 状态建立独立角色：每只宠物共享完整 800px 横向空间，
+    使用由 agent key 派生的独立位置、方向、动画相位和基础速度；速度叠加错相低频包络持续细微
+    变化，不固定匀速。碰撞只在周期窗口内短暂反弹，其余时间允许穿过，避免形成隐性领地。
+17. 本地角色不画地垫；远端角色按 observer host id 使用稳定低饱和细光环。不同远端主机从预留
+    色池映射，地垫只表达执行主机，不承载状态红绿语义。
+18. N4 Pro 设备预览中的 touch bar 是 PETS 专属设置入口。设置持久化到独立用户级版本化 JSON，
+    当前包含远端宠物来源 `follow_local | remote_config | builtin_random` 和巡游速度
+    `slow | medium | fast`；未来 PETS 偏好继续在这里扩展，不进入单 Key binding。
+19. `remote_config` 只对 ChatGPT Settings 中 managed 且 auto-connect=true 的现有 observer 打开
+    `config/read`，只保留宠物 ID；切换其他策略即停止该额外 RPC。远端选择为本机可识别内置宠物
+    时按名字型 ID 精确复用本机 App 素材。远端 `custom:<name>` 通过独立短生命周期系统 SFTP
+    只读镜像 `.codex/pets/<name>/pet.json`（兼容 legacy avatar manifest）和其中声明的单张图集；
+    下载前用 `ls -ln` 拒绝最终 symlink/非普通文件并限制大小，下载后再次校验相对路径、manifest、
+    sprite 版本、图片解码和固定几何。内容寻址版本只写
+    `~/Library/Application Support/AgentDeck/remote-pets/`，绝不写本机 `.codex`、不执行宠物代码、
+    不上传或修改远端，也不复制整个目录。同 host + 同选择 ID 可使用最近成功缓存；选择变化、
+    未知或校验失败不得冒充旧宠物，安全回退本机系统宠物。默认 5 分钟内复用本次解析，避免随
+    5 秒任务状态轮询重复建立 SFTP。
 
 当前明确不做：
 
-- 不解析或重新分发 Codex App 内置宠物资源，也不提交 Rick 或其他本机宠物及派生素材。
-- 不支持 Agent Deck 单独选择宠物、多宠物、按会话选择不同宠物、hover/jump、v2 gaze 或鼠标跟踪。
+- 不重新分发或提交 Codex App 内置宠物、Rick 等本机宠物及派生素材；只在运行时读取用户已安装 App。
+- 不支持 Agent Deck 上传一套新的面板宠物、复制远端 custom 包的任意额外文件或目录、
+  hover/jump、v2 gaze 或鼠标跟踪。
 - 不替换现有 Agent 状态键，不让宠物按键打开 PETS，也不让宠物行为参与审批或执行。
 - Codex CLI 启动联动不纳入本轮；后续必须单独建模 execution host 与 Terminal、iTerm2、Warp、
   Ghostty、Tabby 等 presentation client，不能把它们压成一个直接执行 `codex` 的 App key。
@@ -588,11 +614,12 @@ P5 macOS 产品化边界：
 
 ## 下一次工作建议
 
-当前优先收口 P6 Codex 宠物与 App Key 覆盖扩展：
+当前优先收口 P6 多任务 PETS 与 App Key 覆盖扩展：
 
 1. 先完成定向测试与 `uv run pytest -q`，将实际结果回填到交付记录，不用旧测试结果代替。
-2. 在 fake hardware 通过后，按 P6 真机清单重新执行 Rick 的 60 秒 smoke 和 15 分钟 soak；另测
-   1、2、3 个关联 App Key 的有效 FPS、dirty-key 数、按键响应、HID 错误和原图标恢复。
+2. 在 fake hardware 通过后，以本机 custom 和 ChatGPT 内置宠物分别执行多角色 smoke；验证
+   本地无地垫、不同 remote host 光环、慢中快三档、动态微变速、间歇碰撞和活动结束恢复。
+   长时间 soak 继续记录有效 FPS、dirty-key 数、按键响应、HID 错误和原图标恢复。
 3. 保持独立宠物 Key、PETS 面板和 App Key 覆盖三种展示并存；真机数据不足前不让宠物取代 Agent
    状态键，也不扩大到 Codex CLI 终端控制面。
 

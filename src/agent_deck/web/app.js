@@ -62,6 +62,11 @@ const state = {
   selectedKnobId: "knob_1",
   rotaryLayout: structuredClone(fallbackRotaryLayout),
   rotaryLayoutSource: "default",
+  petsPanelSettings: {
+    remote_pet_source: "builtin_random",
+    patrol_speed: "medium",
+  },
+  petsPanelSettingsSource: "default",
   controlCapabilities: null,
   appQuery: "",
   dirty: false,
@@ -84,6 +89,7 @@ const el = {
   keyGrid: document.getElementById("keyGrid"),
   knobStrip: document.getElementById("knobStrip"),
   lightingControl: document.getElementById("lightingControl"),
+  petsPanelControl: document.getElementById("petsPanelControl"),
   selectedEyebrow: document.getElementById("selectedEyebrow"),
   selectedTitle: document.getElementById("selectedTitle"),
   selectedSubtitle: document.getElementById("selectedSubtitle"),
@@ -668,6 +674,8 @@ function renderKnobs() {
   });
   el.lightingControl.classList.toggle("selected", state.selectedSurface === "lighting");
   el.lightingControl.setAttribute("aria-pressed", String(state.selectedSurface === "lighting"));
+  el.petsPanelControl?.classList.toggle("selected", state.selectedSurface === "pets");
+  el.petsPanelControl?.setAttribute("aria-pressed", String(state.selectedSurface === "pets"));
 }
 
 function choiceButton(kind, title, meta) {
@@ -1390,9 +1398,66 @@ function renderLightingInspector() {
 }
 
 /**
+ * 渲染 PETS 虚拟面板的集中设置；这些设置面向整个 N4 Pro 面板，不属于单个物理 Key。
+ */
+function renderPetsPanelInspector() {
+  const settings = state.petsPanelSettings;
+  const colony = state.status?.codex_pet?.panel_colony || {};
+  el.selectedEyebrow.textContent = "PETS 虚拟面板";
+  el.selectedTitle.textContent = "宠物巡游设置";
+  el.selectedSubtitle.textContent = "统一控制远端任务的宠物来源和整组宠物的巡游节奏；后续 PETS 设置也会放在这里。";
+  el.inspectorBody.innerHTML = `
+    <div class="field-group">
+      <label class="text-field" for="remotePetSource"><span>远端 Agent 宠物</span>
+        <select id="remotePetSource" class="select-input">
+          <option value="follow_local"${settings.remote_pet_source === "follow_local" ? " selected" : ""}>跟随本地宠物设置</option>
+          <option value="remote_config"${settings.remote_pet_source === "remote_config" ? " selected" : ""}>读取远端 ChatGPT 配置</option>
+          <option value="builtin_random"${settings.remote_pet_source === "builtin_random" ? " selected" : ""}>稳定随机系统宠物（不读取远端）</option>
+        </select>
+      </label>
+      <p class="control-note">“读取远端配置”只面向已启用 Connection：先通过 app-server config/read 获取名字型宠物 ID；custom 宠物仅镜像清单声明的图集到 Agent Deck 缓存，失败时才回退系统宠物。</p>
+    </div>
+    <div class="field-group">
+      <label class="text-field" for="petPatrolSpeed"><span>巡游速度</span>
+        <select id="petPatrolSpeed" class="select-input">
+          <option value="slow"${settings.patrol_speed === "slow" ? " selected" : ""}>慢</option>
+          <option value="medium"${settings.patrol_speed === "medium" ? " selected" : ""}>中</option>
+          <option value="fast"${settings.patrol_speed === "fast" ? " selected" : ""}>快</option>
+        </select>
+      </label>
+      <p class="control-note">档位只决定基础节奏；每只宠物仍会持续做细微、平滑且不同步的速度变化。</p>
+    </div>
+    <div class="field-group"><div class="field-label">当前场景</div>
+      ${detailRow("活动宠物", String(colony.actor_count || 0))}
+      ${detailRow("远端宠物", String(colony.remote_actor_count || 0))}
+      ${detailRow("可渲染", String(colony.renderable_actor_count || 0))}
+      ${detailRow("当前来源策略", settings.remote_pet_source === "remote_config" ? "读取远端配置" : settings.remote_pet_source === "follow_local" ? "跟随本地" : "稳定随机（未读取远端）")}
+      ${detailRow("设置状态", state.petsPanelSettingsSource === "persisted" ? "已保存" : "使用 daemon 默认配置")}
+      ${detailRow("远端配置可用", `${colony.remote_config_available_host_count || 0} / ${colony.remote_config_host_count || 0} 台`)}
+      ${detailRow("远端 custom 缓存", `${colony.remote_custom_asset_count || 0} 个可用${colony.remote_custom_stale_count ? ` · ${colony.remote_custom_stale_count} 个陈旧回退` : ""}`)}
+      ${detailRow("素材目录", `${colony.builtin_pet_count || 0} 个系统宠物`)}
+    </div>
+  `;
+  document.getElementById("remotePetSource")?.addEventListener("change", (event) => {
+    settings.remote_pet_source = event.target.value;
+    state.dirty = true;
+    render();
+  });
+  document.getElementById("petPatrolSpeed")?.addEventListener("change", (event) => {
+    settings.patrol_speed = event.target.value;
+    state.dirty = true;
+    render();
+  });
+}
+
+/**
  * 根据当前设备预览选中的表面渲染 key、旋钮或独立灯光设置检查器。
  */
 function renderInspector() {
+  if (state.selectedSurface === "pets") {
+    renderPetsPanelInspector();
+    return;
+  }
   if (state.selectedSurface === "rotary") {
     renderRotaryInspector();
     return;
@@ -1743,6 +1808,20 @@ async function loadRotaryLayout() {
   }
 }
 
+/** 从 daemon 读取 N4 Pro PETS 面板的持久化设置。 */
+async function loadPetsPanelSettings() {
+  try {
+    const response = await fetch("/ui/pets-panel-settings", { cache: "no-store" });
+    if (!response.ok) throw new Error(`PETS settings ${response.status}`);
+    const body = await response.json();
+    state.petsPanelSettings = structuredClone(body.settings);
+    state.petsPanelSettingsSource = body.source || "runtime";
+    render();
+  } catch (error) {
+    el.toast.textContent = `PETS 设置读取失败：${error.message}`;
+  }
+}
+
 /** 读取硬件 profile 与本机系统控制 capability，借此过滤不可用动作。 */
 async function loadControlCapabilities() {
   try {
@@ -2001,12 +2080,17 @@ async function saveAndApply() {
             .map(bindingFromUiKey),
         },
         rotary_layout: state.rotaryLayout,
+        pets_panel_settings: state.petsPanelSettings,
       }),
     });
     if (!response.ok) throw new Error(`save ${response.status}`);
     const body = await response.json();
     applyKeyLayoutResponse(body.key_layout);
     applyRotaryLayoutResponse(body.rotary_layout);
+    if (body.pets_panel_settings?.settings) {
+      state.petsPanelSettings = structuredClone(body.pets_panel_settings.settings);
+      state.petsPanelSettingsSource = body.pets_panel_settings.source || "runtime";
+    }
     state.keys.forEach((key) => {
       key.dirty = false;
     });
@@ -2098,6 +2182,10 @@ el.lightingControl?.addEventListener("click", () => {
   state.selectedSurface = "lighting";
   render();
 });
+el.petsPanelControl?.addEventListener("click", () => {
+  state.selectedSurface = "pets";
+  render();
+});
 el.closeAppModal.addEventListener("click", closeAppModal);
 el.appModal.addEventListener("click", (event) => {
   if (event.target === el.appModal) closeAppModal();
@@ -2112,6 +2200,7 @@ async function boot() {
   await loadAppCatalog();
   await loadKeyLayout();
   await loadRotaryLayout();
+  await loadPetsPanelSettings();
   await loadControlCapabilities();
   await refreshStatus();
   render();

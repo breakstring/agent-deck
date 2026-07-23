@@ -22,11 +22,17 @@ from agent_deck.adapters.codex_remote_ssh import (
     CodexRemoteSshError,
     CodexRemoteSshSnapshot,
     _RemoteThread,
+    _selected_avatar_from_config_read,
     build_codex_remote_ssh_command,
     codex_remote_host_id,
     discover_enabled_codex_remote_ssh_hosts,
     validate_ssh_host_alias,
 )
+from agent_deck.adapters.codex_remote_pet_mirror import (
+    CodexRemotePetMirrorResolution,
+    CodexRemotePetMirrorStatus,
+)
+from agent_deck.config import CodexRemotePetSource
 from agent_deck.core.state import AgentStatus
 from agent_deck.server.app import DaemonPollerConfig, create_app
 
@@ -58,6 +64,26 @@ def test_ssh_host_validation_and_command_are_argv_only() -> None:
             pass
         else:  # pragma: no cover - 失败时给出比 pytest.raises 更直接的候选值。
             raise AssertionError(f"invalid SSH host was accepted: {invalid!r}")
+
+
+def test_config_read_only_projects_selected_avatar_id() -> None:
+    """远端配置响应只投影 desktop 宠物 ID，不保留其他配置内容。"""
+
+    selected, available = _selected_avatar_from_config_read(
+        {
+            "config": {
+                "model": "private-model",
+                "desktop": {
+                    "selected-avatar-id": "builtin:hoots",
+                    "another-private-setting": {"nested": True},
+                },
+            },
+            "origins": {"desktop.selected-avatar-id": {"name": "user"}},
+        }
+    )
+
+    assert selected == "builtin:hoots"
+    assert available is True
 
 
 def test_discovery_only_accepts_managed_auto_connect_true_hosts(
@@ -427,6 +453,57 @@ def test_two_hosts_with_same_thread_id_do_not_collide() -> None:
     assert status["pollers"]["codex_remote_ssh"]["associated_agent_count"] == 2
 
 
+def test_remote_custom_pet_mirror_only_runs_for_remote_config_policy() -> None:
+    """验证只有 remote_config + custom 选择会调用受限素材镜像。
+
+    入参：无。
+    返回：无；断言 remote_config 调用一次，builtin_random 完全不读取素材。
+    错误处理：无。
+    副作用：只运行 fake observer/mirror 的 TestClient lifespan。
+    """
+
+    remote_observer = _PetAwareFakeObserver(selected_avatar_id="custom:fire-cat")
+    remote_mirror = _FakeRemotePetMirror()
+    remote_app = create_app(
+        poller_config=DaemonPollerConfig(
+            codex_remote_ssh_enabled=True,
+            codex_pet_remote_pet_source=CodexRemotePetSource.REMOTE_CONFIG,
+            poll_on_start=True,
+        ),
+        codex_remote_ssh_hosts_reader=lambda: _discovery("minibox"),
+        codex_remote_ssh_observer_factory=lambda _host: remote_observer,
+        codex_remote_pet_mirror=remote_mirror,
+    )
+    with TestClient(remote_app):
+        pass
+
+    random_observer = _PetAwareFakeObserver(selected_avatar_id="custom:fire-cat")
+    random_mirror = _FakeRemotePetMirror()
+    random_app = create_app(
+        poller_config=DaemonPollerConfig(
+            codex_remote_ssh_enabled=True,
+            codex_pet_remote_pet_source=CodexRemotePetSource.BUILTIN_RANDOM,
+            poll_on_start=True,
+        ),
+        codex_remote_ssh_hosts_reader=lambda: _discovery("minibox"),
+        codex_remote_ssh_observer_factory=lambda _host: random_observer,
+        codex_remote_pet_mirror=random_mirror,
+    )
+    with TestClient(random_app):
+        pass
+
+    assert remote_observer.read_pet_config is True
+    assert remote_mirror.calls == [
+        (
+            "minibox",
+            remote_observer.host_id,
+            "custom:fire-cat",
+        )
+    ]
+    assert random_observer.read_pet_config is False
+    assert random_mirror.calls == []
+
+
 def test_daemon_closes_observer_when_chatgpt_connection_is_disabled() -> None:
     """验证 Settings 关闭 connection 后 daemon 无需重启即可停止观察并清理状态。
 
@@ -663,3 +740,102 @@ class _FakeObserver:
         """
 
         self.closed = True
+
+
+class _PetAwareFakeObserver(_FakeObserver):
+    """模拟会按 daemon 策略开启 config/read 的远端 observer。
+
+    入参：构造时保存希望返回的 selected-avatar-id。
+    返回：read_snapshot 在开关启用时投影可用配置。
+    错误处理：无。
+    副作用：只更新内存 ``read_pet_config``。
+    """
+
+    def __init__(self, *, selected_avatar_id: str) -> None:
+        """初始化选择值和动态读取开关。
+
+        入参：``selected_avatar_id`` 是 fake config/read 结果。
+        返回：无。
+        错误处理：无。
+        副作用：无。
+        """
+
+        super().__init__()
+        self.selected_avatar_id = selected_avatar_id
+        self.read_pet_config = False
+
+    def set_read_pet_config(self, enabled: bool) -> None:
+        """记录 poller 是否要求读取远端最小宠物配置。
+
+        入参：enabled 是当前 PETS 来源策略投影。
+        返回：无。
+        错误处理：无。
+        副作用：替换内存布尔值。
+        """
+
+        self.read_pet_config = bool(enabled)
+
+    def read_snapshot(self) -> CodexRemoteSshSnapshot:
+        """返回带可选宠物配置投影的父类安全快照。
+
+        入参：无。
+        返回：read_pet_config 为真时携带选择 ID 和 available=true。
+        错误处理：无。
+        副作用：无。
+        """
+
+        snapshot = super().read_snapshot()
+        return snapshot.model_copy(
+            update={
+                "selected_avatar_id": (
+                    self.selected_avatar_id if self.read_pet_config else None
+                ),
+                "pet_config_available": self.read_pet_config,
+            }
+        )
+
+
+class _FakeRemotePetMirror:
+    """记录 daemon 是否越过策略边界调用远端素材镜像。
+
+    入参：无。
+    返回：resolve 返回 unavailable 结果，足以验证调用条件。
+    错误处理：无。
+    副作用：只向 ``calls`` 追加最小参数。
+    """
+
+    def __init__(self) -> None:
+        """初始化空调用记录。
+
+        入参：无。
+        返回：无。
+        错误处理：无。
+        副作用：无。
+        """
+
+        self.calls: list[tuple[str, str, str | None]] = []
+
+    def resolve(
+        self,
+        *,
+        host: str,
+        host_id: str,
+        selected_avatar_id: str | None,
+        now: datetime | None = None,
+    ) -> CodexRemotePetMirrorResolution:
+        """记录调用并返回不含资产的稳定结果。
+
+        入参：与生产镜像协议一致；now 只用于结果时间。
+        返回：``UNAVAILABLE`` fake resolution。
+        错误处理：无。
+        副作用：追加一条调用记录。
+        """
+
+        self.calls.append((host, host_id, selected_avatar_id))
+        return CodexRemotePetMirrorResolution(
+            host_id=host_id,
+            selected_avatar_id=selected_avatar_id,
+            status=CodexRemotePetMirrorStatus.UNAVAILABLE,
+            updated_at=now or datetime.now(UTC),
+            error="fake_unavailable",
+        )
