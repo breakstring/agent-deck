@@ -883,7 +883,7 @@ def test_daemon_callback_calls_uvicorn_run(
     assert poller_config.codex_app_state_scan_limit == 80
     assert poller_config.codex_app_active_window_seconds == 3600
     assert poller_config.codex_app_active_session_limit == 10
-    assert poller_config.codex_remote_ssh_enabled is False
+    assert poller_config.codex_remote_ssh_enabled is True
     assert "codex_remote_ssh_hosts" not in poller_config.model_dump()
     assert poller_config.codex_quota_enabled is True
     assert poller_config.codex_quota_interval_seconds == 300.0

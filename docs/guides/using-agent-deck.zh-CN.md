@@ -312,7 +312,7 @@ N4 Pro 的宠物按键使用 `112×112` 深色画布，完整 cell 等比缩放�
 ### 6.2 远端 ChatGPT App 任务状态（SSH）
 
 ChatGPT App 的 [Remote Connections](https://learn.chatgpt.com/docs/remote-connections.md)
-可以通过 SSH 在另一台电脑运行 Codex。Agent Deck 对这一类连接提供显式 opt-in 的只读观察：
+可以通过 SSH 在另一台电脑运行 Codex。Agent Deck 默认启用这一类连接的只读观察：
 它为每个 host 创建自己的 SSH 子进程，执行固定的 `codex app-server proxy`，再按
 [Codex app-server](https://learn.chatgpt.com/docs/app-server.md) 合同只调用
 `initialize`、`initialized` 和 `thread/list(useStateDbOnly=true)`。这条连接和 ChatGPT App
@@ -332,8 +332,9 @@ uv run agent-deckctl codex-remote-state \
 `preview`（通常来自首条 prompt）、turn、item、rollout path 和原始响应会在适配器内立即丢弃，
 不会进入 daemon 状态、日志或 `/status`。
 
-确认诊断成功后，先在 ChatGPT 的 **Settings → Connections** 中添加并启用需要观察的
-SSH Connection，再在本机 `agent-deck.toml` 打开 Agent Deck 总开关：
+确认诊断成功后，只需在 ChatGPT 的 **Settings → Connections** 中添加并启用需要观察的
+SSH Connection。Agent Deck 的远端观察总开关默认启用；如需调整轮询参数，可在本机
+`agent-deck.toml` 显式配置：
 
 ```toml
 [codex.remote_ssh]
@@ -351,7 +352,8 @@ Agent Deck 每轮只读取 ChatGPT 自己保存的 managed connections，并且�
 auto-connect 为 `false`/缺失的记录当作授权。用户在 Settings 中关闭 Connection 后，daemon
 会动态关闭自己的 observer 并清理旧状态；设置文件缺失或结构无法确认时同样 fail-closed。
 
-保存总开关后重启后台服务。多个已启用 host 会各自复用一条独立连接并并行轮询；本地和远端
+如需完全关闭 Agent Deck 的远端观察，可设置 `enabled = false` 并重启后台服务。多个已启用
+host 会各自复用一条独立连接并并行轮询；本地和远端
 thread 即使 ID 相同也使用不同的 host-aware agent identity。只消费
 `sourceKinds=["vscode"]` 的顶层 thread，
 因此 Codex CLI、exec 和 child/subagent 不会触发 App Key 宠物覆盖。状态映射如下：

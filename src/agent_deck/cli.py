@@ -282,8 +282,8 @@ def daemon_callback(
     `codex_token_usage_poll_interval_seconds` 控制 token usage 刷新周期；
     Codex 宠物不提供独立 CLI 选择，始终使用配置文件 `[codex.pet]` 的开关、刷新率、
     面板 FPS 与 motion 并跟随 Codex 全局选择；
-    `[codex.remote_ssh]` 只有显式 enabled 时才跟随 ChatGPT Settings 中已启用自动连接的
-    SSH Connection；不会从 Agent Deck 配置或 ``~/.ssh/config`` 扩展主机；
+    `[codex.remote_ssh]` 默认启用，但只跟随 ChatGPT Settings 中已启用自动连接的 SSH
+    Connection；可显式设为 disabled，且不会从 Agent Deck 配置或 ``~/.ssh/config`` 扩展主机；
     `disable_streamdock_quota_touchscreen` 可关闭旧 quota-only 真实硬件触屏下发；
     `config_path` 指向 daemon 默认配置；`disable_hardware_renderer` 可关闭默认真实硬件渲染；
     `device_profile`、`render_interval_seconds` 和 `renderer_fps` 是面向临时调试的通用覆盖项，

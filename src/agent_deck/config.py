@@ -151,7 +151,7 @@ class CodexPetConfig(BaseModel):
 class CodexRemoteSshConfig(BaseModel):
     """配置经独立 SSH app-server proxy 只读观察远端 ChatGPT App。
 
-    入参：``enabled`` 是 Agent Deck 总开关，默认关闭；主机集合不在本配置重复维护，只读取
+    入参：``enabled`` 是 Agent Deck 总开关，默认启用；主机集合不在本配置重复维护，只读取
     ChatGPT Settings 已管理且 auto-connect=true 的 SSH connection。``poll_interval_seconds``
     和 ``timeout_seconds`` 控制设置刷新与单次 RPC；``thread_limit`` 限制远端 state DB 页大小；
     ``stale_after_seconds`` 控制连接持续失败后何时清理旧状态；
@@ -163,7 +163,7 @@ class CodexRemoteSshConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    enabled: bool = False
+    enabled: bool = True
     poll_interval_seconds: float = Field(default=5.0, ge=1.0)
     timeout_seconds: float = Field(default=10.0, ge=1.0)
     thread_limit: int = Field(default=80, ge=1, le=200)
