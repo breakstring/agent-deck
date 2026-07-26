@@ -457,9 +457,9 @@ P5 macOS 产品化边界：
 7. 按 `Needs input > Blocked > Ready > Running > Idle` 聚合顶层 Codex 状态并排除 child agent。
    waiting、failed、review 各播放三轮后进入慢速 idle；`Ready` 首版以
    `COMPLETED_RECENTLY` 近似。同一状态时间戳不重复触发。
-8. N4 Pro PETS 复用 `800×136` 虚拟面板与现有 persistent renderer：Running 约 15 秒完成一次
-   全宽左右往返；Idle 使用 45 秒确定周期（约 30 秒驻留、15 秒走向另一侧）；反应动作冻结当前
-   x 坐标。所有动画以 monotonic time 与累计帧时长采样，不另起 HID 会话、线程或刷新循环。
+8. N4 Pro PETS 复用 `800×136` 虚拟面板与现有 persistent renderer。早期单角色控制器使用
+   Running 约 15 秒全宽往返、Idle 约 30 秒驻留加 15 秒换边的确定周期；当前多角色行为以第 16 项
+   的独立轨迹为准。两种路径都以 monotonic time 与累计帧时长采样，不另起 HID 会话或刷新循环。
 9. `motion=auto` 尽力读取 macOS Reduce Motion；`reduced` 固定 idle 首帧、不横移。`/status`
    增加 `codex_pet` 的选择、解析、版本、activity、motion、更新时间和短错误诊断，不返回素材。
 10. 配置页支持把任意按键设为“Codex 宠物”，完整保存/重载，并明确提示“仅展示、点击无动作”。
@@ -513,13 +513,14 @@ P5 macOS 产品化边界：
   revision 与 fake hardware 单会话行为；以本轮最终测试记录为准，本节不预先标记通过。
 - 真机必须使用当前 Rick 做 60 秒状态 smoke 和 15 分钟 soak，重新测量全宽约 15 秒往返、
   有效背景刷新不低于约 7 FPS、`open/init=1`、无非预期重连/HID 错误/CPU 或线程持续增长，并在
-  结束时显式关闭且不遗留 `agent-deckd`。历史约 9.56–9.57 FPS 只作为旧基线，不算本轮证据。
+  结束时显式关闭且不遗留 `agent-deckd`。单宠物首版 901 秒 soak 的约 7.88 FPS 只作为旧基线，
+  不算当前多角色实现的本轮证据。
 
 后续可拆任务：
 
 1. `AmbientSurface` 抽象。
 2. Claude 或其他 Agent 的宠物/ambient 状态 adapter。
-3. Codex App 内置宠物的合法只读发现机制。
+3. 持续跟踪 ChatGPT/Codex App 内置宠物的 ASAR 资源合同变化，并为不兼容版本保留安全降级。
 4. v2 gaze、鼠标跟踪和显式宠物交互。
 5. Codex CLI 的“执行宿主 + 终端展示客户端”复合启动/聚焦模型。
 6. LED 动效规则。

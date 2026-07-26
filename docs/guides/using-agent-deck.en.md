@@ -134,6 +134,8 @@ scripts/agent-deckd-tmux.sh restart
 - The ten main keys can open or switch applications, open URLs, send keyboard shortcuts, show agent status,
   show quota/usage status, show the Codex pet, or remain unassigned. A Codex pet key is display-only and
   pressing it performs no action.
+- A ChatGPT/Codex launcher key can optionally show a pet while a matching task is active. The pet temporarily
+  covers the original icon; pressing the key still only opens or focuses the application.
 - A shortcut can be one physical key, a chord, or a sequence of up to 16 steps. Each released step may wait 0–2000 ms, and the full sequence is limited to 10 seconds.
 - Application, website, and custom shortcut icons are cached locally and shared by the configuration preview and hardware rendering. A shortcut without a custom image gets an auto-generated chord icon, and the Web preview uses the exact PNG emitted by the hardware renderer.
 - Each of the four knobs can have its own rotation action. For volume actions, pressing the knob implicitly toggles output mute or microphone mute; pressing is not separately configured.
@@ -141,6 +143,9 @@ scripts/agent-deckd-tmux.sh restart
 - With the Codex pet enabled, the bottom virtual panel manually rotates through Brand, Quota, Tokens, and
   Pets; disabling the pet removes Pets from that rotation. A pending approval MESSAGE temporarily overrides
   the display without changing the selected panel, which returns naturally when the approval ends.
+- PETS renders active top-level local tasks and tasks from enabled SSH Remote Connections as independent pets.
+  Select the PETS touch bar in the Web device preview to configure the remote-pet source and slow, medium,
+  or fast patrol speed.
 - If the N4 Pro is unplugged, loses power, or restarts, the background service waits for it to return and restores the display, lighting, and input. This normally takes a few seconds and does not require the official StreamDock application.
 
 ### 4.4 Keyboard Shortcuts and macOS Permission
@@ -186,6 +191,7 @@ For everyday use, open [http://127.0.0.1:8765/](http://127.0.0.1:8765/), edit th
 - Custom shortcut icons: `~/Library/Application Support/AgentDeck/shortcut-icons/`
 - Knob and lighting layout: `~/Library/Application Support/AgentDeck/n4pro-rotary-layout.json`
 - Codex quota presentation policy: `~/Library/Application Support/AgentDeck/quota-presentation.json`
+- PETS panel preferences: `~/Library/Application Support/AgentDeck/n4pro-pets-panel.json`
 
 The repository's [`agent-deck.toml`](../../agent-deck.toml) is the default-settings example. Explicit configuration paths, isolated test directories, and custom quota presentation rules are advanced topics covered by the [Developer Q&A](../references/developer-q-and-a.md) and [Codex quota reference](../references/codex-app-server-quota.md).
 
@@ -213,12 +219,28 @@ The installer creates backups before edits. Keep the default approval setting un
 
 ### 6.1 Codex Pet
 
-Agent Deck does not keep a separate pet selection. It reads Codex's global `selected-avatar-id` from either
-the legacy top level or the current `[desktop]` table, using `CODEX_HOME` and falling back to `~/.codex`.
-For `custom:rick`, it prefers `pets/rick/pet.json` and supports
-the legacy `avatars/rick/avatar.json` location. It never copies local pet assets into this repository.
+The pet system has three independent presentation surfaces:
 
-Configure pet display and polling in [`agent-deck.toml`](../../agent-deck.toml):
+1. Assign **Codex Pet** to a main key for persistent global Codex activity. This key is display-only.
+2. Assign a ChatGPT/Codex application to a main key and enable **Show pet while a task is active**. The pet
+   temporarily covers the app icon, while the key continues to open or focus the application.
+3. Manually switch the bottom logical panel to PETS. Every top-level local or remote ChatGPT task that is
+   active or showing completion feedback becomes an independent roaming actor.
+
+The shortest setup is to configure either pet-capable key in the Web UI, select the touch bar in the N4 Pro
+preview to open PETS settings, and choose **Save and Apply**. Inspect the resolved assets, actors, and panel
+policy with:
+
+```bash
+uv run agent-deckctl status
+```
+
+Agent Deck does not maintain a second local pet selection. It reads Codex's global `selected-avatar-id` from
+the legacy top level or current `[desktop]` table, using `CODEX_HOME` and falling back to `~/.codex`. For
+`custom:rick`, it prefers `pets/rick/pet.json` and supports the legacy
+`avatars/rick/avatar.json` location.
+
+Configure the initial pet behavior in [`agent-deck.toml`](../../agent-deck.toml):
 
 ```toml
 [codex.pet]
@@ -226,42 +248,165 @@ enabled = true
 refresh_interval_seconds = 5.0
 panel_fps = 8
 motion = "auto" # auto | full | reduced
+remote_pet_source = "builtin_random"
+patrol_speed = "medium"
 ```
 
-Disabling the feature removes PETS from the manual panel rotation without changing Codex. `auto` follows
-macOS Reduce Motion when it can be read; `reduced` pins the first idle frame and disables horizontal travel.
-Version 1 custom sheets must be 8×9 at `1536×1872`, version 2 sheets 8×11 at `1536×2288`, with fixed
-`192×208` cells. Version 2 gaze rows are not used in the first release. Absolute paths, `..`, and symlink
-escapes in `spritesheetPath` are rejected. Built-in Codex pets are not extracted from the app: the key uses
-the existing static Codex icon and PETS shows a short diagnostic. Rendering preserves each complete cell
-without trimming or per-frame recentering. RGB residue in fully transparent pixels is normalized and warned
-about, but does not reject an asset that Codex itself accepts.
+- `enabled = false` removes PETS from manual panel rotation without changing Codex's selection.
+- `refresh_interval_seconds` controls read-only checks of Codex configuration and custom packages.
+- `panel_fps` is the maximum PETS target frame rate; device transport can lower the effective rate.
+- `motion = "auto"` follows macOS Reduce Motion when available. `reduced` pins representative frames and
+  disables travel; `full` always enables animation.
+- `remote_pet_source` and `patrol_speed` are startup defaults. PETS preferences saved from the Web device
+  preview are stored in `n4pro-pets-panel.json` and take precedence on later runs.
 
-The pet is presentation-only and never changes approvals, task execution, or Agent slots. Top-level Codex
-tasks are aggregated with `Needs input > Blocked > Ready > Running > Idle` priority; child agents are ignored.
-Waiting, failed, and review reactions play three cycles and then return to slow idle. Running uses a fixed
-key animation and directional travel on the touch bar. `Ready` currently approximates
-`COMPLETED_RECENTLY`, because no reliable unread signal is available.
+Version 1 custom sheets must be 8×9 at `1536×1872`, and version 2 sheets 8×11 at `1536×2288`, with fixed
+`192×208` cells. Version 2 gaze rows are not used. Absolute paths, `..`, and symlink escapes in
+`spritesheetPath` are rejected. Rendering preserves complete cells without trimming or per-frame
+recentering. RGB residue in fully transparent pixels is normalized and reported as a warning, but does not
+reject an asset that Codex itself accepts.
 
-The N4 Pro key uses a `112×112` dark canvas and does not travel. PETS uses the existing `800×136` virtual
-panel: running completes a full left/right round trip in about 15 seconds, while idle waits about 30 seconds
-and walks to the other side over 15 seconds in a deterministic 45-second cycle. Reactions freeze the current
-position. A pending approval MESSAGE remains the highest-priority transient override and never replaces the
-user's selected PETS, Quota, or other panel.
+Built-in pets are discovered read-only from the known installed ChatGPT/Codex application `app.asar`.
+Agent Deck reads only the required resource at its exact offset and decodes active assets in memory. It
+does not scan unrelated applications, unpack built-in assets to disk or the repository, or redistribute
+built-in or custom pet material.
 
-`uv run agent-deckctl status` and `/status` expose a compact `codex_pet` diagnostic with the selected ID,
-resolution state, name, sprite version, global activity, motion mode, update time, asset error, and separate
-motion fallback diagnostic. They do
-not expose image bytes or a full sprite sheet. The first release does not support a separate Agent Deck pet
-picker, multiple or per-session pets, pet-key interactions, gaze/mouse tracking, or replacement of existing
-Agent status keys.
+Pets are presentation-only and never change approvals, task execution, or Agent slots. Global pet activity
+aggregates top-level Codex tasks with `Needs input > Blocked > Ready > Running > Idle` priority and ignores
+child agents. Waiting, failed, and review reactions play three cycles before returning to slow idle.
+`Ready` currently approximates `COMPLETED_RECENTLY`, because no reliable unread signal is available.
 
-Before release, validate the current Rick with one pet key and PETS selected: run a 60-second state smoke and
-a 15-minute soak; verify an approximately 15-second full-width round trip without clipping or ghosting and
-an effective background rate of roughly 7 FPS or better. Confirm `open/init=1` for the connection, no
-unexpected reconnects, HID errors, or sustained CPU/thread growth, then explicitly close the session and
-leave no `agent-deckd` process. These are required steps, not a claim that physical-hardware validation has
-already passed.
+#### Task-state overlay on ChatGPT/Codex launcher keys
+
+The launcher overlay is independent from the dedicated pet key and PETS panel. The UI recognizes current
+OpenAI bundle identifiers or explicit `ChatGPT.app`/`Codex.app` paths; it does not trust a matching display
+name alone. Enabling the overlay preserves both the open-or-focus action and the user's original icon.
+
+Only top-level `codex-app:*` Desktop tasks participate. Codex CLI, child agents, and unrelated apps are
+excluded. Matching tasks aggregate with `Needs input > Error > Review > Running > Completed` priority.
+Running, waiting, and error states remain visible until cleared. `COMPLETED_RECENTLY` plays three waving
+cycles, holds the last frame for five seconds, and restores the original app icon.
+
+Multiple launcher keys may enable the overlay. They share asset and frame caches. The default write budget
+is 10 key updates per second with at least 5 FPS per animated key, so up to two keys animate and additional
+active keys use representative static frames. Pressing a launcher only changes dynamic-slot priority; it
+does not acknowledge a task notification. `/status.codex_pet.app_overlay` reports linked, visible, animated,
+and static-fallback key counts plus the effective FPS and write budget.
+
+#### Multi-task PETS colony
+
+PETS uses the existing `800×136` virtual panel but does not collapse every task into one global state. Each
+top-level local or remote `codex-app:*` task becomes an actor only while active or showing completion
+feedback. Its position, direction, animation phase, and base speed are derived from the Agent identity. All
+actors share the full width. Their speed varies slightly with independent low-frequency envelopes;
+collisions bounce only in short windows so actors do not form permanent territories. Local actors have no
+host marker. Remote actors use a stable, muted halo derived from the observer host; the halo identifies
+execution location, not success or failure.
+
+Select the PETS touch bar in the Web device preview to save:
+
+- **Remote pet source**: `follow_local` uses the local selection; `remote_config` reads the remote Codex pet
+  ID; `builtin_random` gives each task a stable assignment from the locally installed built-in catalog
+  without reading remote pet configuration.
+- **Patrol speed**: `slow`, `medium`, or `fast`. Changing speed preserves current actor positions.
+
+`remote_config` adds the minimum read-only `config/read` call only for SSH connections managed by ChatGPT
+Settings with auto-connect strictly enabled, and retains only `selected-avatar-id`. A recognized remote
+built-in ID reuses the corresponding local App asset. For remote `custom:<name>`, a short-lived system SFTP
+process mirrors only the manifest and its single declared sprite sheet into Agent Deck's content-addressed
+cache. It never executes pet code, copies the whole directory, writes to the remote host, or modifies the
+local Codex directory. Unknown, oversized, symlinked, path-escaping, or invalid packages attempt to fall
+back to a stable built-in pet instead of impersonating a stale selection.
+
+A pending approval MESSAGE remains the highest-priority transient override and never rewrites the selected
+PETS, Quota, or other panel. The dedicated N4 Pro pet key still renders one complete cell on a `112×112`
+surface without horizontal travel.
+
+`uv run agent-deckctl status` and `/status` expose the selected ID, resolution state, sprite version, global
+activity, motion mode, and short asset diagnostics under `codex_pet`. `app_overlay` reports launcher-key
+scheduling. `panel_colony` reports actor and remote-actor counts, assignments, source policy, speed,
+collisions, built-in catalog state, and remote custom-cache state. Diagnostics never expose image bytes, a
+full sprite sheet, complete remote configuration, or prompts.
+
+The current release does not support uploading a separate Agent Deck pet package, choosing a pet per task
+manually, pet-key interactions, hover/jump, version 2 gaze behavior, mouse tracking, or replacing Agent
+status keys. Codex CLI tasks do not become ChatGPT App PETS actors.
+
+### 6.2 Remote ChatGPT App Task State over SSH
+
+ChatGPT App [Remote Connections](https://learn.chatgpt.com/docs/remote-connections.md) can run Codex on
+another computer over SSH. Agent Deck enables read-only observation of these connections by default. Each
+host gets an independent SSH subprocess running `codex app-server proxy`. Normal operation calls only
+`initialize`, `initialized`, and `thread/list(useStateDbOnly=true)`; PETS `remote_config` additionally calls
+read-only `config/read` and immediately projects only the pet selection ID.
+
+Verify an SSH alias, remote Codex executable, and shared app-server before relying on it:
+
+```bash
+uv run agent-deckctl codex-remote-state \
+  --host minibox.example \
+  --timeout-seconds 10 \
+  --limit 80
+```
+
+The result keeps only host summary, cwd, optional thread name, timestamps, and coarse status counts.
+Previews, turns, items, rollout paths, and raw responses are discarded before they can reach daemon state,
+logs, or `/status`.
+
+After the diagnostic succeeds, add and enable the SSH connection in ChatGPT **Settings → Connections**.
+The observer is enabled by default; advanced polling settings are:
+
+```toml
+[codex.remote_ssh]
+enabled = true
+poll_interval_seconds = 5.0
+timeout_seconds = 10.0
+thread_limit = 80
+stale_after_seconds = 20.0
+completed_feedback_seconds = 10.0
+```
+
+Agent Deck reads only ChatGPT-managed connections whose auto-connect value is strictly `true`. It does not
+discover hosts from `~/.ssh/config`, historical projects, or a selected-host field. Disabling a connection
+in ChatGPT closes the corresponding observer and clears its old state; ambiguous or missing Settings data
+fails closed. Local and remote threads use host-aware identities, and only top-level `sourceKinds=["vscode"]`
+threads participate, excluding CLI, exec, and child/subagent work.
+
+| Remote `ThreadStatus` | Agent Deck |
+| --- | --- |
+| `active + waitingOnApproval` | `APPROVAL_NEEDED` |
+| `active + waitingOnUserInput` | `WAITING_USER` |
+| `active` without a waiting flag | `THINKING` |
+| `systemError` | `ERROR` |
+| `active -> idle` | Brief local `COMPLETED_RECENTLY`, then restore the original icon |
+| Cold `idle` or `notLoaded` | Do not cover the original icon |
+
+These same top-level remote tasks become independent PETS actors. Changing their pet-source policy changes
+only asset assignment; it does not change host authorization, task polling, launcher overlays, or the
+remote tasks themselves. A persistent connection failure clears stale state after `stale_after_seconds`.
+`/status.pollers.codex_remote_ssh` reports Settings discovery counts, per-host success times, short error
+types, status counts, and associated Agent counts.
+
+OpenAI-relayed Remote Connections do not currently expose a public third-party thread-status interface.
+Agent Deck does not reverse-engineer that private transport; this feature supports SSH Remotes that are
+already reachable as `ssh <host>` from the local Mac.
+
+#### Physical-device acceptance checklist
+
+The following steps must be rerun before a release; they are not a claim that the current multi-actor
+implementation has passed physical-hardware validation:
+
+1. Configure the current local custom pet, one dedicated pet key, and PETS.
+2. Run multiple local tasks and at least one authorized SSH Remote task. Verify independent actors, stable
+   remote halos, all three source policies, and all three patrol speeds.
+3. Run a 60-second state smoke and a 15-minute soak. Check for clipping, ghosting, or fixed-territory
+   crowding.
+4. Measure an effective PETS background rate of roughly 7 FPS or better. The first single-pet
+   implementation's 901-second result of about 7.88 FPS is only an older baseline.
+5. Confirm `open/init=1`, no unexpected reconnects or HID errors, and no sustained CPU/thread growth.
+6. Explicitly close the device session and background service, leaving no `agent-deckd` process.
+7. With one, two, and three pet-enabled launcher keys, measure animation rate, static fallback, response,
+   original-icon restoration, and HID errors.
 
 ## 7. Token, Cost, and Quota
 

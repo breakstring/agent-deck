@@ -146,6 +146,8 @@ scripts/agent-deckd-tmux.sh restart
 - 启用 Codex 宠物后，底部虚拟面板按“品牌图 -> 订阅额度 -> 用量 -> 宠物”手动轮换；关闭宠物时
   自动跳过宠物面板。用量可在日、周、月、全部之间切换。待审批 MESSAGE 会临时覆盖当前画面，
   但不修改用户选择的面板，审批结束后会自然恢复。
+- PETS 面板会把本机和已启用 SSH Remote Connection 中活动的顶层 ChatGPT 任务显示为独立宠物；
+  点击 Web 设备预览中的 PETS touch bar，可以设置远端宠物来源和慢/中/快三档巡游速度。
 - N4 Pro 被拔掉、断电或自动重启后，后台服务会持续等待它重新出现，并恢复画面、灯光和输入。
   通常几秒内完成，不需要打开官方 StreamDock App。
 
@@ -189,6 +191,7 @@ uv run agent-deckctl hardware n4pro splash
 - 快捷键自定义图标：`~/Library/Application Support/AgentDeck/shortcut-icons/`
 - 旋钮与灯光布局：`~/Library/Application Support/AgentDeck/n4pro-rotary-layout.json`
 - Codex 订阅额度展示：`~/Library/Application Support/AgentDeck/quota-presentation.json`
+- PETS 面板偏好：`~/Library/Application Support/AgentDeck/n4pro-pets-panel.json`
 
 仓库中的 [`agent-deck.toml`](../../agent-deck.toml) 是默认设置示例。手动指定配置文件、隔离测试
 目录或调整订阅额度展示规则属于高级用法，请参阅[开发者 Q&A](../references/developer-q-and-a.md)
@@ -219,11 +222,26 @@ uv run agent-deckctl codex-install --apply
 
 ### 6.1 Codex 宠物
 
-Agent Deck 不维护第二套宠物选择。它只读跟随 Codex 配置中的全局 `selected-avatar-id`（兼容旧版
-顶层字段和当前 `[desktop]` 字段）：先使用 `CODEX_HOME`，未设置时读取 `~/.codex`。例如 Codex
-选中 `custom:rick` 时，Agent Deck 优先从
-`pets/rick/pet.json` 加载；旧版 `avatars/rick/avatar.json` 仍兼容，但两个目录并存时以 `pets`
-为准。不会把本机宠物素材复制到仓库或通过状态接口返回。
+宠物系统包含三种独立展示，启用其中一种不会替换另外两种：
+
+1. 把一个主按键设为“Codex 宠物”，常驻展示全局 Codex 活动；这是纯展示键，按下不执行动作。
+2. 把一个主按键设为 ChatGPT/Codex App，并开启“任务活跃时显示宠物”；宠物只临时覆盖 App 图标，
+   按键仍然打开或聚焦 App。
+3. 手动把底部逻辑面板切到 PETS；本机和远端处于活动或完成反馈状态的每个顶层 ChatGPT 任务会
+   成为独立巡游角色。
+
+最快启用方式是在 Web 配置页选择一个主按键，设为“Codex 宠物”或 ChatGPT App 启动键，再点击
+N4 Pro 预览中的 touch bar 打开 PETS 设置。点击“保存并应用”后，用以下命令确认素材、角色和
+面板策略：
+
+```bash
+uv run agent-deckctl status
+```
+
+Agent Deck 不维护第二套本机宠物选择。它只读跟随 Codex 配置中的全局 `selected-avatar-id`（兼容
+旧版顶层字段和当前 `[desktop]` 字段）：先使用 `CODEX_HOME`，未设置时读取 `~/.codex`。例如
+Codex 选中 `custom:rick` 时，Agent Deck 优先从 `pets/rick/pet.json` 加载；旧版
+`avatars/rick/avatar.json` 仍兼容，但两个目录并存时以 `pets` 为准。
 
 在 [`agent-deck.toml`](../../agent-deck.toml) 中可配置展示与刷新节奏：
 
@@ -233,6 +251,8 @@ enabled = true
 refresh_interval_seconds = 5.0
 panel_fps = 8
 motion = "auto" # auto | full | reduced
+remote_pet_source = "builtin_random"
+patrol_speed = "medium"
 ```
 
 - `enabled = false` 会禁用动态宠物并从手动面板轮换中移除 PETS；它不会改写 Codex 的宠物选择。
@@ -240,6 +260,8 @@ motion = "auto" # auto | full | reduced
 - `panel_fps` 是 PETS 面板的最高目标帧率；实际刷新率还受设备传输能力影响。
 - `motion = "auto"` 会尽力读取 macOS 的“减弱动态效果”；读取失败时使用完整动画并在诊断中说明。
   `reduced` 固定显示 idle 首帧且不横向移动，`full` 始终播放完整动画。
+- `remote_pet_source` 和 `patrol_speed` 是首次启动时的 PETS 面板默认值；用户在 Web 设备预览中
+  保存的设置会写入 `n4pro-pets-panel.json`，以后优先于这里的默认值。
 
 自定义宠物包必须保持 Codex 图集合同。v1 为 `1536×1872` 的 8×9 图集，v2 为
 `1536×2288` 的 8×11 图集，每格都为 `192×208`。首版可解析 v1/v2，但不会使用 v2 的 gaze 行。
@@ -249,8 +271,10 @@ warning，但不会因此拒绝 Codex 本身能够加载的素材。
 或非法几何不会猜测动作行。相同选择 ID 短暂读取失败时保留最近一次成功结果；如果选择 ID 已改变
 却无法加载，则停止展示旧宠物，避免把旧素材冒充为当前选择。
 
-Codex 内置宠物首版不解析 App 内部资源：宠物按键回退到现有静态 Codex 图标，PETS 面板显示简短
-诊断。Agent Deck 不重新分发 Codex 内置素材、自定义 Rick 素材或它们的派生资产。
+已安装 ChatGPT/Codex App 的内置宠物会从已知 App bundle 的 `app.asar` header 按需只读发现，
+只有当前角色实际使用某只宠物时才按精确 offset 解码图集到内存。Agent Deck 不遍历其他 App、
+不把内置素材解包到磁盘或仓库，也不重新分发内置宠物、自定义 Rick 或它们的派生资产。App 不存在、
+资源合同不兼容或自定义包加载失败时，相关展示安全降级，并在状态诊断中说明原因。
 
 宠物是纯展示层，不会改变审批、任务执行或 Agent slot。全局活动只聚合顶层 Codex 任务，忽略
 child agent，并按以下优先级选择最新的触发源：
@@ -295,19 +319,41 @@ child agent 和其他 App。多个任务按 `Needs input > Error > Review > Runn
 图标，App 按键动作仍可执行。`/status.codex_pet.app_overlay` 会报告关联、可见、动态、静态降级键数，
 有效目标 FPS 以及 10 次/秒预算。Codex CLI 启动不在本能力范围内；终端宿主与展示客户端会单独设计。
 
-N4 Pro 的宠物按键使用 `112×112` 深色画布，完整 cell 等比缩放且不会横向移动。PETS 使用现有
-`800×136` 虚拟面板：运行中约 15 秒完成一次全宽左右往返；idle 使用确定性的 45 秒周期，约
-30 秒驻留后用 15 秒走向另一端，下个周期反向。等待、失败和完成反应会冻结当前位置，切换状态
-不会把宠物瞬移回起点。待审批 MESSAGE 仍具有最高显示优先级，但只是临时覆盖；它不会把人工选择
-的 PETS、Quota 或其他面板改写成 MESSAGE。
+#### PETS 多任务巡游
+
+PETS 使用现有 `800×136` 虚拟面板，但不会把所有任务压成一个全局状态。每个本机或远端顶层
+`codex-app:*` 任务只在活动或完成反馈期间成为独立角色，拥有由 agent identity 稳定派生的位置、
+方向、动画相位和基础速度。角色共享完整横向空间，速度会做轻微、错相的周期变化；碰撞只在短窗口
+内反弹，其余时间允许穿过，避免宠物长期挤在固定领地。本机角色不画地垫，远端角色按 observer host
+使用稳定、低饱和光环；光环只表示执行主机，不表示成功或失败。
+
+点击 Web 配置页 N4 Pro 预览中的 PETS touch bar，可以保存：
+
+- **远端宠物来源**：`follow_local` 跟随本机选择；`remote_config` 只读远端 Codex 选择；
+  `builtin_random` 按任务稳定分配本机已安装 ChatGPT/Codex App 中的内置宠物，且不读取远端配置。
+- **巡游速度**：`slow`、`medium`、`fast`。切换速度不会把现有角色瞬移回起点。
+
+本机角色优先使用当前 Codex 选择。`remote_config` 只对 ChatGPT Settings 中 managed 且
+auto-connect 为 `true` 的 SSH connection 增加一次最小 `config/read` 投影，并只保留
+`selected-avatar-id`。远端选择是本机可识别内置宠物时，复用本机 App 里的同名资源；远端
+`custom:<name>` 只通过短生命周期系统 SFTP 镜像 manifest 和其中声明的单张图集到 Agent Deck
+自己的内容寻址缓存。它不会读取完整远端配置、执行宠物代码、复制整个目录、写入远端或改动本机
+Codex 目录。未知、过大、符号链接、越界路径或校验失败的包会尝试回退到稳定内置宠物，不会冒充
+旧选择。
+
+N4 Pro 的独立宠物按键仍使用 `112×112` 画布，完整 cell 等比缩放且不会横向移动。待审批 MESSAGE
+在 PETS 上具有最高显示优先级，但只是临时覆盖；它不会把人工选择的 PETS、Quota 或其他面板改写
+成 MESSAGE。
 
 运行 `uv run agent-deckctl status` 或读取 `/status` 时，可在 `codex_pet` 中查看启用状态、
 `selected-avatar-id`、解析结果、名称、图集版本、全局 activity、motion 模式、更新时间、素材错误
-和独立的 motion 降级诊断，以及 `app_overlay` 下的 App Key 调度诊断。
-诊断不会包含原始图片或完整图集。
+和独立的 motion 降级诊断；`app_overlay` 提供 App Key 调度诊断，`panel_colony` 提供角色数、
+远端角色数、素材分配、来源策略、速度、碰撞计数、内置 catalog 和远端 custom 缓存状态。诊断不会
+包含原始图片、完整图集、完整远端配置或 prompt。
 
-当前不支持 Agent Deck 单独选宠物、多宠物、按会话选择不同宠物、宠物按键交互、v2 gaze/鼠标
-跟踪，也不替换现有 Agent 状态按键。
+当前不支持 Agent Deck 上传独立宠物包、让用户逐任务手选宠物、宠物按键交互、hover/jump、
+v2 gaze 或鼠标跟踪，也不替换现有 Agent 状态按键。Codex CLI 任务不会进入 ChatGPT App 的
+PETS 角色；终端宿主与展示客户端需要单独建模。
 
 ### 6.2 远端 ChatGPT App 任务状态（SSH）
 
@@ -315,7 +361,8 @@ ChatGPT App 的 [Remote Connections](https://learn.chatgpt.com/docs/remote-conne
 可以通过 SSH 在另一台电脑运行 Codex。Agent Deck 默认启用这一类连接的只读观察：
 它为每个 host 创建自己的 SSH 子进程，执行固定的 `codex app-server proxy`，再按
 [Codex app-server](https://learn.chatgpt.com/docs/app-server.md) 合同只调用
-`initialize`、`initialized` 和 `thread/list(useStateDbOnly=true)`。这条连接和 ChatGPT App
+`initialize`、`initialized` 和 `thread/list(useStateDbOnly=true)`；只有 PETS 选择
+`remote_config` 时才增加只读 `config/read`，且立即只投影宠物选择 ID。这条连接和 ChatGPT App
 自己的连接彼此独立；Agent Deck 不读取或复用 App 的 socket 文件描述符，也不调用
 `thread/resume`、`thread/start`、`turn/start`、interrupt、archive 等改变远端状态的方法。
 
@@ -367,6 +414,9 @@ thread 即使 ID 相同也使用不同的 host-aware agent identity。只消费
 | `active -> idle` | 本机短暂 `COMPLETED_RECENTLY`，窗口后恢复原图标 |
 | 冷启动 `idle`、`notLoaded` | 不覆盖原图标 |
 
+这些远端顶层任务同时也是 PETS 面板的独立角色。切换 PETS 的远端宠物来源只改变角色素材如何
+分配，不改变 SSH host 授权、任务状态轮询、App Key 覆盖或远端任务本身。
+
 app-server 当前粗粒度状态不能区分 thinking 与 running tool，也没有显式 review/未读信号，因此
 Agent Deck 不猜测 `RUNNING_TOOL` 或常驻 review。连接持续失败超过 `stale_after_seconds` 后会清理
 该 host 的旧活动状态并恢复 App Key 原图标；按键原有的“打开或聚焦 ChatGPT App”动作不受影响。
@@ -381,11 +431,14 @@ OpenAI 中转型 Remote Connections 目前没有供第三方读取远端 thread/
 以下是发布前必须重新执行的验收步骤，不代表当前版本已经通过真机测试：
 
 1. 使用 Codex 当前选择的 Rick，同时配置一个“Codex 宠物”按键并手动切到 PETS 面板。
-2. 先做 60 秒状态 smoke，再做 15 分钟 soak；确认约 15 秒完成一次全宽往返，且无裁切和鬼影。
-3. 测量 PETS 背景有效刷新率，目标不低于约 7 FPS；历史约 9.56–9.57 FPS 只能作为旧基线。
-4. 确认单次连接期间 `open/init=1`，没有非预期重连、HID 错误、CPU 或线程数持续增长。
-5. 结束时显式关闭设备会话与后台服务，确认没有遗留 `agent-deckd` 进程。
-6. 另配置 1、2、3 个 ChatGPT/Codex App 关联键，分别测量动态键有效 FPS、静态降级、按键响应、
+2. 同时启动多个本机任务和至少一个已授权 SSH Remote 任务，确认角色独立、远端光环稳定，
+   三种远端来源策略和慢/中/快三档均能保存并应用。
+3. 先做 60 秒状态 smoke，再做 15 分钟 soak；确认角色持续巡游，且无裁切、鬼影或固定领地拥挤。
+4. 测量 PETS 背景有效刷新率，目标不低于约 7 FPS；单宠物首版 901 秒 soak 的约 7.88 FPS 只作
+   旧基线，不能替代当前多角色实现的实测。
+5. 确认单次连接期间 `open/init=1`，没有非预期重连、HID 错误、CPU 或线程数持续增长。
+6. 结束时显式关闭设备会话与后台服务，确认没有遗留 `agent-deckd` 进程。
+7. 另配置 1、2、3 个 ChatGPT/Codex App 关联键，分别测量动态键有效 FPS、静态降级、按键响应、
    状态退出后的原图标恢复与 HID 错误；自动化测试通过不等于这项真机验收已完成。
 
 ## 7. Token、金额与订阅额度

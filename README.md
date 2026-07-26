@@ -2,9 +2,9 @@
 
 **[English](README.en.md)**
 
-> 把本机 AI Agent 的运行状态、订阅额度与可控操作，带到妙联宝 N4 Pro 的硬件表面。
+> 把本机 AI Agent 的运行状态、订阅额度、任务宠物与可控操作，带到妙联宝 N4 Pro 的硬件表面。
 
-Agent Deck 是一个运行在本机的 AI Agent 硬件控制台桥接项目。它将 Agent 的状态、用量和经过明确配置的操作映射到妙联宝设备，并提供浏览器中的本地配置界面。当前版本 **`0.1.0`** 支持 **macOS + MiraBox N4 Pro + Codex**；其他操作系统、硬件型号与 Agent 平台暂不作兼容性承诺。
+Agent Deck 是一个运行在本机的 AI Agent 硬件控制台桥接项目。它将 Agent 的状态、用量、任务宠物和经过明确配置的操作映射到妙联宝设备，并提供浏览器中的本地配置界面。当前版本 **`0.1.0`** 支持 **macOS + MiraBox N4 Pro + Codex**；其他操作系统、硬件型号与 Agent 平台暂不作兼容性承诺。
 
 ## 产品演示
 
@@ -31,8 +31,10 @@ Agent ingress -> NormalizedEvent -> AgentStateStore -> DeckMode/LayoutPlan
 
 本地配置页以 N4 Pro 预览为操作入口。选择按键或旋钮后，修改会先反映在 GUI 预览中；只有点击“保存并应用”才会下发到已连接的设备。可以配置：
 
-- 10 个 LCD 主按键的本地 App、网址、键盘快捷键、订阅/额度、Token/金额用量与 Agent 状态入口。
-- 底部逻辑面板的品牌图、Codex quota 和用量趋势；其中用量趋势来自本地缓存，切换时不阻塞硬件交互。
+- 10 个 LCD 主按键的本地 App、网址、键盘快捷键、订阅/额度、Token/金额用量、Agent 状态与
+  Codex 宠物；ChatGPT/Codex App 启动键还可在任务活跃时临时显示宠物状态。
+- 底部逻辑面板的品牌图、Codex quota、用量趋势和 PETS 多任务宠物巡游；其中用量趋势来自本地
+  缓存，切换时不阻塞硬件交互。
 - 4 个旋钮的轮转动作，例如切换面板或周期、调整系统输入/输出音量、显示器亮度与控制台屏幕亮度。
 - 旋钮灯圈组的颜色与可选呼吸效果，并在保存前预览。
 
@@ -48,6 +50,26 @@ Agent ingress -> NormalizedEvent -> AgentStateStore -> DeckMode/LayoutPlan
 
 未连接真实设备时，配置页和核心服务仍可通过 fake hardware 运行，便于体验、开发和排障。
 
+## Codex 宠物系统
+
+Agent Deck 在运行时只读复用 Codex/ChatGPT 已有的宠物资源，不在仓库中维护或重新分发第二套素材。
+本机宠物默认跟随 Codex 全局选择；PETS 角色需要的内置宠物按需从已安装 ChatGPT/Codex App
+读取，自定义宠物从本机 Codex 目录安全加载。
+
+当前有三种互不替代的展示方式：
+
+- **Codex 宠物键**：占用一个主按键持续展示全局 Codex 活动，按下不执行动作。
+- **App 键任务态覆盖**：可在 ChatGPT/Codex 启动键上启用；任务运行、等待输入、错误或刚完成时
+  临时覆盖用户原图标，空闲后自动恢复，按键仍只负责打开或聚焦 App。
+- **PETS 虚拟面板**：把本机与已启用 SSH Remote Connection 中处于活动或完成反馈状态的顶层
+  ChatGPT 任务显示为独立宠物，在 N4 Pro 底部长条区域内共同巡游。远端角色会用稳定的低饱和
+  光环区分执行主机。
+
+在 Web 配置页点击 N4 Pro 预览中的 PETS touch bar，可选择远端宠物跟随本机、只读远端配置或
+稳定随机内置宠物，并调整慢/中/快三档巡游速度。宠物始终只是展示层：不会参与审批、执行任务或
+替代 Agent 状态键；child/subagent、v2 gaze 和鼠标跟踪也不在当前范围内。完整配置、远端素材
+安全边界和诊断方式见[使用指南的 Codex 宠物章节](docs/guides/using-agent-deck.zh-CN.md#61-codex-宠物)。
+
 ## 当前支持范围
 
 | 维度 | 当前状态 |
@@ -55,7 +77,7 @@ Agent ingress -> NormalizedEvent -> AgentStateStore -> DeckMode/LayoutPlan
 | 项目版本 | `0.1.0` |
 | 操作系统 | macOS 为已验证目标。Windows 和 Linux 暂未正式支持。 |
 | 真实硬件 | MiraBox N4 Pro。架构为其他 StreamDock/MiraBox 型号留有扩展空间，但尚未作为可用目标发布。 |
-| Agent | Codex 本地 App/CLI 的状态、quota 与 hook 集成。 |
+| Agent | Codex 本地 App/CLI 状态、ChatGPT SSH 远端任务观察、quota、hook 与宠物展示。 |
 | Python | Python 3.11 或更高版本。 |
 | 用量趋势 | 可选依赖 Bun 的 `bunx` 与 `ccusage`；缺失时，其他功能可继续运行，但 Token/金额趋势不可用。 |
 

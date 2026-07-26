@@ -2,9 +2,9 @@
 
 **[简体中文](README.md)**
 
-> Bring local AI-agent status, subscription quota, and controlled actions to the physical surface of a MiraBox N4 Pro.
+> Bring local AI-agent status, subscription quota, task pets, and controlled actions to the physical surface of a MiraBox N4 Pro.
 
-Agent Deck is a local hardware-console bridge for AI agents. It maps agent state, usage, and explicitly configured actions to MiraBox hardware, with a browser-based local configuration UI. Version **`0.1.0`** supports **macOS + MiraBox N4 Pro + Codex**; other operating systems, hardware models, and agent platforms do not yet carry compatibility guarantees.
+Agent Deck is a local hardware-console bridge for AI agents. It maps agent state, usage, task pets, and explicitly configured actions to MiraBox hardware, with a browser-based local configuration UI. Version **`0.1.0`** supports **macOS + MiraBox N4 Pro + Codex**; other operating systems, hardware models, and agent platforms do not yet carry compatibility guarantees.
 
 ## Product Video
 
@@ -31,8 +31,11 @@ Codex and the N4 Pro are the currently verified combination; the core architectu
 
 The local configuration page uses the N4 Pro preview as its workspace. Select a key or knob to edit it; changes appear in the GUI preview first and reach a connected device only after you choose **Save and Apply**. You can configure:
 
-- Ten LCD main keys for local apps, URLs, keyboard shortcuts, subscription/quota, token/cost usage, and agent-status entry points.
-- A bottom logical panel for the brand card, Codex quota, and usage trends. Usage trends come from local caches so a panel switch does not block hardware interaction.
+- Ten LCD main keys for local apps, URLs, keyboard shortcuts, subscription/quota, token/cost usage,
+  agent-status entry points, and a Codex pet. ChatGPT/Codex launcher keys can also show a temporary
+  task-state pet overlay.
+- A bottom logical panel for the brand card, Codex quota, usage trends, and a multi-task PETS colony.
+  Usage trends come from local caches so a panel switch does not block hardware interaction.
 - Four knob rotation actions, such as changing a panel or time period, adjusting system input/output volume, display brightness, and console-screen brightness.
 - A shared knob-ring color and optional breathing effect, both previewable before saving.
 
@@ -49,6 +52,30 @@ actions only on hover, focus, or **Details** click; the browser itself does not 
 
 Without a connected device, the configuration page and core service still run with fake hardware for exploration, development, and troubleshooting.
 
+## Codex Pet System
+
+Agent Deck reuses existing Codex/ChatGPT pet assets at runtime and does not maintain or redistribute a
+second asset library. The local pet follows Codex's global selection. Built-in assets needed by PETS actors
+are read on demand from an installed ChatGPT/Codex application, while custom pets are loaded safely from
+the local Codex directory.
+
+The three presentation surfaces are independent:
+
+- **Codex pet key**: dedicates one main key to global Codex activity. Pressing it performs no action.
+- **App-key task overlay**: optionally covers a ChatGPT/Codex launcher icon while a task is running,
+  waiting, failing, or showing completion feedback. The original icon returns when idle, and the key still
+  only opens or focuses the application.
+- **PETS virtual panel**: represents top-level local and enabled SSH Remote tasks that are active or showing
+  completion feedback as independent pets sharing the N4 Pro touch bar. Remote actors use stable, muted
+  halos to identify their execution host.
+
+Select the PETS touch bar in the Web device preview to choose whether remote pets follow the local pet,
+read the remote Codex selection, or receive a stable built-in assignment, and to select slow, medium, or
+fast patrol speed. Pets remain presentation-only: they never approve requests, execute tasks, or replace
+Agent status keys. Child/subagents, version 2 gaze rows, and mouse tracking are outside the current scope.
+See the [Codex Pet section of the usage guide](docs/guides/using-agent-deck.en.md#61-codex-pet) for
+configuration, remote-asset safety, and diagnostics.
+
 ## Current Support
 
 | Area | Status |
@@ -56,7 +83,7 @@ Without a connected device, the configuration page and core service still run wi
 | Project version | `0.1.0` |
 | Operating system | macOS is the verified target. Windows and Linux are not formally supported yet. |
 | Physical hardware | MiraBox N4 Pro. The architecture leaves room for other StreamDock/MiraBox models, but they are not released as supported targets. |
-| Agent | Local Codex App/CLI state, quota, and hook integration. |
+| Agent | Local Codex App/CLI state, ChatGPT SSH remote-task observation, quota, hooks, and pet presentation. |
 | Python | Python 3.11 or later. |
 | Usage trends | Optional: Bun's `bunx` and `ccusage`. Without them, other features still run, but token/cost trends are unavailable. |
 
