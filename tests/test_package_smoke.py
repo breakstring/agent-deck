@@ -20,7 +20,7 @@ def test_package_exports_version_and_cli_apps() -> None:
     副作用：仅执行 Python 导入，不启动网络、不打开硬件、不读写用户配置。
     """
 
-    assert agent_deck.__version__ == "0.1.0"
+    assert agent_deck.__version__ == "0.2.0"
     assert daemon_app is not None
     assert ctl_app is not None
     assert codex_hook_app is not None
@@ -38,4 +38,4 @@ def test_ctl_version_command_prints_package_version() -> None:
     result = CliRunner().invoke(ctl_app, ["version"])
 
     assert result.exit_code == 0
-    assert result.output.strip() == "0.1.0"
+    assert result.output.strip() == "0.2.0"

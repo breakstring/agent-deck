@@ -4,13 +4,14 @@
 
 > 把本机 AI Agent 的运行状态、订阅额度、任务宠物与可控操作，带到妙联宝 N4 Pro 的硬件表面。
 
-Agent Deck 是一个运行在本机的 AI Agent 硬件控制台桥接项目。它将 Agent 的状态、用量、任务宠物和经过明确配置的操作映射到妙联宝设备，并提供浏览器中的本地配置界面。当前版本 **`0.1.0`** 支持 **macOS + MiraBox N4 Pro + Codex**；其他操作系统、硬件型号与 Agent 平台暂不作兼容性承诺。
+Agent Deck 是一个运行在本机的 AI Agent 硬件控制台桥接项目。它将 Agent 的状态、用量、任务宠物和经过明确配置的操作映射到妙联宝设备，并提供浏览器中的本地配置界面。当前版本 **`0.2.0`** 支持 **macOS + MiraBox N4 Pro + Codex**；其他操作系统、硬件型号与 Agent 平台暂不作兼容性承诺。
 
 ## 产品演示
 
-[![播放 Agent Deck 产品介绍视频](assets/agent-deck/brand-intro-v02.png)](https://breakstring.github.io/agent-deck/)
+[![播放 Agent Deck v0.2.0 产品介绍视频](assets/agent-deck/product-intro-v06.png)](https://breakstring.github.io/agent-deck/)
 
-点击上图，在浏览器中观看 Agent Deck 的产品介绍视频。
+点击上图，在浏览器中观看 52 秒的 Agent Deck v0.2.0 产品介绍视频：本地与远端 Codex
+任务、PETS 状态、可配置按键、逻辑面板、触控栏和旋钮都在同一支真机演示中呈现。
 
 ## 它解决什么问题
 
@@ -74,7 +75,7 @@ Agent Deck 在运行时只读复用 Codex/ChatGPT 已有的宠物资源，不在
 
 | 维度 | 当前状态 |
 | --- | --- |
-| 项目版本 | `0.1.0` |
+| 项目版本 | `0.2.0` |
 | 操作系统 | macOS 为已验证目标。Windows 和 Linux 暂未正式支持。 |
 | 真实硬件 | MiraBox N4 Pro。架构为其他 StreamDock/MiraBox 型号留有扩展空间，但尚未作为可用目标发布。 |
 | Agent | Codex 本地 App/CLI 状态、ChatGPT SSH 远端任务观察、quota、hook 与宠物展示。 |

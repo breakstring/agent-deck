@@ -4,13 +4,14 @@
 
 > Bring local AI-agent status, subscription quota, task pets, and controlled actions to the physical surface of a MiraBox N4 Pro.
 
-Agent Deck is a local hardware-console bridge for AI agents. It maps agent state, usage, task pets, and explicitly configured actions to MiraBox hardware, with a browser-based local configuration UI. Version **`0.1.0`** supports **macOS + MiraBox N4 Pro + Codex**; other operating systems, hardware models, and agent platforms do not yet carry compatibility guarantees.
+Agent Deck is a local hardware-console bridge for AI agents. It maps agent state, usage, task pets, and explicitly configured actions to MiraBox hardware, with a browser-based local configuration UI. Version **`0.2.0`** supports **macOS + MiraBox N4 Pro + Codex**; other operating systems, hardware models, and agent platforms do not yet carry compatibility guarantees.
 
 ## Product Video
 
-[![Play the Agent Deck product introduction](assets/agent-deck/brand-intro-v02.png)](https://breakstring.github.io/agent-deck/)
+[![Play the Agent Deck v0.2.0 product introduction](assets/agent-deck/product-intro-v06.png)](https://breakstring.github.io/agent-deck/)
 
-Select the image to watch the Agent Deck product introduction in your browser.
+Select the image to watch the 52-second Agent Deck v0.2.0 introduction. It brings local and remote Codex
+tasks, PETS state, configurable keys, logical panels, the touch bar, and knobs into one physical-device demo.
 
 ## Why Agent Deck
 
@@ -80,7 +81,7 @@ configuration, remote-asset safety, and diagnostics.
 
 | Area | Status |
 | --- | --- |
-| Project version | `0.1.0` |
+| Project version | `0.2.0` |
 | Operating system | macOS is the verified target. Windows and Linux are not formally supported yet. |
 | Physical hardware | MiraBox N4 Pro. The architecture leaves room for other StreamDock/MiraBox models, but they are not released as supported targets. |
 | Agent | Local Codex App/CLI state, ChatGPT SSH remote-task observation, quota, hooks, and pet presentation. |
