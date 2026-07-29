@@ -8,10 +8,14 @@ Agent Deck is a local hardware-console bridge for AI agents. It maps agent state
 
 ## Product Video
 
-[![Play the Agent Deck v0.2.0 product introduction](assets/agent-deck/product-intro-v06.png)](https://breakstring.github.io/agent-deck/)
+https://github.com/user-attachments/assets/f0283ca5-a5c8-419b-9235-635c6c82fd5f
 
-Select the image to watch the 52-second Agent Deck v0.2.0 introduction. It brings local and remote Codex
-tasks, PETS state, configurable keys, logical panels, the touch bar, and knobs into one physical-device demo.
+Play the 52-second 720p preview directly in this README, or visit the
+[product page](https://breakstring.github.io/agent-deck/) and download the
+[1080p release](https://github.com/breakstring/agent-deck/releases/download/v0.2.0/agent-deck-intro.mp4).
+
+The video covers local and remote Codex tasks, PETS state, configurable keys, logical panels, the touch
+bar, and knobs.
 
 ## Why Agent Deck
 
