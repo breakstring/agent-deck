@@ -10,10 +10,8 @@ Agent Deck 是一个运行在本机的 AI Agent 硬件控制台桥接项目。�
 
 https://github.com/user-attachments/assets/f0283ca5-a5c8-419b-9235-635c6c82fd5f
 
-在 README 中直接播放 52 秒的 720p 预览版；也可以前往[产品页面](https://breakstring.github.io/agent-deck/)
-观看并下载 [1080p 正式版](https://github.com/breakstring/agent-deck/releases/download/v0.2.0/agent-deck-intro.mp4)。
+前往[介绍页面](https://breakstring.github.io/agent-deck/)
 
-视频展示本地与远端 Codex 任务、PETS 状态、可配置按键、逻辑面板、触控栏和旋钮。
 
 ## 它解决什么问题
 
