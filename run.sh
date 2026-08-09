@@ -25,6 +25,12 @@ fi
 
 PID_FILE="${AGENT_DECK_PID_FILE:-${STATE_DIR}/agent-deckd.pid}"
 LOG_FILE="${AGENT_DECK_LOG_FILE:-${LOG_DIR}/agent-deckd.log}"
+LOG_FILE_DIR=$(dirname -- "${LOG_FILE}")
+STARTUP_LOG_FILE="${LOG_FILE}.startup"
+LOG_FILE_OVERRIDDEN=0
+if [ "${AGENT_DECK_LOG_FILE:-}" ]; then
+  LOG_FILE_OVERRIDDEN=1
+fi
 ACTION="start"
 FOREGROUND=0
 
@@ -44,6 +50,9 @@ Default action is background start. Extra args are passed to agent-deckd.
 Files:
   PID: ${PID_FILE}
   Log: ${LOG_FILE}
+
+Environment:
+  AGENT_DECK_LOG_FILE   Override the rotating log path for this launch.
 EOF
 }
 
@@ -67,7 +76,13 @@ listener_pid() {
 
 daemon_exec() {
   if [ -x "${SCRIPT_DIR}/.venv/bin/agent-deckd" ]; then
+    if [ "${LOG_FILE_OVERRIDDEN}" -eq 1 ]; then
+      exec "${SCRIPT_DIR}/.venv/bin/agent-deckd" --host "${DEFAULT_HOST}" --port "${DEFAULT_PORT}" --log-file "${LOG_FILE}" "$@"
+    fi
     exec "${SCRIPT_DIR}/.venv/bin/agent-deckd" --host "${DEFAULT_HOST}" --port "${DEFAULT_PORT}" "$@"
+  fi
+  if [ "${LOG_FILE_OVERRIDDEN}" -eq 1 ]; then
+    exec uv run agent-deckd --host "${DEFAULT_HOST}" --port "${DEFAULT_PORT}" --log-file "${LOG_FILE}" "$@"
   fi
   exec uv run agent-deckd --host "${DEFAULT_HOST}" --port "${DEFAULT_PORT}" "$@"
 }
@@ -76,12 +91,12 @@ start_foreground() {
   mkdir -p "${STATE_DIR}" "${LOG_DIR}"
   cd "${SCRIPT_DIR}"
   echo "Starting agent-deckd in foreground on ${DEFAULT_HOST}:${DEFAULT_PORT}"
-  echo "Log file is not used in foreground mode."
+  echo "Rotating log: ${LOG_FILE}"
   daemon_exec "$@"
 }
 
 start_background() {
-  mkdir -p "${STATE_DIR}" "${LOG_DIR}"
+  mkdir -p "${STATE_DIR}" "${LOG_DIR}" "${LOG_FILE_DIR}"
   if is_running; then
     pid=$(cat "${PID_FILE}")
     echo "agent-deckd already running with PID ${pid}"
@@ -90,28 +105,31 @@ start_background() {
   fi
   rm -f "${PID_FILE}"
   launcher_output=$(
-    uv run python - "${SCRIPT_DIR}" "${DEFAULT_HOST}" "${DEFAULT_PORT}" "${LOG_FILE}" "$@" <<'PY'
+    uv run python - "${SCRIPT_DIR}" "${DEFAULT_HOST}" "${DEFAULT_PORT}" "${LOG_FILE}" "${STARTUP_LOG_FILE}" "${LOG_FILE_OVERRIDDEN}" "$@" <<'PY'
 import os
 import subprocess
 import sys
 
-script_dir, host, port, log_file, *daemon_args = sys.argv[1:]
+script_dir, host, port, log_file, startup_log_file, log_file_overridden, *daemon_args = sys.argv[1:]
 daemon_bin = os.path.join(script_dir, ".venv", "bin", "agent-deckd")
 if os.path.isfile(daemon_bin) and os.access(daemon_bin, os.X_OK):
-    command = [daemon_bin, "--host", host, "--port", port, *daemon_args]
+    command = [daemon_bin, "--host", host, "--port", port]
 else:
-    command = ["uv", "run", "agent-deckd", "--host", host, "--port", port, *daemon_args]
+    command = ["uv", "run", "agent-deckd", "--host", host, "--port", port]
+if log_file_overridden == "1":
+    command.extend(("--log-file", log_file))
+command.extend(daemon_args)
 
-log = open(log_file, "ab", buffering=0)
-process = subprocess.Popen(
-    command,
-    cwd=script_dir,
-    stdin=subprocess.DEVNULL,
-    stdout=log,
-    stderr=subprocess.STDOUT,
-    start_new_session=True,
-    close_fds=True,
-)
+with open(startup_log_file, "wb", buffering=0) as startup_log:
+    process = subprocess.Popen(
+        command,
+        cwd=script_dir,
+        stdin=subprocess.DEVNULL,
+        stdout=startup_log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        close_fds=True,
+    )
 print(process.pid)
 PY
   )
@@ -123,12 +141,14 @@ PY
       rm -f "${PID_FILE}"
       echo "agent-deckd exited during startup"
       echo "Log: ${LOG_FILE}"
+      tail -n 40 "${STARTUP_LOG_FILE}" 2>/dev/null || true
       tail -n 40 "${LOG_FILE}" 2>/dev/null || true
       return 1
     fi
     listen_pid=$(listener_pid || true)
     if [ -n "${listen_pid}" ]; then
       printf '%s\n' "${listen_pid}" >"${PID_FILE}"
+      rm -f "${STARTUP_LOG_FILE}"
       echo "agent-deckd started in background with PID ${listen_pid}"
       echo "Log: ${LOG_FILE}"
       return 0
@@ -180,9 +200,9 @@ status_daemon() {
 }
 
 show_logs() {
-  mkdir -p "${LOG_DIR}"
+  mkdir -p "${LOG_DIR}" "${LOG_FILE_DIR}"
   touch "${LOG_FILE}"
-  tail -n 80 -f "${LOG_FILE}"
+  tail -n 80 -F "${LOG_FILE}"
 }
 
 if [ "$#" -gt 0 ]; then

@@ -138,6 +138,10 @@ fail-closed 策略处理。
 | `scripts/agent-deckd-tmux.sh [start\|stop\|status\|logs\|attach\|restart]` | 以 tmux 管理常驻服务；推荐用于日常运行。 |
 | `./run.sh [start\|stop\|status\|logs\|restart]` | 没有 tmux 时使用的普通后台管理脚本。 |
 
+常驻 daemon 默认只记录 `WARNING` 及以上并关闭 HTTP access log；文件达到 5 MiB 后自动轮转，
+保留 2 份历史记录。级别、access log、文件路径和轮转上限均可在 `agent-deck.toml` 的
+`[logging]` 中调整，详见[使用指南](docs/guides/using-agent-deck.zh-CN.md#51-日志级别与文件上限)。
+
 前台调试时可以直接运行：
 
 ```bash

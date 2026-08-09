@@ -197,6 +197,29 @@ uv run agent-deckctl hardware n4pro splash
 目录或调整订阅额度展示规则属于高级用法，请参阅[开发者 Q&A](../references/developer-q-and-a.md)
 和 [Codex quota 说明](../references/codex-app-server-quota.md)。
 
+### 5.1 日志级别与文件上限
+
+个人常驻使用默认只记录 `warning`、`error` 和 `critical`，并关闭每次 HTTP 请求都会产生的
+access log。日志文件按大小轮转：当前文件达到 5 MiB 后轮转，默认保留 2 份历史文件，因此总占用
+通常不超过约 15 MiB。配置位于 `agent-deck.toml`：
+
+```toml
+[logging]
+level = "warning" # critical | error | warning | info | debug | trace
+access_log = false
+file_enabled = true
+file_path = "~/Library/Logs/AgentDeck/agent-deckd.log"
+max_bytes = 5242880
+backup_count = 2
+```
+
+- 日常使用建议保持 `warning` 和 `access_log = false`；普通状态轮询与成功请求不会写入日志。
+- 临时排障可执行 `uv run agent-deckd --log-level info`，或在配置中开启 access log；排障后应恢复
+  默认值。
+- `file_enabled = false` 可完全关闭文件日志，错误仍会输出到前台或 tmux 控制台。
+- `./run.sh logs` 跟随轮转日志文件；`AGENT_DECK_LOG_FILE` 仍可临时覆盖后台脚本使用的路径。
+- 修改配置后需要重启 daemon 才会生效。
+
 ## 6. Codex 集成
 
 先获取只读检测报告和手动配置提示：

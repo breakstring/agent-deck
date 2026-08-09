@@ -29,11 +29,13 @@ from agent_deck.actions.macos_keyboard import (
 )
 from agent_deck.config import (
     AgentDeckConfigError,
+    LogLevel,
     PermissionRequestMode,
     load_agent_deck_config,
     resolve_agent_deck_config_path,
     resolve_hardware_renderer_defaults,
 )
+from agent_deck.logging_config import build_uvicorn_log_config
 from agent_deck.adapters.codex_app_state import (
     CodexAppActiveSession,
     build_codex_app_state_events_from_report,
@@ -241,6 +243,27 @@ def daemon_callback(
             help="Agent Deck TOML config path for daemon defaults.",
         ),
     ] = Path("agent-deck.toml"),
+    log_level: Annotated[
+        LogLevel | None,
+        typer.Option(
+            "--log-level",
+            help="Temporarily override the configured logging level.",
+        ),
+    ] = None,
+    log_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--log-file",
+            help="Temporarily enable file logging at this path.",
+        ),
+    ] = None,
+    disable_log_file: Annotated[
+        bool,
+        typer.Option(
+            "--disable-log-file",
+            help="Disable the rotating log file for this daemon run.",
+        ),
+    ] = False,
     disable_hardware_renderer: Annotated[
         bool,
         typer.Option(
@@ -288,7 +311,9 @@ def daemon_callback(
     `[codex.remote_ssh]` 默认启用，但只跟随 ChatGPT Settings 中已启用自动连接的 SSH
     Connection；可显式设为 disabled，且不会从 Agent Deck 配置或 ``~/.ssh/config`` 扩展主机；
     `disable_streamdock_quota_touchscreen` 可关闭旧 quota-only 真实硬件触屏下发；
-    `config_path` 指向 daemon 默认配置；`disable_hardware_renderer` 可关闭默认真实硬件渲染；
+    `config_path` 指向 daemon 默认配置；``log_level``、``log_file`` 和
+    ``disable_log_file`` 可临时覆盖 ``[logging]`` 的级别与文件开关，HTTP access log 是否
+    启用仍由配置文件控制；`disable_hardware_renderer` 可关闭默认真实硬件渲染；
     `device_profile`、`render_interval_seconds` 和 `renderer_fps` 是面向临时调试的通用覆盖项，
     未传时沿用配置文件，当前默认设备 profile 为 `n4pro`；真实 `focus_agent` 默认启用，
     可由配置文件 `[actions.focus].enabled = false` 临时关闭。
@@ -306,6 +331,17 @@ def daemon_callback(
         return
     try:
         local_config = load_agent_deck_config(config_path)
+        logging_config = local_config.logging.model_copy(
+            update={
+                **({"level": log_level} if log_level is not None else {}),
+                **(
+                    {"file_enabled": True, "file_path": log_file}
+                    if log_file is not None
+                    else {}
+                ),
+                **({"file_enabled": False} if disable_log_file else {}),
+            }
+        )
         hardware_renderer = resolve_hardware_renderer_defaults(
             local_config,
             disabled=disable_hardware_renderer,
@@ -379,6 +415,9 @@ def daemon_callback(
         ),
         host=host,
         port=port,
+        log_config=build_uvicorn_log_config(logging_config),
+        log_level=logging_config.level.value,
+        access_log=logging_config.access_log,
     )
 
 

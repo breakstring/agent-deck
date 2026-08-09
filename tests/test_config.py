@@ -11,8 +11,71 @@ import pytest
 from agent_deck.config import (
     AgentDeckConfigError,
     CodexPetMotion,
+    LogLevel,
     load_agent_deck_config,
 )
+
+
+def test_logging_defaults_are_quiet_and_bounded(tmp_path) -> None:
+    """缺省日志应过滤普通信息、关闭 access log，并限制文件总量。
+
+    入参：pytest ``tmp_path`` 提供不存在的配置路径。
+    返回：无；断言通过代表个人常驻使用的默认日志策略保持降噪和有限轮转。
+    错误处理：默认值漂移时由 pytest 报告。
+    副作用：不创建日志文件，只读取不存在的 TOML 路径。
+    """
+
+    logging = load_agent_deck_config(tmp_path / "missing.toml").logging
+
+    assert logging.level == LogLevel.WARNING
+    assert logging.access_log is False
+    assert logging.file_enabled is True
+    assert logging.file_path.name == "agent-deckd.log"
+    assert logging.max_bytes == 5 * 1024 * 1024
+    assert logging.backup_count == 2
+
+
+def test_logging_config_round_trip_and_validation(tmp_path) -> None:
+    """日志级别、access 开关与轮转参数应可由 TOML 配置并严格校验。
+
+    入参：pytest ``tmp_path`` 保存隔离 TOML。
+    返回：无；断言通过代表 debug 策略和自定义轮转参数可以完整读取。
+    错误处理：未知日志级别应转换为 ``AgentDeckConfigError``。
+    副作用：只写 pytest 临时配置文件，不创建实际日志文件。
+    """
+
+    config_path = tmp_path / "agent-deck.toml"
+    log_path = tmp_path / "debug.log"
+    config_path.write_text(
+        "\n".join(
+            (
+                "[logging]",
+                'level = "debug"',
+                "access_log = true",
+                "file_enabled = true",
+                f'file_path = "{log_path}"',
+                "max_bytes = 4096",
+                "backup_count = 4",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    logging = load_agent_deck_config(config_path).logging
+
+    assert logging.level == LogLevel.DEBUG
+    assert logging.access_log is True
+    assert logging.file_path == log_path
+    assert logging.max_bytes == 4096
+    assert logging.backup_count == 4
+
+    config_path.write_text('[logging]\nlevel = "verbose"\n', encoding="utf-8")
+    with pytest.raises(AgentDeckConfigError, match="level"):
+        load_agent_deck_config(config_path)
+
+    config_path.write_text('[logging]\nfile_path = ""\n', encoding="utf-8")
+    with pytest.raises(AgentDeckConfigError, match="file_path"):
+        load_agent_deck_config(config_path)
 
 
 def test_codex_pet_config_defaults_follow_codex_without_pet_id(tmp_path) -> None:

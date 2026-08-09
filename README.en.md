@@ -143,6 +143,10 @@ The default approval mode keeps Codex's native approval UI and does not automati
 | `scripts/agent-deckd-tmux.sh [start\|stop\|status\|logs\|attach\|restart]` | Manages the persistent service through tmux; recommended for regular use. |
 | `./run.sh [start\|stop\|status\|logs\|restart]` | Standard background-process helper for machines without tmux. |
 
+The always-on daemon logs `WARNING` and above by default with HTTP access logs disabled. Files rotate at
+5 MiB with two backups. Configure the level, access log, path, and rotation limit under `[logging]` in
+`agent-deck.toml`; see the [usage guide](docs/guides/using-agent-deck.en.md#51-log-levels-and-file-limits).
+
 For foreground debugging, run:
 
 ```bash

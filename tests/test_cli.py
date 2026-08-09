@@ -868,15 +868,19 @@ def test_daemon_callback_calls_uvicorn_run(
     monkeypatch.setattr(
         cli.uvicorn,
         "run",
-        lambda app, host, port: uvicorn_calls.append(
-            {"app": app, "host": host, "port": port}
-        ),
+        lambda app, **kwargs: uvicorn_calls.append({"app": app, **kwargs}),
     )
 
     result = runner.invoke(cli.daemon_app, [])
 
     assert result.exit_code == 0
-    assert uvicorn_calls == [{"app": fake_app, "host": "127.0.0.1", "port": 8765}]
+    assert len(uvicorn_calls) == 1
+    assert uvicorn_calls[0]["app"] is fake_app
+    assert uvicorn_calls[0]["host"] == "127.0.0.1"
+    assert uvicorn_calls[0]["port"] == 8765
+    assert uvicorn_calls[0]["log_level"] == "warning"
+    assert uvicorn_calls[0]["access_log"] is False
+    assert "rotating_file" in uvicorn_calls[0]["log_config"]["handlers"]
     poller_config = create_app_calls[0]["poller_config"]
     assert poller_config.codex_app_state_enabled is True
     assert poller_config.codex_app_state_interval_seconds == 5.0

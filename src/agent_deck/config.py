@@ -14,11 +14,68 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 _CONFIG_ENV = "AGENT_DECK_CONFIG"
 _CWD_CONFIG_PATH = Path("agent-deck.toml")
 _USER_CONFIG_PATH = Path.home() / "Library/Application Support/AgentDeck/config.toml"
+
+
+class LogLevel(StrEnum):
+    """定义 daemon 可配置的日志过滤级别。
+
+    入参：枚举值来自 ``[logging].level`` 或 CLI 临时覆盖项。
+    返回：兼容 Uvicorn/Python logging 的小写级别字符串。
+    错误处理：未知级别由 Pydantic 或 Typer 拒绝，不做模糊回退。
+    副作用：无；声明枚举不创建日志文件或修改全局 logger。
+    """
+
+    CRITICAL = "critical"
+    ERROR = "error"
+    WARNING = "warning"
+    INFO = "info"
+    DEBUG = "debug"
+    TRACE = "trace"
+
+
+class LoggingConfig(BaseModel):
+    """描述 daemon 控制台与轮转文件日志策略。
+
+    入参：``level`` 过滤低优先级消息；``access_log`` 控制是否记录每次 HTTP 请求；
+    ``file_enabled`` 和 ``file_path`` 控制本机日志文件；``max_bytes`` 是单文件轮转阈值，
+    ``backup_count`` 是保留的历史文件数量。
+    返回：冻结 Pydantic 模型；默认仅记录 warning 及以上、关闭 access log，并把日志总占用
+    限制在大约 ``max_bytes * (backup_count + 1)``。
+    错误处理：空路径、非正阈值、越界历史数量或未知级别由 Pydantic 拒绝。
+    副作用：模型自身不创建目录、不打开或轮转文件。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    level: LogLevel = LogLevel.WARNING
+    access_log: bool = False
+    file_enabled: bool = True
+    file_path: Path = Field(
+        default_factory=lambda: Path.home()
+        / "Library/Logs/AgentDeck/agent-deckd.log"
+    )
+    max_bytes: int = Field(default=5 * 1024 * 1024, ge=1024)
+    backup_count: int = Field(default=2, ge=0, le=20)
+
+    @field_validator("file_path", mode="before")
+    @classmethod
+    def validate_file_path(cls, value: Any) -> Any:
+        """拒绝空日志路径，同时保留 ``Path`` 的标准解析与 ``~`` 展开时机。
+
+        入参：``value`` 是 Pydantic 解析前的路径值。
+        返回：原值，后续仍由 ``Path`` 类型完成转换。
+        错误处理：空字符串或只包含空白的路径抛 ``ValueError``。
+        副作用：无；不展开用户目录、不创建目录或文件。
+        """
+
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("file_path 不能为空")
+        return value
 
 
 class AgentDeckConfigError(ValueError):
@@ -223,9 +280,9 @@ class ActionsConfig(BaseModel):
 class AgentDeckConfig(BaseModel):
     """Agent Deck daemon 的本地可编辑配置根模型。
 
-    入参：`hardware_renderer` 是真实硬件渲染相关默认值；`codex` 是 Codex 专属集成能力
-    配置域；`actions` 是外部动作能力开关，focus 默认启用；后续可继续加入 agent、quota、
-    interaction 等配置域。
+    入参：``logging`` 是 daemon 日志过滤与轮转策略；`hardware_renderer` 是真实硬件渲染相关
+    默认值；`codex` 是 Codex 专属集成能力配置域；`actions` 是外部动作能力开关，focus 默认
+    启用；后续可继续加入 agent、quota、interaction 等配置域。
     返回：frozen Pydantic model。
     错误处理：子配置非法时由 Pydantic 返回结构化校验错误。
     副作用：模型自身不读写外部资源。
@@ -233,6 +290,7 @@ class AgentDeckConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
     hardware_renderer: HardwareRendererConfig = Field(
         default_factory=HardwareRendererConfig
     )

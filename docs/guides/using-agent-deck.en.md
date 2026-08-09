@@ -195,6 +195,31 @@ For everyday use, open [http://127.0.0.1:8765/](http://127.0.0.1:8765/), edit th
 
 The repository's [`agent-deck.toml`](../../agent-deck.toml) is the default-settings example. Explicit configuration paths, isolated test directories, and custom quota presentation rules are advanced topics covered by the [Developer Q&A](../references/developer-q-and-a.md) and [Codex quota reference](../references/codex-app-server-quota.md).
 
+### 5.1 Log Levels and File Limits
+
+For a personal always-on daemon, Agent Deck records only `warning`, `error`, and `critical` messages by
+default and disables the per-request HTTP access log. The active file rotates at 5 MiB and keeps two
+backups, so total usage normally stays below roughly 15 MiB. Configure this in `agent-deck.toml`:
+
+```toml
+[logging]
+level = "warning" # critical | error | warning | info | debug | trace
+access_log = false
+file_enabled = true
+file_path = "~/Library/Logs/AgentDeck/agent-deckd.log"
+max_bytes = 5242880
+backup_count = 2
+```
+
+- Keep `warning` and `access_log = false` for everyday use; routine polling and successful requests are
+  not logged.
+- For temporary diagnostics, run `uv run agent-deckd --log-level info` or enable the access log, then
+  restore the quiet defaults afterward.
+- Set `file_enabled = false` to disable the file while retaining errors in the foreground or tmux console.
+- `./run.sh logs` follows the rotating file. `AGENT_DECK_LOG_FILE` can still override the background
+  launcher's path temporarily.
+- Restart the daemon after changing the configuration.
+
 ## 6. Codex Integration
 
 Start by producing a read-only detection report and manual integration guidance:

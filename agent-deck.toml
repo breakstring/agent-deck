@@ -1,3 +1,12 @@
+[logging]
+# 个人常驻使用默认只记录 warning/error/critical，避免 INFO 和逐请求 access log 持续增长。
+level = "warning"
+access_log = false
+file_enabled = true
+file_path = "~/Library/Logs/AgentDeck/agent-deckd.log"
+max_bytes = 5242880
+backup_count = 2
+
 [hardware_renderer]
 enabled = true
 device_profile = "n4pro"
