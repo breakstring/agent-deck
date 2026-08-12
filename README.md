@@ -165,6 +165,12 @@ git diff --check
 
 真实设备验证属于显式手动 smoke，不纳入自动化测试。提交 issue 时，请避免粘贴 API key、token、完整 prompt 或私有应用路径；详见[贡献指南](CONTRIBUTING.zh-CN.md)。
 
+
 ## 授权协议
 
 核心代码采用 **[MIT 许可证](LICENSE)**。`vendor/streamdock-python-sdk` 是用于与妙联宝/StreamDock 控制台设备通信的第三方 Python SDK，来源于 [MiraboxSpace/StreamDock-Plugin-SDK](https://github.com/MiraboxSpace/StreamDock-Plugin-SDK)，同样采用 [MIT 许可证](vendor/streamdock-python-sdk/LICENSE)。
+
+## 友情链接
+<p align="center">
+    <a href="https://linux.do" alt="LINUX DO"><img src="https://shorturl.at/ggSqS" /></a>
+</p>
