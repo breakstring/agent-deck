@@ -170,3 +170,9 @@ Physical-device verification is an explicit manual smoke test and is not part of
 ## License
 
 The core codebase is licensed under the **[MIT License](LICENSE)**. `vendor/streamdock-python-sdk` is the third-party Python SDK used to communicate with MiraBox/StreamDock console devices; it comes from [MiraboxSpace/StreamDock-Plugin-SDK](https://github.com/MiraboxSpace/StreamDock-Plugin-SDK) and is also available under the [MIT License](vendor/streamdock-python-sdk/LICENSE).
+
+
+## Links
+<p align="center">
+    <a href="https://linux.do" alt="LINUX DO"><img src="https://shorturl.at/ggSqS" /></a>
+</p>
