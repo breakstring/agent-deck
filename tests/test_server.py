@@ -2335,6 +2335,7 @@ def test_default_n4pro_renderer_input_callback_routes_sdk_events(
             streamdock_n4pro_frame_root=tmp_path,
         ),
         codex_token_usage_reader=_token_snapshot,
+        visible_splash_touchscreen_sink=_fake_visible_splash_sink,
     )
     with TestClient(app) as client:
         input_callback = captured["input_callback"]
@@ -2451,6 +2452,7 @@ def test_default_n4pro_renderer_input_callback_routes_button_intents(
             streamdock_n4pro_renderer_enabled=True,
             streamdock_n4pro_frame_root=tmp_path,
         ),
+        visible_splash_touchscreen_sink=_fake_visible_splash_sink,
     )
     with TestClient(app) as client:
         client.post("/events", json=_event("session-1").model_dump(mode="json"))
@@ -2932,6 +2934,20 @@ def test_events_accept_nested_payload_and_return_json_safe_response() -> None:
     assert body["state"]["agent_key"] == "codex:session-nested"
     assert body["layout"]["touchscreen"]["title"] == "session-nested"
     assert body["render_count"] > 0
+
+
+def _fake_visible_splash_sink(
+    _image: object,
+) -> StreamDockTouchscreenRenderResult:
+    """模拟 dual-device 启停画面下发，隔离测试与真实 HID 设备。
+
+    入参：`_image` 是 daemon 生成的启动或退出画面，本 helper 不检查其内容。
+    返回：固定成功的触屏渲染结果。
+    错误处理：无。
+    副作用：无；不会枚举、打开或写入真实 StreamDock 设备。
+    """
+
+    return StreamDockTouchscreenRenderResult(ok=True)
 
 
 def _event(
