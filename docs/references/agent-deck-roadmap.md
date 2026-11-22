@@ -246,6 +246,8 @@ flowchart LR
     Hook command 应捕获 Codex hook 运行时 `$PPID` 并作为 `agent_pid` 透传到 normalized
     payload，作为后续区分 CLI/App、direct PTY、tmux pane、attached/detached tmux
     presentation client 或多实例宿主的基础线索。
+    安装器优先写入当前 Python 环境里的 hook 入口绝对路径，其次查找 PATH 上已安装的入口，
+    源码环境找不到可执行入口时回退到 `uv run`。状态上报遇到网络错误或超时静默退出。
 
     Codex hooks 后续优化 backlog：
 
@@ -254,8 +256,6 @@ flowchart LR
       awaiting 的低侵入状态。
     - 评估 lifecycle hook 的快速返回路径：先完整读取 stdin，再通过本地 relay 或常驻
       IPC 客户端异步投递事件，避免每个高频 hook 都启动完整 Python/uv 进程。
-    - 优先让 managed wrapper 使用当前虚拟环境里的 console script 或已安装可执行文件，
-      仅在源码开发模式下回退到 `uv --directory ... run`，降低 hook 启动成本。
     - 为 hook latency、daemon event receive latency 和状态覆盖原因增加诊断日志，避免
       working 动画被延迟事件或本地 scanner 弱信号打断时难以定位。
     - 基于 hook 透传的 `agent_pid` 做宿主存活检测：当会话超过 idle TTL 但 PID 仍存在时

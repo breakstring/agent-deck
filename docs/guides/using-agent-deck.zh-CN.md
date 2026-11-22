@@ -243,6 +243,29 @@ uv run agent-deckctl codex-install --apply
 安装器会在修改前创建备份。除非你清楚修改审批方式的影响，否则保持默认设置；默认情况下，
 审批仍由 Codex 原生界面处理。
 
+### 系统级 Codex hooks
+
+`--managed-system` 将生命周期 hooks 写入 `/etc/codex/requirements.toml`，将启动脚本安装到
+`/usr/local/lib/agent-deck/codex-hooks/agent-deck-codex-hook`，并清理重复的用户级 Agent Deck
+hooks。Codex 按系统策略信任这些 hooks。轮次完成通知 `notify` 仍由用户级配置管理。
+
+完成 `uv sync` 后，在仓库根目录以当前用户执行只读检查，查看输出中的 `ok` 和 `checks`。
+
+```bash
+uv run agent-deckctl codex-install --managed-system --validate-only
+```
+
+确认检查结果后，用管理员权限安装或刷新。显式传入 Codex 配置目录可以让安装器在 `sudo` 下
+仍操作当前用户的配置。
+
+```bash
+sudo "$PWD/.venv/bin/agent-deckctl" codex-install --managed-system --apply \
+  --codex-home "${CODEX_HOME:-$HOME/.codex}"
+```
+
+同一条命令也可刷新旧的 `uv run` wrapper，让它直接调用当前虚拟环境里的 hook 入口。如果仓库
+或虚拟环境迁移了路径，从新位置重新执行安装。完成后再运行一次只读检查，并新开 Codex 会话。
+
 ### 6.1 Codex 宠物
 
 宠物系统包含三种独立展示，启用其中一种不会替换另外两种：

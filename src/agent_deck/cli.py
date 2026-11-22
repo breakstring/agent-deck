@@ -82,6 +82,8 @@ from agent_deck.server.quota_presentation_store import resolve_quota_presentatio
 
 DEFAULT_DAEMON_URL = "http://127.0.0.1:8765"
 _DEFAULT_HTTP_TIMEOUT_SECONDS = 5.0
+# 状态上报运行在 Codex 前台的高频 hook 中，daemon 离线属于日常使用场景。
+_HOOK_EVENT_HTTP_TIMEOUT = httpx.Timeout(2.0, connect=0.25)
 _STREAMDOCK_SDK_PATH_ENV = "AGENT_DECK_STREAMDOCK_SDK_PATH"
 _HARDWARE_OCCUPANT_PATTERNS = (
     "agent-deckd",
@@ -2010,14 +2012,14 @@ def notify(
         ),
     ] = DEFAULT_DAEMON_URL,
 ) -> None:
-    """Forward a Codex notify payload as a best-effort turn.completed event.
+    """尽力将 Codex notify 转发为 turn.completed 事件。
 
     入参：`payload_json` 是 Codex 官方 notify 传入的单个 JSON 参数，可省略并从 stdin
     读取以兼容测试和手工管道；`daemon_url` 是 daemon base URL。
     返回：无显式返回值；成功时不要求输出固定内容。
-    错误处理：payload 为空、非法 JSON 或非 object 时以 exit 2 退出；daemon 不可达、
-    HTTP 非 2xx 或 JSON 解码失败时写 stderr 但 exit 0。
-    副作用：读取 argv 或 stdin，并可能用 bounded httpx POST 到 `/events`；不修改配置或文件。
+    错误处理：payload 为空、非法 JSON 或非 object 时以 exit 2 退出；网络错误和超时
+    静默退出 0，HTTP 或响应格式错误写 stderr 后退出 0。
+    副作用：读取 argv 或 stdin，并向 `/events` 发送一次带短超时的 HTTP POST。
     """
 
     payload = _read_json_object_from_text_or_stdin(payload_json)
@@ -2026,13 +2028,7 @@ def notify(
         normalized_type=EventType.TURN_COMPLETED,
         default_source_event_type="notify",
     )
-    try:
-        _http_post_json(
-            _join_url(daemon_url, "events"),
-            event.model_dump(mode="json"),
-        )
-    except (httpx.HTTPError, ValueError) as exc:
-        typer.echo(f"agent-deck-codex-hook notify: {exc}", err=True)
+    _forward_codex_hook_event(daemon_url, event, command="notify")
 
 
 @codex_hook_app.command()
@@ -2052,15 +2048,15 @@ def event(
         ),
     ] = None,
 ) -> None:
-    """Forward a generic Codex lifecycle hook payload as a normalized event.
+    """尽力将 Codex 生命周期 hook 转发为统一事件。
 
     入参：`daemon_url` 是 daemon base URL；stdin 必须是非空 JSON object，`hookEventName`
     或同义字段会映射到 Agent Deck normalized event type；`agent_pid` 可由 hook command
     传入 `$PPID`，作为宿主识别线索保存在 payload 中。
     返回：无显式返回值；成功时不要求输出固定内容。
-    错误处理：stdin 为空、非法 JSON 或非 object 时以 exit 2 退出；daemon 不可达、HTTP
-    非 2xx 或 JSON 解码失败时写 stderr 但 exit 0，避免阻断 Codex 普通 lifecycle hooks。
-    副作用：读取 stdin，并可能用 bounded httpx POST 到 `/events`；不修改配置或文件。
+    错误处理：stdin 为空、非法 JSON 或非 object 时以 exit 2 退出；网络错误和超时静默
+    退出 0，HTTP 或响应格式错误写 stderr 后退出 0。
+    副作用：读取 stdin，并向 `/events` 发送一次带短超时的 HTTP POST。
     """
 
     payload = _read_json_object_from_stdin()
@@ -2071,13 +2067,36 @@ def event(
         normalized_type=normalized_type,
         default_source_event_type="codex-hook",
     )
+    _forward_codex_hook_event(daemon_url, event, command="event")
+
+
+def _forward_codex_hook_event(
+    daemon_url: str, event: NormalizedEvent, *, command: str
+) -> None:
+    """向 daemon 转发可丢弃的 Codex 状态事件。
+
+    入参：`daemon_url` 是 daemon base URL，`event` 已完成归一化和脱敏，
+    `command` 是诊断中显示的 hook 子命令名。
+    返回：无。
+    错误处理：网络错误和超时静默忽略；HTTP 或响应格式错误写入脱敏诊断。
+    副作用：尝试一次 HTTP POST；异常响应可能写 stderr。
+    """
+
     try:
         _http_post_json(
             _join_url(daemon_url, "events"),
             event.model_dump(mode="json"),
+            timeout=_HOOK_EVENT_HTTP_TIMEOUT,
         )
-    except (httpx.HTTPError, ValueError) as exc:
-        typer.echo(f"agent-deck-codex-hook event: {exc}", err=True)
+    except (httpx.NetworkError, httpx.TimeoutException):
+        return
+    except httpx.HTTPStatusError as exc:
+        typer.echo(
+            f"agent-deck-codex-hook {command}: daemon HTTP {exc.response.status_code}",
+            err=True,
+        )
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
+        typer.echo(f"agent-deck-codex-hook {command}: {type(exc).__name__}", err=True)
 
 
 @codex_hook_app.command("permission-request")
@@ -2210,12 +2229,12 @@ def _http_post_json(
     url: str,
     body: dict[str, Any],
     *,
-    timeout: float = _DEFAULT_HTTP_TIMEOUT_SECONDS,
+    timeout: float | httpx.Timeout = _DEFAULT_HTTP_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Perform a bounded POST request with JSON body and return JSON object.
 
-    入参：`url` 是完整请求 URL；`body` 是 JSON object 请求体；`timeout` 是 httpx client
-    超时秒数。
+    入参：`url` 是完整请求 URL，`body` 是 JSON object 请求体，`timeout` 是统一超时秒数
+    或按连接、读写等阶段配置的 httpx 超时。
     返回：响应 JSON object。
     错误处理：网络错误、超时或非 2xx 由 httpx 异常报告；响应 JSON 不是 object 时抛
     ValueError。

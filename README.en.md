@@ -127,6 +127,10 @@ uv run agent-deckctl codex-install
 uv run agent-deckctl codex-install --apply
 ```
 
+The commands above install user-level hooks. Use `--managed-system` to install or refresh system-managed
+hooks with administrator privileges. Refresh an existing wrapper to make it call the hook executable
+directly from the virtual environment. See [System-managed Codex hooks](docs/guides/using-agent-deck.en.md#system-managed-codex-hooks).
+
 The default approval mode keeps Codex's native approval UI and does not automatically move approval control to hardware. Keyboard shortcuts are limited to physical keys, chords, and timing; they do not expose text, mouse, shell, media-key, or Fn injection. Text input and approval/deny actions remain high-risk capabilities that require explicit configuration. If the daemon is unavailable, a response is invalid, or a wait times out, the approval path follows a fail-closed policy.
 
 ## Common Commands and Process Management

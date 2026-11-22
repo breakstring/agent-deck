@@ -242,6 +242,32 @@ uv run agent-deckctl codex-install --apply
 
 The installer creates backups before edits. Keep the default approval setting unless you understand the effect of changing it; by default, approvals stay in Codex's native interface.
 
+### System-managed Codex hooks
+
+`--managed-system` writes lifecycle hooks to `/etc/codex/requirements.toml`, installs the wrapper at
+`/usr/local/lib/agent-deck/codex-hooks/agent-deck-codex-hook`, and removes duplicate user-level Agent Deck
+hooks. Codex trusts these hooks through system policy. The user configuration still controls turn-completion
+notifications via `notify`.
+
+After `uv sync`, run the read-only check from the repository root as your regular user. Review `ok` and
+`checks` in the output.
+
+```bash
+uv run agent-deckctl codex-install --managed-system --validate-only
+```
+
+After reviewing the results, install or refresh the wrapper with administrator privileges. Pass your Codex
+configuration directory explicitly so the installer can find it under `sudo`.
+
+```bash
+sudo "$PWD/.venv/bin/agent-deckctl" codex-install --managed-system --apply \
+  --codex-home "${CODEX_HOME:-$HOME/.codex}"
+```
+
+Use the same command to refresh an older `uv run` wrapper so it calls the executable in the current virtual
+environment directly. If you move the repository or virtual environment, rerun the installation from its new
+location. Run the read-only check again, then start a new Codex session.
+
 ### 6.1 Codex Pet
 
 The pet system has three independent presentation surfaces:

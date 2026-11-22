@@ -2,12 +2,14 @@
 
 本文件验证 Codex detection report 和 `--enable-integration` 引导内容的稳定契约。
 测试不读取真实 `~/.codex` 内容、不启动 Codex、不写用户配置，也不连接 Agent Deck
-daemon；所有路径都使用 pytest 临时目录或显式 fake 值。
+daemon；所有写入路径都使用 pytest 临时目录。
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -365,16 +367,26 @@ def test_install_codex_integration_apply_creates_missing_files(tmp_path: Path) -
 
 
 def test_install_codex_integration_managed_system_apply_writes_system_files(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """验证 managed-system apply 写系统 requirements/wrapper 并清理用户级重复 hooks。
 
-    入参：`tmp_path` 提供 fake 系统路径和 fake `CODEX_HOME`。
+    入参：`tmp_path` 提供 fake 系统路径和 fake `CODEX_HOME`，`monkeypatch` 设置安装器的
+    虚拟环境解释器路径。
     返回：无返回值；断言通过代表 requirements 带 managed block，wrapper 可执行，用户自定义
     hook 被保留而 Agent Deck user hook 被移除。
     错误处理：若未备份、未写系统文件或清理错误，由 pytest 断言报告。
-    副作用：只写 pytest 临时目录下的 fake 系统路径和 Codex 配置。
+    副作用：写 pytest 临时目录并运行生成的 wrapper，后者只调用 fake helper。
     """
+
+    environment_bin = tmp_path / "test environment" / "bin"
+    environment_bin.mkdir(parents=True)
+    interpreter = environment_bin / "python"
+    interpreter.symlink_to(sys.executable)
+    monkeypatch.setattr(sys, "executable", str(interpreter))
+    helper = environment_bin / "agent-deck-codex-hook"
+    helper.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8")
+    helper.chmod(0o755)
 
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
@@ -419,9 +431,16 @@ def test_install_codex_integration_managed_system_apply_writes_system_files(
     assert len(result.backup_paths) == 1
     assert wrapper_path.exists()
     assert wrapper_path.stat().st_mode & 0o100
-    wrapper_text = wrapper_path.read_text(encoding="utf-8")
-    assert "agent-deck-codex-hook" in wrapper_text
-    assert "exec uv " not in wrapper_text
+    command = subprocess.run(
+        [str(wrapper_path), "event", "--daemon-url", "http://127.0.0.1:8765"],
+        env={"PATH": "/usr/bin:/bin"},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert command.stdout.splitlines() == [
+        "event", "--daemon-url", "http://127.0.0.1:8765",
+    ]
     requirements_text = requirements_path.read_text(encoding="utf-8")
     assert "BEGIN_AGENT_DECK_MANAGED_HOOKS" in requirements_text
     parsed_requirements = tomllib.loads(requirements_text)

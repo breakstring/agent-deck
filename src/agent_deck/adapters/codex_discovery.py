@@ -14,6 +14,7 @@ import os
 import re
 import shlex
 import shutil
+import sys
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1823,15 +1824,25 @@ def _agent_deck_notify_command(daemon_url: str) -> list[str]:
 
 
 def _agent_deck_hook_base_command() -> list[str]:
-    """返回当前环境中最稳妥的 `agent-deck-codex-hook` 启动前缀。
+    """生成可供 Codex 子进程直接使用的 hook 启动前缀。
 
-    入参：无。
-    返回：在源码仓库里且 `uv` 可用时返回 `uv --directory <repo> run agent-deck-codex-hook`；
-    否则返回已安装 console script 名称。
-    错误处理：无；路径不存在或 `uv` 不在 PATH 时自动降级到 console script。
-    副作用：检查当前源码路径和 PATH，不读写文件。
+    入参：无，使用安装器当前的 Python 环境和 PATH。
+    返回：优先使用当前 Python 环境中 console script 的绝对路径，其次查找 PATH 上
+    已安装的入口，最后在源码仓库里回退到 `uv run` 或保留原命令名。
+    错误处理：候选入口不可执行时按上述顺序回退。
+    副作用：只读检查可执行文件和源码仓库路径。
     """
 
+    command = "agent-deck-codex-hook"
+    if sys.executable:
+        # 解释器可能是虚拟环境里的符号链接，跟随链接会查到基础 Python 的 bin 目录。
+        sibling = Path(sys.executable).absolute().with_name(command)
+        executable = shutil.which(str(sibling))
+        if executable:
+            return [executable]
+    executable = shutil.which(command)
+    if executable:
+        return [os.path.abspath(executable)]
     repo_root = Path(__file__).resolve().parents[3]
     uv_path = shutil.which("uv")
     if (repo_root / "pyproject.toml").exists() and uv_path:
@@ -1840,9 +1851,9 @@ def _agent_deck_hook_base_command() -> list[str]:
             "--directory",
             str(repo_root),
             "run",
-            "agent-deck-codex-hook",
+            command,
         ]
-    return ["agent-deck-codex-hook"]
+    return [command]
 
 
 def _is_string_list(value: Any) -> bool:

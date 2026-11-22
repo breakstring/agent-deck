@@ -188,9 +188,11 @@ export AGENT_DECK_QUOTA_PRESENTATION="/path/to/quota-presentation.json"
 
 ### Q：Codex hook 的失败语义是什么？
 
-- `agent-deck-codex-hook notify` 是 best-effort；daemon 不可用时可写 stderr，但应保持 exit 0，
-  不能影响 Codex 正常流程。
-- `permission-request` 必须 fail-closed；daemon 不可用、响应非法或等待超时时返回 deny。
+- `agent-deck-codex-hook event` 和 `notify` 尽力投递，每个事件尝试一次。连接阶段超时
+  250 毫秒，其他 I/O 阶段各 2 秒。网络错误或超时静默退出 0，非法 JSON 输入退出 2。
+  daemon 返回 HTTP 错误或非法响应时，hook 向 stderr 写简短诊断并退出 0。
+- `permission-request` 在显式启用 `handle` 时采用 fail-closed 策略。daemon 不可用、响应非法
+  或等待超时时返回 deny。
 - 默认 `codex.permission_request.mode = "passthrough"`，审批仍由 Codex 原生界面处理。
 
 普通用户不需要理解或修改这些合同；安装器默认先展示 dry-run，只有显式 `--apply` 才写配置。

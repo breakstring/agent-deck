@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
 from PIL import Image
 from typer.testing import CliRunner
 
@@ -688,25 +689,37 @@ def test_resolve_rejects_invalid_behavior_without_http(monkeypatch: Any) -> None
     assert _FakeClient.requests == []
 
 
-def test_notify_daemon_failure_exits_zero(monkeypatch: Any) -> None:
-    """Verify Codex notify fails open when the daemon is unavailable.
+@pytest.mark.parametrize("command", ["event", "notify"])
+@pytest.mark.parametrize("failure", [cli.httpx.ConnectError, cli.httpx.ReadTimeout])
+def test_codex_hook_event_daemon_failure_is_quiet(
+    monkeypatch: pytest.MonkeyPatch, command: str, failure: type[Exception]
+) -> None:
+    """验证普通 Codex hooks 在 daemon 拒绝连接或超时时静默退出。
 
-    入参：`monkeypatch` 安装会抛 ConnectError 的 fake HTTP client。
-    返回：无返回值；断言通过代表 stderr 记录原因且 exit 0。
-    错误处理：退出码、stderr 或请求行为不符合 fail-open 契约时由 pytest 报告。
-    副作用：读取测试 stdin JSON；不访问真实 daemon。
+    入参：`command` 是 CLI 子命令，`failure` 是模拟的网络异常类型。
+    返回：无，断言短超时、单次请求、空输出和退出码 0。
+    错误处理：发生重试或输出错误时由 pytest 报告。
+    副作用：替换 HTTP helper，读取测试 stdin，不访问真实 daemon。
     """
 
-    _install_fake_client(monkeypatch, fail=True)
+    timeouts: list[cli.httpx.Timeout] = []
 
+    def fail_post(url: str, body: dict[str, Any], *, timeout: cli.httpx.Timeout) -> None:
+        """记录 POST 使用的超时并抛出测试指定的网络异常，无外部 I/O。"""
+
+        timeouts.append(timeout)
+        raise failure("daemon unavailable")
+
+    monkeypatch.setattr(cli, "_http_post_json", fail_post)
     result = runner.invoke(
         cli.codex_hook_app,
-        ["notify"],
-        input=json.dumps({"session_id": "demo", "cwd": "/tmp/demo"}),
+        [command],
+        input=json.dumps({"session_id": "demo", "hook_event_name": "SessionStart"}),
     )
 
     assert result.exit_code == 0
-    assert "daemon unavailable" in result.stderr
+    assert result.stdout == result.stderr == ""
+    assert timeouts == [cli.httpx.Timeout(2.0, connect=0.25)]
 
 
 def test_notify_accepts_codex_json_argument(monkeypatch: Any) -> None:

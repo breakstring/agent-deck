@@ -121,6 +121,10 @@ uv run agent-deckctl codex-install
 uv run agent-deckctl codex-install --apply
 ```
 
+上面是默认的用户级安装。需要安装或刷新系统级 managed hooks 时，使用 `--managed-system`。
+系统级安装需要管理员权限，已有 wrapper 也需要刷新后才会直接调用虚拟环境里的 hook 入口。
+完整命令见[系统级 Codex hooks](docs/guides/using-agent-deck.zh-CN.md#系统级-codex-hooks)。
+
 默认审批模式保留 Codex 原生审批界面，不会自动把审批控制权交给硬件。键盘快捷键只允许受限的
 物理键/组合键/时序，不提供文本、鼠标、shell、媒体键或 `Fn` 注入。涉及文本输入、批准或拒绝等
 高风险操作时，必须由用户显式配置；daemon 不可用、响应非法或等待超时时，审批链路按
